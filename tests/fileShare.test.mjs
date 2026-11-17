@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadIdentity } from '../src/identity.js';
 import { encodeRecord } from '../src/records.js';
-import { FILE_RE, SHARE_ROOT, createFileShare } from '../src/transport/fileShare.js';
+import { FILE_RE, SHARE_ROOT, checkShareDirPath, checkStoredShareDir, createFileShare, validateShareDir } from '../src/transport/fileShare.js';
 import { makeInstall, makeNetwork, syncAll, tmpDir, tree } from './helpers.mjs';
 
 const TS = 1_700_000_000_000;
@@ -197,4 +197,24 @@ test('symlinked record files and writer subdirs are not read', async () => {
   await t.sync();
   assert.deepEqual(offers, []);
   await t.stop();
+});
+
+// Invariant: only a `..` path component leaves a directory: a share named `..share` inside the data dir, or a data
+// dir named `..data` inside the share, is an overlap like any other.
+test('a dotted name does not defeat the share/data dir overlap check', async () => {
+  const dataDir = tmpDir('code-inbox-data-');
+  const inside = path.join(dataDir, '..share');
+  fs.mkdirSync(inside);
+  const base = tmpDir('code-inbox-base-');
+  const dottedData = path.join(base, '..data');
+  fs.mkdirSync(dottedData);
+  for (const [dir, data] of [[inside, dataDir], [base, dottedData]]) {
+    assert.throws(() => checkShareDirPath(dir, data), { code: 'SHARE_INVALID' }, dir);
+    await assert.rejects(checkStoredShareDir(dir, data), { code: 'SHARE_INVALID' }, dir);
+    await assert.rejects(validateShareDir(dir, data), { code: 'SHARE_INVALID' }, dir);
+  }
+  // A sibling whose name merely starts with dots is not an overlap.
+  const sibling = path.join(base, '..share');
+  fs.mkdirSync(sibling);
+  assert.equal(await validateShareDir(sibling, dottedData), sibling);
 });

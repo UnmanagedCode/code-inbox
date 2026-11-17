@@ -65,8 +65,17 @@ describe('TransportPanel', () => {
   it('classifies hosts by address, not by prefix', () => {
     for (const h of ['', 'localhost', '127.0.0.1', '127.255.0.9', '::1']) expect(isLoopback(h), h).toBe(true);
     for (const h of ['127.example.com', '127.0.0.256', '1270.0.0.1', '10.0.0.1', '0.0.0.0', '::']) expect(isLoopback(h), h).toBe(false);
-    for (const h of ['0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0', '0000::']) expect(isWildcard(h), h).toBe(true);
-    for (const h of ['::1', '0.0.0.1', 'example.com', '127.0.0.1']) expect(isWildcard(h), h).toBe(false);
+    for (const h of ['0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0', '0000::', '::ffff:0.0.0.0', '::ffff:0:0', '0:0:0:0:0:ffff:0.0.0.0', '::0.0.0.0']) expect(isWildcard(h), h).toBe(true);
+    for (const h of ['::1', '0.0.0.1', 'example.com', '127.0.0.1', '::ffff:1.2.3.4', '::ffff:0.0.0.1', '1::', ':::', '::ffff:0.0.0.256', '0:0:0:0:0:0:0:0:0']) expect(isWildcard(h), h).toBe(false);
+  });
+
+  // Invariant: the advertised host is labelled required for every wildcard the backend refuses without one.
+  it('labels the advertised host required for an IPv4-mapped wildcard', () => {
+    render(<TransportPanel state={stateWith({ kind: 'tcp', configured: true, host: '127.0.0.1', port: 47821, advertise: '127.0.0.1' })} refresh={() => {}} />);
+    type('Listen host', '::ffff:0.0.0.0');
+    expect(screen.getByRole('textbox', { name: 'Advertised host (required)' })).toBeTruthy();
+    type('Listen host', '192.168.1.20');
+    expect(screen.getByRole('textbox', { name: 'Advertised host' })).toBeTruthy();
   });
 
   // Invariant: a transport that failed to start says why, by code.

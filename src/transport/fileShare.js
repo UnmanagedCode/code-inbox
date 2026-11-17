@@ -14,9 +14,11 @@ export const SHARE_ROOT = path.join('code-inbox', 'v1');
 export const FILE_RE = /^\d{13}-[0-9a-f]{32}\.rec$/;
 const YIELD_EVERY = 64;
 
-const isInside = (parent, child) => {
+// Whether `child` is `parent` or below it. Only a `..` path component leaves `parent`: a name such as `..share`
+// is an ordinary entry inside it.
+export const isInside = (parent, child) => {
   const rel = path.relative(parent, child);
-  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+  return !(rel === '..' || rel.startsWith(`..${path.sep}`) || path.isAbsolute(rel));
 };
 
 const shareRefusal = (dir) => (why) => { throw new CodedError('SHARE_INVALID', `share dir ${JSON.stringify(dir)} ${why}`); };
@@ -34,6 +36,25 @@ export function checkShareDirPath(dir, dataDir) {
   return dir;
 }
 
+// The overlap rule on real paths (symlinks resolved), for a share dir that exists (`real` is its realpath).
+async function checkRealOverlap(dir, real, dataDir) {
+  const refuse = shareRefusal(dir);
+  const realData = await fs.realpath(dataDir);
+  if (isInside(realData, real)) refuse('is inside the data dir (through a link)');
+  if (isInside(real, realData)) refuse('contains the data dir (through a link)');
+}
+
+// The check of a stored share dir at boot: checkShareDirPath, plus the real-path overlap rule when the dir resolves
+// (a link into or above the data dir is refused). A dir that cannot be resolved yet (missing, or a mount not up)
+// passes, so the share still starts and is scanned once it appears. Refuses SHARE_INVALID; resolves the dir unchanged.
+export async function checkStoredShareDir(dir, dataDir) {
+  checkShareDirPath(dir, dataDir);
+  let real;
+  try { real = await fs.realpath(dir); } catch { return dir; }
+  await checkRealOverlap(dir, real, dataDir);
+  return dir;
+}
+
 // The full check when a human saves a share dir: checkShareDirPath, then it must be an existing writable directory
 // that neither contains the data dir nor lies inside it compared by realpath (symlinks resolved): the private key
 // must never sit on the share. Refuses SHARE_INVALID; resolves the dir unchanged.
@@ -43,10 +64,7 @@ export async function validateShareDir(dir, dataDir) {
   let st;
   try { st = await fs.stat(dir); } catch { refuse('does not exist'); }
   if (!st.isDirectory()) refuse('is not a directory');
-  const real = await fs.realpath(dir);
-  const realData = await fs.realpath(dataDir);
-  if (isInside(realData, real)) refuse('is inside the data dir');
-  if (isInside(real, realData)) refuse('contains the data dir');
+  await checkRealOverlap(dir, await fs.realpath(dir), dataDir);
   const probe = path.join(dir, `${TMP_PREFIX}probe-${crypto.randomBytes(8).toString('hex')}`);
   try {
     await fs.writeFile(probe, '', { flag: 'wx' });

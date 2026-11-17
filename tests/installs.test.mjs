@@ -363,6 +363,11 @@ test('an invalid stored transport boots unconfigured with its error', async (t) 
     [{ kind: 'file-share', dir: inData }, 'SHARE_INVALID'],
     [{ kind: 'file-share', dir: (dataDir) => path.dirname(dataDir) }, 'SHARE_INVALID'],
     [{ kind: 'carrier-pigeon' }, 'TRANSPORT_INVALID'],
+    // A name that resolves to every interface.
+    [{ kind: 'tcp', host: '0x0.0.0.0', port: 0, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    // Links into, and above, the data dir: caught on the real path once the stored path exists.
+    [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(dataDir, l); return l; } }, 'SHARE_INVALID'],
+    [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(path.dirname(dataDir), l); return l; } }, 'SHARE_INVALID'],
   ];
   for (const [transport, code] of cases) {
     const dataDir = tmpDir('code-inbox-data-');
@@ -374,6 +379,8 @@ test('an invalid stored transport boots unconfigured with its error', async (t) 
     const st = x.engine.state().transport;
     assert.equal(st.configured, false, code);
     assert.equal(st.error.code, code);
+    assert.ok(st.kind === null || st.kind === transport.kind, 'kind is a known kind or null');
+    if (code === 'TRANSPORT_INVALID') assert.equal(st.kind, null);
     await assert.rejects(x.engine.announce(), { code: 'TRANSPORT_UNCONFIGURED' });
   }
 });

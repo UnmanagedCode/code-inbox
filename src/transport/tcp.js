@@ -1,3 +1,4 @@
+import dns from 'node:dns/promises';
 import net from 'node:net';
 import { CodedError } from '../errors.js';
 import { decodeRecord } from '../records.js';
@@ -75,6 +76,30 @@ export function validateTcpConfig(input) {
   return { host, port, advertise };
 }
 
+// validateTcpConfig, then the wildcard rule on what a non-literal host and advertised host resolve to: a name such as
+// `0`, `00.0.0.0` or `0x0.0.0.0` passes as a hostname but resolves to 0.0.0.0. A host that does not resolve is
+// refused; an advertised host that does not resolve here is allowed (peers may resolve it where this install cannot).
+// Refuses TCP_INVALID; resolves the normalized config. `lookup` is dns.lookup with {all: true} (tests may inject one).
+export async function resolveTcpConfig(input, { lookup = (h) => dns.lookup(h, { all: true }) } = {}) {
+  const cfg = validateTcpConfig(input);
+  const refuse = (why) => { throw new CodedError('TCP_INVALID', why); };
+  const resolved = async (name, what, mustResolve) => {
+    if (net.isIP(name) !== 0) return;
+    let addrs;
+    try {
+      addrs = await lookup(name);
+    } catch (err) {
+      if (mustResolve) refuse(`${what} ${name} does not resolve (${err.code ?? err.message})`);
+      return;
+    }
+    const wild = addrs.find((a) => isWildcardHost(a.address));
+    if (wild) refuse(`${what} ${name} resolves to ${wild.address}, every interface: name an address`);
+  };
+  await resolved(cfg.host, 'host', true);
+  await resolved(cfg.advertise, 'advertised host', false);
+  return cfg;
+}
+
 const defaultSchedule = (fn, ms) => {
   const t = setTimeout(fn, ms);
   t.unref?.();
@@ -87,7 +112,8 @@ const minFp = (fps) => [...fps].sort()[0];
  * One listener and its pool. `attach(binding)` → a Transport for one identity:
  * binding = {identity: proofSigner(...), view, cursors: {load(), save(obj)}}.
  */
-export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT, advertise = host, limits = {}, now = Date.now, schedule = defaultSchedule, syncMs = TCP_SYNC_MS, log = console }) {
+// `createServer` builds the listener (net.createServer); tests inject one to reach the server object.
+export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT, advertise = host, limits = {}, now = Date.now, schedule = defaultSchedule, syncMs = TCP_SYNC_MS, createServer = net.createServer, log = console }) {
   const lim = { ...DEFAULT_LIMITS, ...limits };
   const bindings = new Map(); // fp → binding (started, not stopped)
   const sessions = new Set();
@@ -195,7 +221,7 @@ export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT,
 
   function listen() {
     if (listening) return listening;
-    const srv = net.createServer(onConnection);
+    const srv = createServer(onConnection);
     server = srv;
     listening = new Promise((resolve, reject) => {
       const failed = (err) => { forget(srv); reject(err); };

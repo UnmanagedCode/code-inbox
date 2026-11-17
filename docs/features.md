@@ -22,9 +22,13 @@ One transport at a time: **File share** or **TCP (direct)**, picked with a radio
 | Control | Does | Refused with |
 |---|---|---|
 | **Save share** | Makes the file share the transport: stores the dir and starts scanning it | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath) |
-| **Save TCP** | Makes direct TCP the transport: listens on **Listen host** (empty: `127.0.0.1`) and **Port** (empty: `TCP_DEFAULT_PORT`, `src/transport/tcp.js`). **Advertised host** (shown once the host is not loopback; required for `0.0.0.0` / `::`) is what peers dial | `TCP_INVALID` (a bad host, port or advertised host), `TCP_LISTEN_FAILED` (the port is taken or not allowed; no transport is configured until a save succeeds) |
+| **Save TCP** | Makes direct TCP the transport: listens on **Listen host** (empty: `127.0.0.1`) and **Port** (empty: `TCP_DEFAULT_PORT`, `src/transport/tcp.js`). **Advertised host** (shown once the host is not loopback; required when the host is every interface: `0.0.0.0` or any spelling of `::`) is what peers dial | `TCP_INVALID` (a bad host, port or advertised host; a host that does not resolve; a host or advertised host that is, or resolves to, every interface such as `0.0.0.0`, `::`, `0`), `TCP_LISTEN_FAILED` (the port is taken or not allowed; no transport is configured until a save succeeds) |
 
-- The panel shows the transport in use, the share dir or the addresses this install is reachable at, and a failed listener's `CODE: message`.
+- The panel shows the transport in use, the share dir or the addresses this install is reachable at, and, when no transport could start at boot, why as `CODE: message`:
+  - `SHARE_INVALID`: the stored share dir is relative, or overlaps the data dir (also through a link). A share dir that is merely missing (a mount not up yet) is not an error: it is scanned once it appears;
+  - `TCP_INVALID`: the stored host, port or advertised host is invalid, a host does not resolve, or it resolves to every interface;
+  - `TRANSPORT_INVALID`: the stored transport is of an unknown kind;
+  - `TCP_LISTEN_FAILED`: the port is taken or not allowed.
 - A listen host that is not loopback shows a warning: it opens a port to the network, and records travel unencrypted.
 - After changing the host or port, **Announce** again: peers dial the addresses in the last announce, and the contact card is marked stale until then.
 

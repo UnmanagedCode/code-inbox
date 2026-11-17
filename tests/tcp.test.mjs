@@ -10,7 +10,7 @@ import { FILES } from '../src/store.js';
 import { TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, encodeFrame } from '../src/transport/frames.js';
 import { proofSigner } from '../src/transport/handshake.js';
 import { routeKey } from '../src/transport/index.js';
-import { TCP_REDIAL_MIN_MS, createTcpEndpoint } from '../src/transport/tcp.js';
+import { TCP_REDIAL_MIN_MS, createTcpEndpoint, resolveTcpConfig } from '../src/transport/tcp.js';
 import { fakeClock, silentLog, tmpDir } from './helpers.mjs';
 import {
   acceptProofs, countingListener, freePort, memCursors, personal, rawConn, rawConnect, rawPeer, settle, stubSink, stubView, tcpNode, waitFor,
@@ -589,4 +589,45 @@ test('an owed admission completes after a boot listen failure followed by setTcp
   await new Promise((r) => busy.close(r));
   await alice.engine.setTcp({ port });
   assert.deepEqual(alice.engine.listInboxes()[0].members.map((m) => m.fp).sort(), [alice.fp, bob.fp].sort());
+});
+
+// Invariant (D7): a listen or advertised host that resolves to every interface is refused like 0.0.0.0, however it
+// is spelt; a listen host that does not resolve is refused, an advertised one need not resolve here.
+test('a host that resolves to an unspecified address is refused TCP_INVALID', async (t) => {
+  const alice = await tcpNode('alice');
+  closeAll(t, alice);
+  for (const name of ['0', '00.0.0.0', '0x0.0.0.0']) {
+    await assert.rejects(alice.engine.setTcp({ host: name, port: 0, advertise: '127.0.0.1' }), { code: 'TCP_INVALID' }, `host ${name}`);
+    await assert.rejects(alice.engine.setTcp({ advertise: name, port: 0 }), { code: 'TCP_INVALID' }, `advertise ${name}`);
+  }
+  assert.equal(alice.engine.state().transport.configured, true);
+  const nowhere = async () => { throw Object.assign(new Error('not found'), { code: 'ENOTFOUND' }); };
+  await assert.rejects(resolveTcpConfig({ host: 'nowhere.example', advertise: '127.0.0.1' }, { lookup: nowhere }), { code: 'TCP_INVALID' });
+  assert.equal((await resolveTcpConfig({ advertise: 'peer.example' }, { lookup: nowhere })).advertise, 'peer.example');
+  const everywhere = async () => [{ address: '10.0.0.1', family: 4 }, { address: '::', family: 6 }];
+  await assert.rejects(resolveTcpConfig({ host: 'multi.example', advertise: '127.0.0.1' }, { lookup: everywhere }), { code: 'TCP_INVALID' });
+});
+
+// Invariant (C3): a listener that fails after it is up is closed and forgotten: its port is free to bind again and
+// the sessions it accepted carry on.
+test('a listener that fails after it is up frees its port and keeps its sessions', async (t) => {
+  let srv;
+  const identity = await newIdentity();
+  const endpoint = createTcpEndpoint({ port: 0, syncMs: 3_600_000, log: silentLog, createServer: (onConnection) => { srv = net.createServer(onConnection); return srv; } });
+  const transport = endpoint.attach({ identity: proofSigner(identity), view: stubView(), cursors: memCursors() });
+  await transport.start(stubSink());
+  t.after(() => endpoint.close());
+  const { port } = endpoint.stats().listening;
+  const raw = await rawPeer(port, await newIdentity(), identity.fp);
+  closeAll(t, raw);
+  await waitFor(() => endpoint.stats().sessions.length === 1, 'the session');
+  srv.emit('error', Object.assign(new Error('accept failed'), { code: 'EMFILE' }));
+  assert.equal(endpoint.stats().listening, null);
+  assert.deepEqual(transport.addresses(), []);
+  const again = net.createServer();
+  await new Promise((resolve, reject) => { again.once('error', reject); again.listen(port, '127.0.0.1', resolve); });
+  await new Promise((r) => again.close(r));
+  raw.send({ t: 'ping' });
+  assert.equal((await raw.nextOf('pong')).t, 'pong');
+  assert.equal(endpoint.stats().sessions.length, 1);
 });

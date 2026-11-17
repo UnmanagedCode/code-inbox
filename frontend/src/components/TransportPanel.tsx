@@ -12,9 +12,40 @@ const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1
 // in 127.0.0.0/8, or `::1`. A hostname that merely starts with 127 is not: it resolves wherever its DNS says.
 export const isLoopback = (h: string) => h === '' || h === 'localhost' || h === '::1' || (IPV4_RE.test(h) && h.startsWith('127.'));
 
-// "Every interface": 0.0.0.0 or an IPv6 literal of only zeros (`::`, `::0`, `0:0:0:0:0:0:0:0`). The backend decides
-// on the parsed address (validateTcpConfig); this only labels the advertised host as required.
-export const isWildcard = (h: string) => h === '0.0.0.0' || (h.includes(':') && /^[0:]+$/.test(h));
+// The eight 16-bit groups of an IPv6 literal (an IPv4 tail counts as two), or null when `h` is not one.
+function ipv6Groups(h: string): number[] | null {
+  if (!h.includes(':')) return null;
+  let text = h;
+  let tail: number[] = [];
+  const v4 = /^(.*:)((?:\d{1,3}\.){3}\d{1,3})$/.exec(h);
+  if (v4) {
+    if (!IPV4_RE.test(v4[2])) return null;
+    const [a, b, c, d] = v4[2].split('.').map(Number);
+    tail = [(a << 8) | b, (c << 8) | d];
+    text = v4[1].endsWith('::') ? v4[1] : v4[1].slice(0, -1);
+  }
+  const halves = text.split('::');
+  if (halves.length > 2) return null;
+  const groups = (part: string) => (part === '' ? [] : part.split(':'));
+  const head = groups(halves[0]);
+  const rest = halves.length === 2 ? groups(halves[1]) : [];
+  if (![...head, ...rest].every((x) => /^[0-9a-fA-F]{1,4}$/.test(x))) return null;
+  const known = head.length + rest.length + tail.length;
+  if (halves.length === 1 ? known !== 8 : known > 7) return null;
+  const hex = (xs: string[]) => xs.map((x) => parseInt(x, 16));
+  return [...hex(head), ...Array<number>(8 - known).fill(0), ...hex(rest), ...tail];
+}
+
+// "Every interface", decided like the backend's isWildcardHost: 0.0.0.0, or an IPv6 literal for `::` in any
+// spelling, or its IPv4-mapped form (`::ffff:0.0.0.0`). A name that resolves to one is caught by the backend only
+// (it needs a DNS lookup); this labels the advertised host as required.
+export function isWildcard(h: string) {
+  if (h === '0.0.0.0') return true;
+  const g = ipv6Groups(h);
+  if (!g) return false;
+  const zeroUpTo = (n: number) => g.slice(0, n).every((x) => x === 0);
+  return zeroUpTo(8) || (zeroUpTo(5) && g[5] === 0xffff && g[6] === 0 && g[7] === 0);
+}
 
 const DESCRIBE: Record<Kind, string> = { 'file-share': 'file share', tcp: 'TCP (direct)' };
 

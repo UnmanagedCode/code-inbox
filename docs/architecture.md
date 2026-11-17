@@ -14,7 +14,7 @@
 | `src/store.js` | Everything under the data dir (below); assigns the acceptance seq |
 | `src/engine.js` | Ingest and every action; the single send path `sendMessage`; the outbox; emits `message` events. Builds the transport's `view` ([transport.md → The factory and the engine view](transport.md#the-factory-and-the-engine-view)) from two in-memory maps: its own signed records per route (`ownLog`, rebuilt at boot) and announce bytes by id. `importCard` admits a pasted announce |
 | `src/transport/index.js` | The `Transport` typedefs, `assertTransport`, route helpers ([transport.md](transport.md)) |
-| `src/transport/fileShare.js` | The v1 transport; `checkShareDirPath` (path rules only, used at boot) and `validateShareDir` (the full check on save) |
+| `src/transport/fileShare.js` | The v1 transport; `checkStoredShareDir` (the boot check: path rules, plus real paths when the dir resolves; never requires it to exist) and `validateShareDir` (the full check on save) |
 | `src/transport/frames.js` | TCP framing (`encodeFrame`, `createDecoder`), exact frame schemas per phase (`parseFrame`), the frame-size and count limits. Pure |
 | `src/transport/handshake.js` | `PROOF_DOMAIN`, `proofBytes`, `proofSigner` (the only signing a transport can do), `makeProofs`, `verifyProofs`. Pure |
 | `src/transport/tcpSession.js` | One connection: the handshake state machine, phase limits, deadlines, keepalive, request/response correlation, the bounded inbound queue |
@@ -46,7 +46,7 @@ peer-cursors.json           {peerFp: {routeKey: seq}}: the TCP pull cursors (the
 
 - At boot the in-memory index is rebuilt from `accepted.ndjson` (each record re-decoded). A line that does not parse (a torn last write) is skipped and logged; a record that no longer decodes is skipped and logged.
 - Refused ids are kept (`rejected.ndjson`) so what builds on them is refused too, across restarts; the diagnostics count and recent reasons are in memory only.
-- The share dir must not be inside the data dir, nor contain it, so the key never reaches the share: checked on save by realpath (`validateShareDir`), and at boot on the resolved paths (`checkShareDirPath`), which does not require the share to be mounted yet.
+- The share dir must not be inside the data dir, nor contain it, so the key never reaches the share: checked on save by realpath (`validateShareDir`), and at boot on the resolved paths plus, when the dir resolves, the real paths (`checkStoredShareDir`), which does not require the share to be mounted yet.
 
 ## Ingest pipeline
 
@@ -93,7 +93,7 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 ## TCP transport lifecycle
 
-- **Start** (`startTransport` → `start(sink)`): at boot the stored config is checked first (TCP fully, a share dir by its path rules only; an invalid one starts nothing and the refusal is shown in `state().transport.error`). Then attach the binding (closing the endpoint's sessions if it already had others), listen (a failure leaves no transport and refuses `TCP_LISTEN_FAILED`; at boot it is logged and shown, not fatal), load `peer-cursors.json`, run `maintain` and then every `syncMs`. After any successful start (boot, `setShare`, `setTcp`) the engine writes every admission still owed (`reconcileAdmissions`).
+- **Start** (`startTransport` → `start(sink)`): at boot the stored config is checked first (TCP as on save, DNS included; a share dir by `checkStoredShareDir`, which never requires it to exist; an invalid one starts nothing and the refusal is shown in `state().transport.error`). Then attach the binding (closing the endpoint's sessions if it already had others), listen (a failure leaves no transport and refuses `TCP_LISTEN_FAILED`; at boot it is logged and shown, not fatal), load `peer-cursors.json`, run `maintain` and then every `syncMs`. After any successful start (boot, `setShare`, `setTcp`) the engine writes every admission still owed (`reconcileAdmissions`).
 - **Listener errors** after it is up close the listener (freeing the port) and forget it; existing sessions stay.
 - **Maintain:** whois for contacts with no address → dial contacts without a session → pull from every session the routes of interest that peer could serve (`view.mayPull`). Maintain runs and pulls of one binding never overlap.
 - **Session ready:** `peerOnline` (the engine flushes its outbox for that peer) and a pull of the binding's interest from that peer.
