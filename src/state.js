@@ -27,10 +27,11 @@ export function createIndex() {
     msgs: new Map(), // inbox id → [rec], in acceptance order
     pending: new Map(), // record id → {id, payload, …}: verified, route-bound, waiting for a dependency
     rejected: new Map(), // record id → {reason, type, inbox, signer}: refused for good
-    // Settled message verdicts (accept/reject; never pending) and completed kept-chain walks. A walk that ended is
-    // fixed by the hash chain; a settled verdict changes only through a record that is not a msg or an announce
-    // (membership and removals, invites, responses, inbox-creates), which clears `verdicts`. A new message, a pending
-    // record or a refusal can only settle what was undecided, and undecided verdicts are never kept.
+    // Settled message verdicts (accept/reject; never pending) and completed kept-chain walks. A settled verdict changes
+    // only through a record that is not a msg or an announce (membership and removals, invites, responses,
+    // inbox-creates), which clears `verdicts`. A completed walk may have crossed pending records; refusing one of them
+    // ends the walk sooner, so a refusal clears both. A new message or pending record only settles what was undecided,
+    // and undecided verdicts are never kept.
     verdicts: new Map(),
     chains: new Map(),
   };
@@ -38,7 +39,11 @@ export function createIndex() {
 
 export const addPending = (index, rec) => { index.pending.set(rec.id, rec); };
 export const removePending = (index, id) => { index.pending.delete(id); };
-export const addRejected = (index, id, info) => { index.rejected.set(id, info); };
+export const addRejected = (index, id, info) => {
+  index.rejected.set(id, info);
+  index.chains.clear();
+  index.verdicts.clear();
+};
 
 // Adds an accepted record to the index (mutates it). Idempotent by id.
 export function addRecord(index, rec) {

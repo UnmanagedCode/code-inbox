@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createEngine } from '../src/engine.js';
 import { loadIdentity } from '../src/identity.js';
-import { encodeRecord } from '../src/records.js';
+import { encodeRecord, sharedInboxId as sharedId } from '../src/records.js';
 import { createStore } from '../src/store.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { makeInstall, makeNetwork, silentLog, syncAll, tmpDir } from './helpers.mjs';
@@ -222,4 +222,47 @@ test('readers fed the same records in any order reach the same valid and refused
     }
   }
   for (const x of installs) await x.close();
+});
+
+// Invariant: a cached kept-chain walk that crossed a pending record does not outlive that record's refusal: the
+// running reader's verdicts equal those of the same data dir booted afresh.
+test('a refusal of a link a cached walk crossed invalidates the walk; verdicts match a fresh boot', async () => {
+  const owner = await loadIdentity(tmpDir());
+  const carol = await loadIdentity(tmpDir());
+  const nonce = crypto.randomBytes(16).toString('hex');
+  const create = encodeRecord(owner, { type: 'inbox-create', signer: owner.fp, ts: 1, inbox: sharedId(owner.fp, nonce), nonce, name: 'team' });
+  const inbox = create.payload.inbox;
+  let ts = 10;
+  const member = (fields) => encodeRecord(owner, { type: 'member', signer: owner.fp, ts: ts++, inbox, member: carol.fp, ...fields });
+  const msgOf = (body, epoch, prev) => encodeRecord(carol, { type: 'msg', signer: carol.fp, ts: ts++, inbox, body, epoch, prev });
+  const add1 = member({ seq: 1, op: 'add' });
+  const P = msgOf('P', 1, null);
+  const H = msgOf('H', 2, P.id);
+  const add2 = member({ seq: 2, op: 'add' });
+  let remove2;
+  do remove2 = member({ seq: 2, op: 'remove', keepHead: P.id }); while (remove2.id > add2.id); // the tie resolves to the remove
+  const remove3 = member({ seq: 3, op: 'remove', keepHead: H.id });
+  const at = (r, route, writer) => ({ route, writer, bytes: r.bytes });
+  const onInbox = { kind: 'inbox', id: inbox };
+
+  const dataDir = tmpDir('code-inbox-reader-');
+  const boot = async () => {
+    const store = createStore(dataDir, { log: silentLog });
+    await store.load();
+    const engine = createEngine({ store, identity: await loadIdentity(dataDir), log: silentLog, makeTransport: () => { throw new Error('a reader has no transport'); } });
+    await engine.boot();
+    return engine;
+  };
+  const engine = await boot();
+  for (const x of [at(create, { kind: 'directory' }, owner.fp), at(add1, onInbox, owner.fp), at(P, onInbox, carol.fp), at(remove3, onInbox, owner.fp), at(H, onInbox, carol.fp)]) await engine.ingest(x);
+  assert.deepEqual(engine.verdicts(inbox).pending, [H.id], 'H waits for epoch 2');
+  assert.deepEqual(engine.verdicts(inbox).valid, [P.id], 'the seq-3 walk through the pending H reaches P, and is cached');
+  await engine.ingest(at(remove2, onInbox, owner.fp)); // epoch 2 removes carol: H is refused NOT_MEMBER
+  await engine.ingest(at(add2, onInbox, owner.fp));
+  const running = engine.verdicts(inbox);
+  assert.deepEqual(running.rejected, [H.id]);
+  await engine.stop();
+  const fresh = (await boot()).verdicts(inbox);
+  assert.deepEqual(running, fresh, 'the running reader agrees with a fresh boot of its data dir');
+  assert.deepEqual(fresh.valid, [], 'P is off the seq-3 chain once H is refused');
 });
