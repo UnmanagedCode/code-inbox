@@ -368,6 +368,8 @@ test('an invalid stored transport boots unconfigured with its error', async (t) 
     // Links into, and above, the data dir: caught on the real path once the stored path exists.
     [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(dataDir, l); return l; } }, 'SHARE_INVALID'],
     [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(path.dirname(dataDir), l); return l; } }, 'SHARE_INVALID'],
+    // A share whose root (`code-inbox`) is a link elsewhere.
+    [{ kind: 'file-share', dir: () => { const s = tmpDir('code-inbox-share-'); fs.symlinkSync(tmpDir('code-inbox-elsewhere-'), path.join(s, 'code-inbox')); return s; } }, 'SHARE_UNSAFE'],
   ];
   for (const [transport, code] of cases) {
     const dataDir = tmpDir('code-inbox-data-');

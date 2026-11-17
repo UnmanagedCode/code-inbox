@@ -26,6 +26,7 @@ One transport at a time: **File share** or **TCP (direct)**, picked with a radio
 
 - The panel shows the transport in use, the share dir or the addresses this install is reachable at, and, when no transport could start at boot, why as `CODE: message`:
   - `SHARE_INVALID`: the stored share dir is relative, or overlaps the data dir (also through a link). A share dir that is merely missing (a mount not up yet) is not an error: it is scanned once it appears;
+  - `SHARE_UNSAFE`: the stored share's `code-inbox` or `v1` is a link;
   - `TCP_INVALID`: the stored host, port or advertised host is invalid, a host does not resolve, or it resolves to every interface;
   - `TRANSPORT_INVALID`: the stored transport is of an unknown kind;
   - `TCP_LISTEN_FAILED`: the port is taken or not allowed.

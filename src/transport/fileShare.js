@@ -74,23 +74,46 @@ async function mkdirsInside(base, parts, realBase, realData = null) {
   return cur;
 }
 
+// The state of the share's root `<dir>/SHARE_ROOT`, component by component (`code-inbox`, then `v1`), never
+// following a link: 'present' (each is a real directory), or 'missing' (a component does not exist or is not a
+// directory). A component that is a symlink is refused SHARE_UNSAFE: it would carry every write (or, at save, the
+// root's creation) to wherever it points. The share dir itself may be a link. The one rule for save, boot and write.
+export async function rootState(dir) {
+  let cur = dir;
+  for (const part of SHARE_ROOT.split(path.sep)) {
+    cur = path.join(cur, part);
+    let st;
+    try { st = await fs.lstat(cur); } catch (err) {
+      if (err.code === 'ENOENT' || err.code === 'ENOTDIR') return 'missing';
+      throw err;
+    }
+    if (st.isSymbolicLink()) unsafe(`${cur} is a link, not the share's own directory`);
+    if (!st.isDirectory()) return 'missing';
+  }
+  return 'present';
+}
+
 // Creates the share's root (`<dir>/SHARE_ROOT`) when a human saves the share (the dir passed validateShareDir): from
 // then on a send requires the root to exist. A `code-inbox` or `v1` that is a link, or resolves outside the share
 // or into the data dir, is refused SHARE_UNSAFE before anything is created through it.
 export async function ensureShareRoot(dir, dataDir) {
+  await rootState(dir);
   const [realDir, realData] = await Promise.all([fs.realpath(dir), fs.realpath(dataDir)]);
   await mkdirsInside(dir, SHARE_ROOT.split(path.sep), realDir, realData);
   return dir;
 }
 
-// The check of a stored share dir at boot: checkShareDirPath, plus the real-path overlap rule when the dir resolves
-// (a link into or above the data dir is refused). A dir that cannot be resolved yet (missing, or a mount not up)
+// The check of a stored share dir at boot: checkShareDirPath, plus, when the dir resolves, the real-path overlap rule
+// (a link into or above the data dir is refused) and rootState (a root that is a link is refused SHARE_UNSAFE). A dir that cannot be resolved yet (missing, or a mount not up)
 // passes, so the share still starts and is scanned once it appears. Refuses SHARE_INVALID; resolves the dir unchanged.
 export async function checkStoredShareDir(dir, dataDir) {
   checkShareDirPath(dir, dataDir);
   let real;
   try { real = await fs.realpath(dir); } catch { return dir; }
   await checkRealOverlap(dir, real, dataDir);
+  // A root that is a link is refused (SHARE_UNSAFE); a root that cannot be read yet waits for the mount like a
+  // missing one.
+  try { await rootState(dir); } catch (err) { if (err instanceof CodedError) throw err; }
   return dir;
 }
 
@@ -214,14 +237,11 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
   }
 
   // Before any write: the share's root must already exist (else SHARE_UNAVAILABLE: an unmounted mount point, or a
-  // share never saved), and neither the share dir nor its root may resolve into or above the data dir (else
-  // SHARE_UNSAFE: a link that appeared after the share was checked).
+  // share never saved) as real directories, not links (rootState, else SHARE_UNSAFE), and neither the share dir nor
+  // its root may resolve into or above the data dir (else SHARE_UNSAFE: a link that appeared after the share was
+  // checked).
   async function checkWritable() {
-    let st;
-    try { st = await fs.stat(root); } catch (err) {
-      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
-    }
-    if (!st?.isDirectory()) throw new CodedError('SHARE_UNAVAILABLE', `the share ${shareDir} has no ${SHARE_ROOT} (not mounted?)`);
+    if (await rootState(shareDir) === 'missing') throw new CodedError('SHARE_UNAVAILABLE', `the share ${shareDir} has no ${SHARE_ROOT} (not mounted?)`);
     const realData = await fs.realpath(dataDir);
     for (const p of [shareDir, root]) {
       const why = realOverlap(await fs.realpath(p), realData);

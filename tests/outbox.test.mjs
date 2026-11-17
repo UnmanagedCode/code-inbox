@@ -299,3 +299,33 @@ test('an owed write with no recipient is kept on a system error and dropped, log
   assert.equal(bug.state().transport.outboxError, null, 'a dropped write leaves no standing error');
   assert.ok(log.lines.some((l) => l.includes('dropped') && l.includes('a bug')), log.lines.join('\n'));
 });
+
+// Invariant (V1): after a save, a share root replaced by a link (`code-inbox/v1` or `code-inbox` itself) takes no
+// write: a fresh action is refused SHARE_UNSAFE, a queued write stays owed with the error shown, and nothing lands
+// at the link's target.
+for (const [what, component] of [['the v1 root', SHARE_ROOT], ['code-inbox', SHARE_ROOT.split(path.sep)[0]]]) {
+  test(`a share whose ${what} is replaced by a link after saving is never written through`, async (t) => {
+    const clock = fakeClock();
+    const { shareDir, installs } = await makeNetwork(['alice', 'bob'], { schedule: clock.schedule });
+    const [a, b] = installs;
+    t.after(async () => { for (const x of installs) await x.close(); });
+    const { id, inbox } = await a.engine.invite(b.fp);
+    await syncAll(installs);
+    await b.engine.respondInvite(id, true);
+    await syncAll(installs);
+    const mount = unmount(shareDir);
+    await a.engine.sendMessage(inbox, 'queued');
+    mount();
+    const target = tmpDir('code-inbox-target-');
+    if (component === SHARE_ROOT) fs.mkdirSync(path.join(target, 'mirror'));
+    const linked = path.join(shareDir, component);
+    fs.renameSync(linked, `${linked}.real`);
+    fs.symlinkSync(target, linked);
+    await tick(clock, a);
+    assert.equal(outboxOf(a), 1);
+    assert.equal(a.engine.state().transport.outboxError.code, 'SHARE_UNSAFE');
+    await assert.rejects(a.engine.sendMessage(inbox, 'fresh'), { code: 'SHARE_UNSAFE' });
+    assert.deepEqual(Object.keys(tree(target)), [], 'nothing written at the link target');
+    assert.ok(!fs.readdirSync(target).some((n) => n !== 'mirror'));
+  });
+}
