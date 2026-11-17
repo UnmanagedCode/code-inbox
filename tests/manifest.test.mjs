@@ -53,3 +53,10 @@ test('the backend serves the health path and MCP endpoint the manifest names', a
   assert.deepEqual(r.json, { structured: { inboxes: [] } });
   await x.close();
 });
+
+// Invariant: every user-facing title of the plugin is the manifest name (the nav label and the page's <title>).
+test('every user-facing title equals the manifest name', () => {
+  assert.equal(MANIFEST.frontend.navLabel, MANIFEST.name);
+  const html = fs.readFileSync(new URL('../frontend/index.html', import.meta.url), 'utf8');
+  assert.equal(/<title>([^<]*)<\/title>/.exec(html)?.[1], MANIFEST.name);
+});

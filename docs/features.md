@@ -1,8 +1,8 @@
 # Features
 
-## The Inbox page
+## The Code Inbox page
 
-One page, opened from cc's navigation (**Inbox**). The overview stacks the panels below; `?inbox=<id>` opens one inbox. The page reloads `api/state` every few seconds while it is visible (`POLL_MS`, `frontend/src/components/InboxView.tsx`).
+One page, opened from cc's navigation (**Code Inbox**). The overview stacks the panels below; `?inbox=<id>` opens one inbox. The page reloads `api/state` every few seconds while it is visible (`POLL_MS`, `frontend/src/components/InboxView.tsx`).
 
 Every refusal shows as `CODE: message` next to the control that caused it.
 
