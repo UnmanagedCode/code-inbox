@@ -107,8 +107,12 @@ export function createServer({ routes, distDir, statusFor, log = console }) {
         if (!JSON_TYPE.test(req.headers['content-type'] ?? '')) return sendJson(res, 415, { error: 'Content-Type must be application/json', code: 'UNSUPPORTED_MEDIA_TYPE' });
         body = await readJsonBody(req);
       }
+      let params;
+      try { params = m.slice(1).map(decodeURIComponent); } catch {
+        return sendJson(res, 400, { error: 'a path segment is not valid percent-encoding', code: 'BAD_REQUEST' });
+      }
       const query = new URL(req.url, 'http://localhost').searchParams;
-      const out = await route.handler({ params: m.slice(1).map(decodeURIComponent), query, body });
+      const out = await route.handler({ params, query, body });
       if (out && out.status && out.body) return sendJson(res, out.status, out.body);
       return sendJson(res, 200, out);
     }

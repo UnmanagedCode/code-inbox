@@ -4,7 +4,7 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeRecord, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addRecord, classify, createIndex, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
+  addRecord, admissionDue, classify, createIndex, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
   messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
@@ -77,13 +77,20 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     if (p.type === 'invite-response' && p.accept && p.to === self) reactions.push(rec);
   }
 
-  // An accepted response to this install's shared invite admits the invitee (an admission is a member record).
+  // An accepted response to this install's shared invite admits the invitee (an admission is a member record), but
+  // only while admissionDue holds: a replayed acceptance of an invite older than a removal admits nobody.
   async function react(reactions) {
     for (const rec of reactions) {
       const inv = index.invites.get(rec.payload.invite);
-      if (inv?.payload.kind !== 'shared' || inv.payload.signer !== self) continue;
-      if (currentMembers(index, inv.payload.inbox)?.has(rec.payload.signer)) continue;
-      await writeMember(inv.payload.inbox, 'add', rec.payload.signer);
+      if (!inv || inv.payload.signer !== self || !admissionDue(index, inv)) continue;
+      await writeMember(inv.payload.inbox, 'add', inv.payload.to);
+    }
+  }
+
+  // Admissions owed for acceptances accepted before a crash or restart (react runs only as a record arrives).
+  async function reconcileAdmissions() {
+    for (const inv of [...index.invites.values()]) {
+      if (inv.payload.signer === self && admissionDue(index, inv)) await writeMember(inv.payload.inbox, 'add', inv.payload.to);
     }
   }
 
@@ -99,6 +106,14 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     }
     const reactions = [];
     await acceptRecord(rec, reactions);
+    await drainPending(reactions);
+    await persistNewPins();
+    refreshInterest();
+    await react(reactions);
+  }
+
+  // Re-classifies every pending record until no more progress; accepts and rejects leave the pending set.
+  async function drainPending(reactions) {
     let changed = false;
     for (let progress = true; progress;) {
       progress = false;
@@ -113,9 +128,6 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       }
     }
     if (changed) await store.savePending([...pending.values()]);
-    await persistNewPins();
-    refreshInterest();
-    await react(reactions);
   }
 
   // The transport's sink: `retry` only while the bytes may still be arriving.
@@ -187,11 +199,14 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     return id;
   }
 
-  async function writeMember(inbox, op, member, keep) {
+  async function writeMember(inbox, op, member, extra = {}) {
     const seqs = (index.members.get(inbox) ?? []).map((m) => m.payload.seq);
     const seq = Math.max(0, ...seqs) + 1;
-    return publish({ type: 'member', inbox, seq, op, member, ...(keep ? { keep } : {}) });
+    return publish({ type: 'member', inbox, seq, op, member, ...extra });
   }
+
+  // The id of the last message by `signer` in `inbox` this install accepted (acceptance order), or null.
+  const lastMessageOf = (inbox, signer) => (index.msgs.get(inbox) ?? []).filter((m) => m.payload.signer === signer).at(-1)?.id ?? null;
 
   // ---- guards ----
 
@@ -262,10 +277,17 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       }
       for (const e of loaded.pending) {
         const d = decodeRecord(e.bytes);
-        if (d.ok) pending.set(d.id, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
+        if (d.ok && !index.byId.has(d.id)) pending.set(d.id, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
       }
+      // Close the crash windows: pending records whose dependency was accepted, and admissions not yet written.
+      const reactions = [];
+      await drainPending(reactions);
+      if (pending.size !== loaded.pending.length) await store.savePending([...pending.values()]);
       await persistNewPins();
-      if (settings.shareDir) await startTransport(settings.shareDir);
+      if (settings.shareDir) {
+        await startTransport(settings.shareDir);
+        await locked(() => reconcileAdmissions());
+      }
     },
 
     async stop() {
@@ -407,9 +429,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         requireFp(member, 'member');
         if (member === self) refuse('BAD_REQUEST', 'the owner cannot remove itself');
         if (!currentMembers(index, inbox)?.has(member)) refuse('NOT_MEMBER', 'that identity is not a member');
-        // Every reader keeps exactly the messages the owner had accepted from the member (docs/protocol.md → Removal).
-        const keep = (index.msgs.get(inbox) ?? []).filter((m) => m.payload.signer === member).map((m) => m.id);
-        return { id: await writeMember(inbox, 'remove', member, keep) };
+        // Every reader keeps the member's messages on the prev chain back from the last one the owner accepted
+        // (docs/protocol.md → Removal): a fixed-size record however busy the member was.
+        return { id: await writeMember(inbox, 'remove', member, { keepHead: lastMessageOf(inbox, member) }) };
       });
     },
 
@@ -422,10 +444,13 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         if (typeof body !== 'string' || body.length === 0) refuse('BAD_REQUEST', 'body must be a non-empty string');
         const size = Buffer.byteLength(body, 'utf8');
         if (size > BODY_MAX_BYTES) refuse('BODY_TOO_LARGE', `the body is ${size} bytes; the limit is ${BODY_MAX_BYTES}`);
-        const fields = { type: 'msg', inbox, body, ...(b.kind === 'shared' ? { epoch: currentEpoch(index, inbox) } : {}) };
-        const probe = encodeRecord(identity, { ...fields, signer: self, ts: now() });
-        if (probe.bytes.length > RECORD_MAX_BYTES) refuse('BODY_TOO_LARGE', `the encoded record exceeds ${RECORD_MAX_BYTES} bytes (escaped characters count more than once)`);
-        return { id: await publish(fields), inbox };
+        const shared = b.kind === 'shared' ? { epoch: currentEpoch(index, inbox), prev: lastMessageOf(inbox, self) } : {};
+        try {
+          return { id: await publish({ type: 'msg', inbox, body, ...shared }), inbox };
+        } catch (err) {
+          if (err.code === 'RECORD_TOO_LARGE') refuse('BODY_TOO_LARGE', `the encoded record exceeds ${RECORD_MAX_BYTES} bytes (escaped characters count more than once)`);
+          throw err;
+        }
       });
     },
 

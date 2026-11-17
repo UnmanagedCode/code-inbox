@@ -1,6 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { NOTIFY_DEBOUNCE_MS, NOTIFY_RETRY_MS } from '../src/notifier.js';
+import fs from 'node:fs';
+import path from 'node:path';
+import { loadIdentity } from '../src/identity.js';
+import { encodeRecord } from '../src/records.js';
+import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { conductorRow, connectPersonal, fakeCc, fakeClock, makeInstall, syncAll, tmpDir } from './helpers.mjs';
 
 // alice's install notifies conductor session S1 (via fakeCc, on a fake clock); bob sends her mail.
@@ -160,4 +165,50 @@ test('a restart does not re-notify delivered mail and still delivers owed mail',
   await third.close();
   await s.b.close();
   s.cc.close();
+});
+
+// Invariant: flushes never overlap: a message owed while a delivery is in flight is announced once, by the next
+// prompt, never by two.
+test('a flush due while another is in flight waits for it; no message is announced twice', async () => {
+  const s = await setup();
+  await s.a.notifier.setTarget({ sessionId: 'S1', label: 'main' });
+  let release;
+  s.cc.state.sendPrompt = () => new Promise((r) => { release = () => r({ status: 200, body: { sessionId: 'S1', status: 'turn' } }); });
+  await s.fromBob(1);
+  s.clock.advance(NOTIFY_DEBOUNCE_MS); // the first flush starts and holds in send_prompt
+  while (!release) await new Promise((r) => setImmediate(r));
+  await s.fromBob(1);
+  s.clock.advance(NOTIFY_DEBOUNCE_MS); // due while the first is in flight
+  s.cc.state.sendPrompt = null;
+  release();
+  await s.a.notifier.settled();
+  await s.tick();
+  assert.equal(s.cc.state.prompts.length, 2);
+  assert.match(s.cc.state.prompts[0].text, /: 1 from bob/);
+  assert.match(s.cc.state.prompts[1].text, /: 1 from bob/, 'the second prompt carries only the second message');
+  await s.tick(NOTIFY_RETRY_MS);
+  assert.equal(s.cc.state.prompts.length, 2);
+  await s.close();
+});
+
+// Invariant: "new" is decided by local acceptance seq, never the sender's clock: a backdated message is still
+// unread and still notified.
+test('a backdated message from a peer is still unread and still notified', async () => {
+  const s = await setup();
+  await s.a.notifier.setTarget({ sessionId: 'S1', label: 'main' });
+  await s.fromBob(1);
+  await s.tick();
+  await s.a.engine.readMessages(s.inbox);
+  assert.equal(s.cc.state.prompts.length, 1);
+  const bob = await loadIdentity(s.b.dataDir);
+  const { bytes } = encodeRecord(bob, { type: 'msg', signer: s.b.fp, ts: 1, inbox: s.inbox, body: 'from 1970' });
+  const dir = path.join(s.shareDir, SHARE_ROOT, 'inboxes', s.inbox, s.b.fp);
+  fs.writeFileSync(path.join(dir, `${'0'.repeat(13)}-${'b'.repeat(32)}.rec`), bytes);
+  await s.a.engine.sync();
+  assert.equal(s.a.engine.listInboxes()[0].unread, 1);
+  assert.deepEqual((await s.a.engine.readMessages(s.inbox, { markRead: false })).messages.map((m) => m.body), ['from 1970']);
+  await s.tick();
+  assert.equal(s.cc.state.prompts.length, 2);
+  assert.match(s.cc.state.prompts[1].text, /1 from bob/);
+  await s.close();
 });

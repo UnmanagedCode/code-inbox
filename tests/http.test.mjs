@@ -200,3 +200,15 @@ test('the messages route refuses non-JSON (415) and cross-site (403) requests', 
   assert.deepEqual(a.engine.messages(inbox), []);
   await a.close();
 });
+
+// Invariant: a malformed percent-escape in a route parameter is the caller's error (400), never a server fault.
+test('a malformed percent-escape in a route parameter answers 400', async () => {
+  const x = await makeInstall(tmpDir());
+  for (const [method, p] of [['GET', '/api/inboxes/%E0%A4%A/messages'], ['POST', '/api/invites/%ZZ/respond']]) {
+    const r = await x.rest(method, p, method === 'POST' ? { accept: true } : undefined);
+    assert.equal(r.status, 400, p);
+    assert.equal(r.json.code, 'BAD_REQUEST');
+    hasSecurityHeaders(r);
+  }
+  await x.close();
+});

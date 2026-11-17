@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIdentity } from '../src/identity.js';
 import {
-  BODY_MAX_BYTES, RECORD_MAX_BYTES, decodeRecord, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
+  BODY_MAX_BYTES, RECORD_MAX_BYTES, TS_MAX, decodeRecord, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
 } from '../src/records.js';
 import { tmpDir } from './helpers.mjs';
 
@@ -92,7 +92,13 @@ test('an extra payload field or a wrong type is rejected: BAD_PAYLOAD', () => {
   assert.equal(reason(forge(alice, { type: 'telepathy', signer: alice.fp, ts: TS })), 'BAD_PAYLOAD');
   const inbox = 'a'.repeat(32);
   assert.equal(reason(forge(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body: 'x'.repeat(BODY_MAX_BYTES + 1) })), 'BAD_PAYLOAD');
-  assert.equal(reason(forge(alice, { type: 'member', signer: alice.fp, ts: TS, inbox, seq: 1, op: 'add', member: bob.fp, keep: [] })), 'BAD_PAYLOAD');
+  assert.equal(reason(forge(alice, { type: 'member', signer: alice.fp, ts: TS, inbox, seq: 1, op: 'add', member: bob.fp, keepHead: null })), 'BAD_PAYLOAD', 'keepHead on an add');
+  assert.equal(reason(forge(alice, { type: 'member', signer: alice.fp, ts: TS, inbox, seq: 1, op: 'remove', member: bob.fp })), 'BAD_PAYLOAD', 'a remove without keepHead');
+  assert.equal(reason(forge(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body: 'x', epoch: 0 })), 'BAD_PAYLOAD', 'epoch without prev');
+  assert.equal(reason(forge(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body: 'x', prev: null })), 'BAD_PAYLOAD', 'prev without epoch');
+  assert.equal(reason(forge(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body: '' })), 'BAD_PAYLOAD', 'an empty body');
+  assert.equal(reason(forge(alice, announce(alice, { ts: TS_MAX + 1 }))), 'BAD_PAYLOAD', 'a ts no Date can show');
+  assert.equal(decodeRecord(forge(alice, announce(alice, { ts: TS_MAX }))).ok, true);
   assert.equal(reason(forge(alice, { type: 'join-response', signer: alice.fp, ts: TS, to: bob.fp, request: inbox, inbox, accept: true })), 'BAD_PAYLOAD', 'a join-response is a decline only');
 });
 
@@ -136,4 +142,19 @@ test('routeFor maps each record type to its route', () => {
 test('encodeRecord refuses an invalid payload or another signer', () => {
   assert.throws(() => encodeRecord(alice, announce(alice, { name: 'bad name' })));
   assert.throws(() => encodeRecord(alice, announce(bob)));
+});
+
+// Invariant: a type naming an Object.prototype member is an unknown type, not a crash: decoding is total.
+test('a type naming a prototype member is BAD_PAYLOAD, never an exception', () => {
+  for (const type of ['constructor', '__proto__', 'toString', 'hasOwnProperty', 'valueOf']) {
+    const r = decodeRecord(forge(alice, { type, signer: alice.fp, ts: TS }));
+    assert.equal(r.reason, 'BAD_PAYLOAD', type);
+  }
+});
+
+// Invariant: nothing can sign a record readers would reject for its size.
+test('encodeRecord refuses a record over RECORD_MAX_BYTES: RECORD_TOO_LARGE', () => {
+  const inbox = 'a'.repeat(32);
+  const body = '\u0001'.repeat(BODY_MAX_BYTES); // within BODY_MAX_BYTES, but six bytes each once escaped
+  assert.throws(() => encodeRecord(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body }), { code: 'RECORD_TOO_LARGE' });
 });

@@ -140,7 +140,7 @@ export function tree(dir) {
 // Serves the cc routes code-inbox calls: GET /api/instances (state.instances), GET /api/plugins, POST
 // /mcp/tools/send_prompt and POST /api/plugins/:id/autostart. Every request lands in `state.hits` as
 // "<METHOD> <path>"; send_prompt bodies in `state.prompts`, autostart bodies in `state.autostart`.
-// `state.sendPrompt(body)` may answer send_prompt instead: {status, body}. `env` is what cc.js reads.
+// `state.sendPrompt(body)` may answer send_prompt instead: {status, body}, or a promise of it (to hold the answer). `env` is what cc.js reads.
 export async function fakeCc({ instances = [] } = {}) {
   const state = { instances, hits: [], prompts: [], autostart: [], sendPrompt: null, autoStart: false };
   const server = http.createServer((req, res) => {
@@ -148,7 +148,7 @@ export async function fakeCc({ instances = [] } = {}) {
     state.hits.push(`${req.method} ${url.pathname}`);
     const chunks = [];
     req.on('data', (c) => chunks.push(c));
-    req.on('end', () => {
+    req.on('end', async () => {
       const reply = (body, status = 200) => { res.writeHead(status, { 'content-type': 'application/json' }); res.end(JSON.stringify(body)); };
       const json = () => JSON.parse(Buffer.concat(chunks).toString('utf8') || '{}');
       if (req.method === 'POST' && !/^application\/json/.test(req.headers['content-type'] ?? '')) return reply({ error: 'unsupported media type' }, 415);
@@ -157,7 +157,7 @@ export async function fakeCc({ instances = [] } = {}) {
       if (req.method === 'POST' && url.pathname === '/mcp/tools/send_prompt') {
         const body = json();
         state.prompts.push(body);
-        const hooked = state.sendPrompt?.(body);
+        const hooked = await state.sendPrompt?.(body);
         if (hooked) return reply(hooked.body, hooked.status);
         return reply({ sessionId: body.sessionId, status: 'turn' });
       }

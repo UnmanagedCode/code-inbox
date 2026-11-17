@@ -123,3 +123,77 @@ test('a record in another writer subdir or on the wrong route is rejected: ROUTE
   assert.deepEqual(a.engine.state().directory, []);
   await a.close();
 });
+
+// Signs any payload as `id`, bypassing encodeRecord's schema check (what a hostile peer can do).
+function forgeAny(id, payload) {
+  const pb = Buffer.from(JSON.stringify(payload));
+  const sig = id.sign(Buffer.concat([Buffer.from('code-inbox/v1\0'), pb]));
+  return Buffer.from(JSON.stringify({ v: 1, key: id.publicRaw.toString('base64url'), payload: pb.toString('base64url'), sig: sig.toString('base64url') }));
+}
+
+// Invariant: a malformed record is counted and skipped; it never stalls the valid records after it on its route.
+test('a poison record is counted and the valid records after it still arrive', async () => {
+  const { shareDir, installs } = await makeNetwork(['alice']);
+  const [a] = installs;
+  const bob = await loadIdentity(tmpDir());
+  const dir = path.join(shareDir, SHARE_ROOT, 'directory', bob.fp);
+  fs.mkdirSync(dir, { recursive: true });
+  for (const [i, type] of ['constructor', '__proto__'].entries()) {
+    fs.writeFileSync(path.join(dir, `${'0'.repeat(13)}-${String(i).padStart(32, '0')}.rec`), forgeAny(bob, { type, signer: bob.fp, ts: TS }));
+  }
+  fs.writeFileSync(path.join(dir, `${'9'.repeat(13)}-${'a'.repeat(32)}.rec`), announceOf(bob, 'bob'));
+  await a.engine.sync();
+  const diag = a.engine.state().diagnostics;
+  assert.equal(diag.rejected, 2);
+  assert.deepEqual(diag.recent.map((r) => r.reason), ['BAD_PAYLOAD', 'BAD_PAYLOAD']);
+  assert.deepEqual(a.engine.state().directory.map((d) => d.name), ['bob']);
+  await a.engine.sync();
+  assert.equal(a.engine.state().diagnostics.rejected, 2, 'counted once, not every poll');
+  await a.close();
+});
+
+// Invariant: a sink failure on one file is that file's alone: the rest of the route is still offered, and the
+// failed file is offered again on the next scan.
+test('a file whose offer throws does not stop the scan, and is retried', async () => {
+  let failFirst = true;
+  const { me, t, offers, root } = await recordingShare({
+    answer: (i) => { if (failFirst && i.bytes.toString() === 'first') { failFirst = false; throw new Error('boom'); } return { retry: false }; },
+  });
+  const dir = path.join(root, 'directory', me.fp);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${'1'.repeat(13)}-${'1'.repeat(32)}.rec`), 'first');
+  fs.writeFileSync(path.join(dir, `${'2'.repeat(13)}-${'2'.repeat(32)}.rec`), 'second');
+  await t.sync();
+  assert.deepEqual(offers.map((o) => o.bytes.toString()), ['first', 'second']);
+  await t.sync();
+  assert.deepEqual(offers.map((o) => o.bytes.toString()), ['first', 'second', 'first']);
+  await t.stop();
+});
+
+// Invariant: a peer cannot redirect this install's writes by swapping its writer subdir for a symlink.
+test('a writer subdir replaced by a symlink is refused, and nothing is written through it', async () => {
+  const { me, t, root } = await recordingShare();
+  const outside = tmpDir('code-inbox-outside-');
+  fs.mkdirSync(path.join(root, 'directory'), { recursive: true });
+  fs.symlinkSync(outside, path.join(root, 'directory', me.fp));
+  await assert.rejects(t.send(announceOf(me, 'alice'), { route: { kind: 'directory' }, to: [] }), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+  await t.stop();
+});
+
+// Invariant: records are read only from real files inside the share: a .rec symlink, or a writer subdir that is a
+// symlink, pointing out of the share is never read.
+test('symlinked record files and writer subdirs are not read', async () => {
+  const { me, t, offers, root } = await recordingShare();
+  const other = await loadIdentity(tmpDir());
+  const outside = tmpDir('code-inbox-outside-');
+  const target = path.join(outside, `${'1'.repeat(13)}-${'f'.repeat(32)}.rec`);
+  fs.writeFileSync(target, announceOf(me, 'alice'));
+  const dir = path.join(root, 'directory', me.fp);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.symlinkSync(target, path.join(dir, `${'1'.repeat(13)}-${'e'.repeat(32)}.rec`));
+  fs.symlinkSync(outside, path.join(root, 'directory', other.fp));
+  await t.sync();
+  assert.deepEqual(offers, []);
+  await t.stop();
+});

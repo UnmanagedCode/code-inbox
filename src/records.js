@@ -1,4 +1,5 @@
 import crypto from 'node:crypto';
+import { CodedError } from './errors.js';
 import { fingerprint, verifySignature } from './identity.js';
 
 // The wire format: the only module that knows how a record is laid out, signed and validated
@@ -12,6 +13,8 @@ export const FP_RE = /^[0-9a-f]{64}$/;
 export const ID_RE = /^[0-9a-f]{32}$/;
 export const ADDR_MAX = 8;
 export const ADDR_MAX_CHARS = 256;
+// The largest ts a JavaScript Date can represent: a later one could not be displayed.
+export const TS_MAX = 8_640_000_000_000_000;
 
 const DOMAIN = Buffer.from('code-inbox/v1\0', 'utf8');
 const ENVELOPE_KEYS = ['v', 'key', 'payload', 'sig'];
@@ -45,8 +48,9 @@ const isBool = (v) => typeof v === 'boolean';
 const isInt = (min) => (v) => Number.isSafeInteger(v) && v >= min;
 const oneOf = (...xs) => (v) => xs.includes(v);
 const isAddrList = (v) => Array.isArray(v) && v.length <= ADDR_MAX && v.every((a) => typeof a === 'string' && a.length > 0 && a.length <= ADDR_MAX_CHARS);
-const isIdList = (v) => Array.isArray(v) && v.every(isId) && new Set(v).size === v.length;
-const isBody = (v) => typeof v === 'string' && Buffer.byteLength(v, 'utf8') <= BODY_MAX_BYTES;
+const isIdOrNull = (v) => v === null || isId(v);
+const isBody = (v) => typeof v === 'string' && v.length > 0 && Buffer.byteLength(v, 'utf8') <= BODY_MAX_BYTES;
+const isTs = (v) => isInt(0)(v) && v <= TS_MAX;
 const NAME = Symbol('name');
 
 // Per type: field → check (`NAME` marks a name, refused as BAD_NAME); `optional` lists fields that may be absent.
@@ -57,8 +61,10 @@ const SCHEMA = {
   'invite-response': { fields: { to: isFp, invite: isId, inbox: isId, accept: isBool } },
   'join-request': { fields: { to: isFp, inbox: isId } },
   'join-response': { fields: { to: isFp, request: isId, inbox: isId, accept: (v) => v === false } },
-  member: { fields: { inbox: isId, seq: isInt(1), op: oneOf('add', 'remove'), member: isFp, keep: isIdList }, optional: ['keep'] },
-  msg: { fields: { inbox: isId, body: isBody, epoch: isInt(0) }, optional: ['epoch'] },
+  // A remove carries keepHead: the last of the member's messages the owner accepted (null: none). docs/protocol.md → Removal.
+  member: { fields: { inbox: isId, seq: isInt(1), op: oneOf('add', 'remove'), member: isFp, keepHead: isIdOrNull }, optional: ['keepHead'] },
+  // A shared-inbox message carries epoch and prev (the same sender's previous message there, null for its first).
+  msg: { fields: { inbox: isId, body: isBody, epoch: isInt(0), prev: isIdOrNull }, optional: ['epoch', 'prev'] },
 };
 export const RECORD_TYPES = Object.keys(SCHEMA);
 
@@ -68,10 +74,10 @@ const bad = (reason, detail) => ({ ok: false, reason, detail });
 // Resolves {ok:true} or {ok:false, reason, detail}.
 export function checkPayload(p) {
   if (!p || typeof p !== 'object' || Array.isArray(p)) return bad('BAD_PAYLOAD', 'payload is not an object');
-  const spec = SCHEMA[p.type];
+  const spec = typeof p.type === 'string' && Object.hasOwn(SCHEMA, p.type) ? SCHEMA[p.type] : null;
   if (!spec) return bad('BAD_PAYLOAD', `unknown type ${JSON.stringify(p.type)?.slice(0, 40)}`);
   if (!isFp(p.signer)) return bad('BAD_PAYLOAD', 'signer is not a fingerprint');
-  if (!isInt(0)(p.ts)) return bad('BAD_PAYLOAD', 'ts is not a non-negative integer');
+  if (!isTs(p.ts)) return bad('BAD_PAYLOAD', 'ts is not an integer from 0 to TS_MAX');
   const allowed = new Set(['type', 'signer', 'ts', ...Object.keys(spec.fields)]);
   for (const k of Object.keys(p)) if (!allowed.has(k)) return bad('BAD_PAYLOAD', `unexpected field ${JSON.stringify(k).slice(0, 40)}`);
   for (const [k, check] of Object.entries(spec.fields)) {
@@ -86,7 +92,8 @@ export function checkPayload(p) {
     }
   }
   if ('to' in p && p.to === p.signer) return bad('SELF_ADDRESSED', `${p.type} is addressed to its own signer`);
-  if (p.type === 'member' && p.op === 'add' && 'keep' in p) return bad('BAD_PAYLOAD', 'keep belongs to a remove only');
+  if (p.type === 'member' && (p.op === 'remove') !== ('keepHead' in p)) return bad('BAD_PAYLOAD', 'keepHead belongs to a remove, and every remove has one');
+  if (p.type === 'msg' && ('epoch' in p) !== ('prev' in p)) return bad('BAD_PAYLOAD', 'a shared message carries both epoch and prev; a personal one neither');
   if (p.type === 'inbox-create' && sharedInboxId(p.signer, p.nonce) !== p.inbox) return bad('INBOX_ID_MISMATCH', 'shared inbox id does not recompute');
   if (p.type === 'invite') {
     const expected = p.kind === 'personal' ? personalInboxId(p.signer, p.to, p.nonce) : sharedInboxId(p.signer, p.nonce);
@@ -106,7 +113,8 @@ function b64urlBytes(s) {
 const signedBytes = (payloadBytes) => Buffer.concat([DOMAIN, payloadBytes]);
 
 // Signs `payload` (validated first: an invalid one is a programming error and throws) as `identity`.
-// Resolves {bytes, id, payload}: `bytes` is exactly what is stored and sent.
+// Resolves {bytes, id, payload}: `bytes` is exactly what is stored and sent. A record over RECORD_MAX_BYTES, which
+// every reader would reject, is refused RECORD_TOO_LARGE before it is signed into existence.
 export function encodeRecord(identity, payload) {
   const check = checkPayload(payload);
   if (!check.ok) throw new Error(`cannot encode an invalid ${payload?.type} record: ${check.reason} (${check.detail})`);
@@ -118,13 +126,23 @@ export function encodeRecord(identity, payload) {
     payload: payloadBytes.toString('base64url'),
     sig: identity.sign(signedBytes(payloadBytes)).toString('base64url'),
   };
-  return { bytes: Buffer.from(JSON.stringify(envelope), 'utf8'), id: recordId(payloadBytes), payload };
+  const bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
+  if (bytes.length > RECORD_MAX_BYTES) throw new CodedError('RECORD_TOO_LARGE', `the ${payload.type} record would be ${bytes.length} bytes; readers accept at most ${RECORD_MAX_BYTES}`);
+  return { bytes, id: recordId(payloadBytes), payload };
 }
 
 // Verifies stored bytes, in order: size cap, strict envelope shape, Ed25519 signature, fingerprint(key) === signer,
 // payload schema. Resolves {ok:true, id, payload} or {ok:false, reason, detail}. `BAD_JSON` alone may be a file
-// still being written; every other reason is final.
+// still being written; every other reason is final. Total: any bytes give a verdict, never an exception.
 export function decodeRecord(bytes) {
+  try {
+    return decodeUnsafe(bytes);
+  } catch (err) {
+    return bad('BAD_PAYLOAD', `the record could not be decoded: ${String(err?.message ?? err).slice(0, 80)}`);
+  }
+}
+
+function decodeUnsafe(bytes) {
   if (bytes.length > RECORD_MAX_BYTES) return bad('TOO_LARGE', `${bytes.length} bytes`);
   const text = Buffer.from(bytes).toString('utf8');
   let env;

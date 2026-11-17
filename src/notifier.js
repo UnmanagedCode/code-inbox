@@ -39,9 +39,15 @@ export function createNotifier({ engine, cc, store, schedule = unrefTimeout, now
   const target = () => engine.settings().notifyTarget;
   const owed = () => engine.unseenSince(watermark);
 
+  // Flushes never overlap: a timer that fires while one is in flight re-arms instead, so no message is read as owed
+  // by two flushes before either has advanced the watermark.
   function arm(ms) {
     if (cancel || !target()) return;
-    cancel = schedule(() => { cancel = null; flushing = flush().finally(() => { flushing = null; }); }, ms);
+    cancel = schedule(() => {
+      cancel = null;
+      if (flushing) { arm(debounceMs); return; }
+      flushing = flush().finally(() => { flushing = null; });
+    }, ms);
   }
 
   function disarm() {

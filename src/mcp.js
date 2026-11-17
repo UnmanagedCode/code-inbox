@@ -24,6 +24,11 @@ function messageOf(err) {
 
 const who = (p) => `${p.name ?? 'unnamed'} [${p.fp.slice(0, 16)}]`;
 
+// The sender's clock as ISO text; a value no Date can show is printed raw rather than failing the whole read.
+function isoOf(ts) {
+  try { return new Date(ts).toISOString(); } catch { return `ts ${ts}`; }
+}
+
 // A frame marker no body can forge: random per response, and redrawn should a body happen to contain it.
 function frameNonce(bodies) {
   for (;;) {
@@ -42,7 +47,7 @@ export const TEXT_VIEWS = {
     if (messages.length === 0) return { text: `No messages to read in inbox ${inbox} (cursor ${cursor}).` };
     const nonce = frameNonce(messages.map((m) => m.body));
     const blocks = messages.map((m) => [
-      `Message ${m.id} (seq ${m.seq}) from ${who(m.sender)} at ${new Date(m.ts).toISOString()}:`,
+      `Message ${m.id} (seq ${m.seq}) from ${who(m.sender)} at ${isoOf(m.ts)}:`,
       `<<<UNTRUSTED-${nonce}`,
       m.body,
       `UNTRUSTED-${nonce}>>>`,

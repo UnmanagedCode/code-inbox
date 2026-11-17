@@ -23,6 +23,7 @@ export function createIndex() {
     joinResponses: new Map(), // join-request record id → [rec]
     members: new Map(), // inbox id → [rec]
     msgs: new Map(), // inbox id → [rec], in acceptance order
+    chains: new Map(), // `${inbox}:${signer}:${keepHead}` → {size, ids, missing}: keptChain's memo, valid while byId.size is unchanged
   };
 }
 
@@ -101,6 +102,27 @@ export const currentMembers = (index, inboxId) => membersAt(index, inboxId, curr
 
 // ---- authorization ----
 
+// The messages a removal keeps: `keepHead`, then each `prev` back, while each link is a known message by `signer` in
+// `inbox`. When a link is not known here yet, `missing` names it (null once the chain is complete).
+export function keptChain(index, inbox, signer, keepHead) {
+  const key = `${inbox}:${signer}:${keepHead}`;
+  const memo = index.chains.get(key);
+  if (memo && memo.size === index.byId.size) return memo;
+  const ids = new Set();
+  let missing = null;
+  for (let cur = keepHead; cur !== null && !ids.has(cur);) {
+    const r = index.byId.get(cur);
+    if (!r) { missing = cur; break; }
+    const p = r.payload;
+    if (p.type !== 'msg' || p.signer !== signer || p.inbox !== inbox) break;
+    ids.add(cur);
+    cur = p.prev ?? null;
+  }
+  const result = { size: index.byId.size, ids, missing };
+  index.chains.set(key, result);
+  return result;
+}
+
 const accept = { verdict: 'accept' };
 const pending = (reason) => ({ verdict: 'pending', reason });
 const reject = (reason) => ({ verdict: 'reject', reason });
@@ -120,10 +142,14 @@ function classifyMsg(index, rec) {
   const members = membersAt(index, p.inbox, p.epoch);
   if (!members) return pending('EPOCH_UNSEEN');
   if (!members.has(p.signer)) return reject('NOT_MEMBER');
-  // A later removal of the signer keeps only the messages its owner listed: a backdated epoch does not help.
+  // A later removal of the signer keeps only its messages on the prev chain back from the removal's keepHead: a
+  // backdated epoch, a fork or a message pre-signed before the removal is off that chain.
   for (const [seq, m] of memberChain(index, p.inbox)) {
     const mp = m.payload;
-    if (seq > p.epoch && mp.op === 'remove' && mp.member === p.signer && !(mp.keep ?? []).includes(rec.id)) return reject('REMOVED');
+    if (seq <= p.epoch || mp.op !== 'remove' || mp.member !== p.signer) continue;
+    const kept = keptChain(index, p.inbox, p.signer, mp.keepHead);
+    if (kept.ids.has(rec.id) || kept.missing === rec.id) continue;
+    return kept.missing === null ? reject('REMOVED') : pending('CHAIN_UNSEEN');
   }
   return accept;
 }
@@ -170,6 +196,17 @@ export function classify(index, rec) {
     default:
       return reject('BAD_PAYLOAD');
   }
+}
+
+// Whether this install, owner of `inv`'s shared inbox, still owes the invitee its admission: the invite's
+// effective response (responseOf) accepts, the invitee is not a member, and the invite was accepted here after the
+// invitee's last member record. A replayed or re-signed acceptance of an invite that predates a removal admits nobody.
+export function admissionDue(index, inv) {
+  const p = inv.payload;
+  if (p.kind !== 'shared' || responseOf(index, inv.id)?.payload.accept !== true) return false;
+  if (currentMembers(index, p.inbox)?.has(p.to)) return false;
+  const last = (index.members.get(p.inbox) ?? []).filter((m) => m.payload.member === p.to).reduce((mx, m) => Math.max(mx, m.seq), 0);
+  return inv.seq > last;
 }
 
 // A message is valid when it would still be accepted against everything known now (a later decline, removal or

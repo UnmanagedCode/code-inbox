@@ -1,15 +1,20 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
+import fs from 'node:fs';
+import path from 'node:path';
+import { loadIdentity } from '../src/identity.js';
 import { UNTRUSTED_NOTICE } from '../src/mcp.js';
+import { TS_MAX, encodeRecord } from '../src/records.js';
+import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { MANIFEST, connectPersonal, makeInstall, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
 
 const TOOLS = ['list_inboxes', 'read_messages', 'send_message'];
 
 async function pair() {
-  const { installs } = await makeNetwork(['alice', 'bob']);
+  const { shareDir, installs } = await makeNetwork(['alice', 'bob']);
   const [a, b] = installs;
   const inbox = await connectPersonal(a, b);
-  return { a, b, inbox, close: async () => { await a.close(); await b.close(); } };
+  return { shareDir, a, b, inbox, close: async () => { await a.close(); await b.close(); } };
 }
 
 // Invariant: every tool answers in both formats with the contract cc enforces (json: exactly {structured}, valid
@@ -94,4 +99,18 @@ test('malformed calls are coded refusals', async () => {
   assert.equal((await x.mcp.handle(null)).code, 'TOOL_UNKNOWN');
   assert.equal((await mcpCall(assert, x.mcp, 'read_messages', {}, 'json')).code, 'BAD_REQUEST');
   await x.close();
+});
+
+// Invariant: a peer's extreme (but valid) ts cannot break the text read of an inbox.
+test('the text view reads a message stamped at TS_MAX', async () => {
+  const { shareDir, a, b, inbox, close } = await pair();
+  const alice = await loadIdentity(a.dataDir);
+  const { bytes } = encodeRecord(alice, { type: 'msg', signer: a.fp, ts: TS_MAX, inbox, body: 'far future' });
+  const dir = path.join(shareDir, SHARE_ROOT, 'inboxes', inbox, a.fp);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, `${'0'.repeat(13)}-${'c'.repeat(32)}.rec`), bytes);
+  await syncAll([a, b]);
+  const { text } = await mcpCall(assert, b.mcp, 'read_messages', { inbox });
+  assert.match(text, /far future/);
+  await close();
 });

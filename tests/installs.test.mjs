@@ -5,7 +5,7 @@ import path from 'node:path';
 import { encodeRecord } from '../src/records.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
-import { connectPersonal, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
+import { connectPersonal, makeInstall, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
 
 // Several whole installs (engine, MCP, REST) over one temp share. "Human" sends go through each install's REST app
 // (POST api/inboxes/:id/messages), "agent" sends through the send_message tool.
@@ -172,7 +172,7 @@ async function sharedTeam(names = ['alice', 'bob', 'carol']) {
   return { ...net, inbox };
 }
 
-// Invariant: a removed member leaves the inbox for everyone; its earlier messages stay (keep), its sends are refused.
+// Invariant: a removed member leaves the inbox for everyone; its earlier messages stay (keepHead chain), its sends are refused.
 test('the owner removes a member: it leaves, its earlier messages stay, its sends are refused', async () => {
   const { installs, inbox } = await sharedTeam();
   const [a, b, c] = installs;
@@ -217,7 +217,7 @@ test('planted attacks are rejected and counted; valid traffic is unaffected', as
   const epoch = 1; // member records: 1 admits bob, 2 admits carol, 3 removes carol
 
   // 1. mallory's msg claiming to be bob, in bob's subdir: signed by mallory's key → SIGNER_MISMATCH
-  const asBob = { type: 'msg', signer: b.fp, ts: Date.now(), inbox, body: 'I am bob', epoch };
+  const asBob = { type: 'msg', signer: b.fp, ts: Date.now(), inbox, body: 'I am bob', epoch, prev: null };
   const forged = JSON.parse(encodeRecord(mallory, { ...asBob, signer: mallory.fp }).bytes);
   const pb = Buffer.from(JSON.stringify(asBob));
   forged.payload = pb.toString('base64url');
@@ -232,10 +232,11 @@ test('planted attacks are rejected and counted; valid traffic is unaffected', as
   // 3. a message of alice's copied from the personal inbox into the shared one
   plant(shareDir, ['inboxes', inbox, a.fp], real, 3);
   // 4. a non-member's (mallory's) correctly signed message, in its own subdir
-  plant(shareDir, ['inboxes', inbox, mallory.fp], encodeRecord(mallory, { type: 'msg', signer: mallory.fp, ts: Date.now(), inbox, body: 'let me in', epoch: 2 }).bytes, 4);
-  // 5. carol (removed at epoch 3) writes on, citing her old epoch
+  plant(shareDir, ['inboxes', inbox, mallory.fp], encodeRecord(mallory, { type: 'msg', signer: mallory.fp, ts: Date.now(), inbox, body: 'let me in', epoch: 2, prev: null }).bytes, 4);
+  // 5. carol (removed at epoch 3) writes on, citing her old epoch and chaining onto her last kept message
   const carolId = await loadIdentity(c.dataDir);
-  plant(shareDir, ['inboxes', inbox, c.fp], encodeRecord(carolId, { type: 'msg', signer: c.fp, ts: Date.now(), inbox, body: 'carol after', epoch: 2 }).bytes, 5);
+  const carolLast = a.engine.messages(inbox).at(-1).id;
+  plant(shareDir, ['inboxes', inbox, c.fp], encodeRecord(carolId, { type: 'msg', signer: c.fp, ts: Date.now(), inbox, body: 'carol after', epoch: 2, prev: carolLast }).bytes, 5);
   await syncAll(installs);
 
   const reasons = (x) => x.engine.state().diagnostics.recent.map((r) => r.reason);
@@ -250,5 +251,65 @@ test('planted attacks are rejected and counted; valid traffic is unaffected', as
   await syncAll(installs);
   assert.deepEqual(bodies(await agentRead(a, inbox)), ['carol before', 'bob after']);
   assert.deepEqual(bodies(await agentRead(a, personal)), ['personal before', 'personal after']);
+  await closeAll(installs);
+});
+
+// Invariant: removal is a fixed-size record, so removing a member that wrote more messages than a keep list could
+// hold is accepted by every reader, survives the owner's restart, and still keeps the member's earlier messages.
+test('a removal after hundreds of messages is accepted everywhere and survives the owner\'s restart', { timeout: 60_000 }, async () => {
+  const { shareDir, installs, inbox } = await sharedTeam(['alice', 'bob', 'carol']);
+  const [a, b, c] = installs;
+  const COUNT = 800;
+  for (let i = 0; i < COUNT; i += 1) await c.engine.sendMessage(inbox, `carol ${i}`);
+  await syncAll(installs);
+  await a.engine.removeMember(inbox, c.fp);
+  await syncAll(installs);
+  const membersOf = (x) => x.engine.listInboxes().find((i) => i.id === inbox)?.members.map((m) => m.name).sort();
+  for (const x of [a, b]) {
+    assert.deepEqual(membersOf(x), ['alice', 'bob'], `${x.name} applied the removal`);
+    assert.equal(x.engine.messages(inbox).length, COUNT, `${x.name} keeps carol's messages`);
+    assert.equal(x.engine.state().diagnostics.rejected, 0);
+  }
+  assert.deepEqual(c.engine.listInboxes(), [], 'carol sees herself removed');
+  await a.close();
+  const restarted = await makeInstall(null, { dataDir: a.dataDir });
+  assert.deepEqual(membersOf(restarted), ['alice', 'bob'], 'the removal survives the restart');
+  assert.equal(restarted.engine.messages(inbox).length, COUNT);
+  // carol writes on, chaining onto her last message: rejected by everyone.
+  const carolId = await loadIdentity(c.dataDir);
+  const last = restarted.engine.messages(inbox).at(-1).id;
+  plant(shareDir, ['inboxes', inbox, c.fp], encodeRecord(carolId, { type: 'msg', signer: c.fp, ts: Date.now(), inbox, body: 'after removal', epoch: 2, prev: last }).bytes, 9);
+  await syncAll([restarted, b]);
+  for (const x of [restarted, b]) assert.equal(x.engine.messages(inbox).length, COUNT);
+  await restarted.close();
+  await b.close();
+  await c.close();
+});
+
+// Invariant: a removed member cannot re-admit itself by re-signing an acceptance of the invite it was admitted by;
+// an honest re-invite after the removal admits it again.
+test('a replayed acceptance re-admits nobody; a fresh invite does', async () => {
+  const { shareDir, installs } = await makeNetwork(['alice', 'bob']);
+  const [a, b] = installs;
+  const { id: inbox } = await a.engine.createSharedInbox('team');
+  await syncAll(installs);
+  const inv = await a.engine.inviteMember(inbox, b.fp);
+  await syncAll(installs);
+  await b.engine.respondInvite(inv.id, true);
+  await syncAll(installs);
+  assert.equal(a.engine.listInboxes()[0].members.length, 2, 'bob admitted');
+  await a.engine.removeMember(inbox, b.fp);
+  await syncAll(installs);
+  const bobId = await loadIdentity(b.dataDir);
+  const replay = encodeRecord(bobId, { type: 'invite-response', signer: b.fp, ts: Date.now() + 1, to: a.fp, invite: inv.id, inbox, accept: true });
+  plant(shareDir, ['mailbox', a.fp, b.fp], replay.bytes, 7);
+  await syncAll(installs);
+  assert.deepEqual(a.engine.listInboxes()[0].members.map((m) => m.name), ['alice'], 'still removed');
+  assert.deepEqual(b.engine.listInboxes(), []);
+  const again = await a.engine.inviteMember(inbox, b.fp);
+  await syncAll(installs);
+  await b.engine.respondInvite(again.id, true);
+  await syncAll(installs);
+  assert.deepEqual(a.engine.listInboxes()[0].members.map((m) => m.name).sort(), ['alice', 'bob']);
   await closeAll(installs);
 });
