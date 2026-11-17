@@ -94,7 +94,13 @@ Pending while the inbox or the epoch is unseen.
 - While a link of the chain is unseen, a message not yet reached waits (`CHAIN_UNSEEN`); the link, when it arrives, is reached by the walk. Once the walk ends without reaching a message, that message is refused for good.
 - After a re-add, messages citing the new epoch are valid again; a re-added sender chains onto its last valid message, never onto one the removal refused.
 - Validity is recomputed against everything known, so a message accepted before a removal that does not reach it becomes **hidden** everywhere, together with everything built on it.
-- **Convergence:** pending records and refused ids take part in every verdict, refusals are terminal, and refused ids are kept across restarts (`rejected.ndjson`). The rule is built so readers that end with the same records reach the same verdicts whatever order they arrived in. The test "readers fed the same records in any order reach identical verdicts with nothing pending" checks this on one record set (two removals, a re-add, chains, a fork, a stale write, pre-signed links) in fixed and seeded shuffled orders, and across a reader restart. One exception is an equivocating owner: two member records with one `seq` resolve to the lowest id, which a later-arriving record can change.
+- **Convergence:** pending records and refused ids take part in every verdict, refusals are terminal, and refused ids are kept across restarts (`rejected.ndjson`). The rule is built so readers that end with the same records hold the same **valid** and **refused** sets, whatever order the records arrived in. Whether a refused message was refused at ingest or accepted first and invalidated later depends on arrival order; which messages are valid does not. The test "readers fed the same records in any order reach the same valid and refused sets with nothing pending" checks this on one record set (two removals, a re-add, chains, a fork, a stale write, pre-signed links) in fixed and seeded shuffled orders, and across a reader restart.
+- **Equivocation breaks convergence, for the equivocator's own relationship only.** Where the protocol picks the lowest record id among conflicting records, a party that signs two conflicting ones can make readers diverge:
+  - an owner signing two `member` records with one `seq`;
+  - an invitee signing both an accept and a decline of one invite: one reader can refuse a message `INVITE_DECLINED` that another holds valid;
+  - an inviter signing two personal invites for one inbox id.
+
+  The divergence is permanent: a message a reader has already refused stays refused, even once the conflicting record arrives. Only the inbox relationship of the party that equivocated is affected; no third party can cause it or gain from it.
 
 ### Admission after an accepted shared invite
 

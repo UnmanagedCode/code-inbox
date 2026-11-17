@@ -4,7 +4,7 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeRecord, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addPending, addRecord, addRejected, admissionDue, classify, createIndex, inboxVerdicts, removePending, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
+  addPending, addRecord, addRejected, admissionDue, classify, createIndex, inboxVerdicts, isValidMessage, removePending, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
   messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
@@ -215,7 +215,11 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
   // The id of the last valid message by `signer` in `inbox` (acceptance order), or null: a sender's `prev`, an
   // owner's `keepHead`. Never an invalid one: validity is prefix-closed along prev.
-  const lastValidOf = (inbox, signer) => messagesOf(index, inbox).filter((m) => m.payload.signer === signer).at(-1)?.id ?? null;
+  function lastValidOf(inbox, signer) {
+    const msgs = index.msgs.get(inbox) ?? [];
+    for (let i = msgs.length - 1; i >= 0; i -= 1) if (msgs[i].payload.signer === signer && isValidMessage(index, msgs[i])) return msgs[i].id;
+    return null;
+  }
 
   // ---- guards ----
 

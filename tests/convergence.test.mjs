@@ -11,7 +11,7 @@ import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { makeInstall, makeNetwork, silentLog, syncAll, tmpDir } from './helpers.mjs';
 
 // The removal rule end to end: what a removed member signs is never accepted unless the owner held that exact
-// message when it removed them, and every reader that ends with the same records reaches the same verdicts.
+// message when it removed them, and every reader that ends with the same records holds the same valid and refused sets.
 
 let planted = 0;
 function plant(shareDir, inbox, fp, bytes) {
@@ -158,9 +158,9 @@ function shuffle(list, seed) {
 
 // Invariant: verdicts are a function of the record set alone: readers fed one record set covering membership
 // changes, two removals, a re-add, chains, a fork, a stale write and a pre-signed link, in many seeded orders (and
-// with the owner's or the member's dir scanned first), reach identical verdicts, equal to the owner's, with nothing
+// with the owner's or the member's dir scanned first), hold the same valid and refused sets as the owner, with nothing
 // pending; a reader restarted from its data dir keeps them.
-test('readers fed the same records in any order reach identical verdicts with nothing pending', { timeout: 120_000 }, async () => {
+test('readers fed the same records in any order reach the same valid and refused sets with nothing pending', { timeout: 120_000 }, async () => {
   const { shareDir, installs, inbox } = await team(['alice', 'bob', 'dave']);
   const [a, b, d] = installs;
   const bob = await loadIdentity(b.dataDir);

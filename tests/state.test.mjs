@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
-  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
+  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
 } from '../src/state.js';
 
 // Pure fold tests: synthetic records (the fold trusts records.js for signatures and id recomputation).
@@ -228,6 +228,25 @@ test('a removal after hundreds of messages keeps them all through one keepHead',
   addRecord(index, removal);
   assert.equal(JSON.stringify(removal.payload).length < 400, true);
   assert.deepEqual(messagesOf(index, INBOX).map((m) => m.id), all);
+});
+
+// Invariant: chain length is not an availability limit: one sender's 20k-message chain, judged message by message
+// as it arrives and again in full after a removal clears the settled verdicts, ends all valid with nothing pending.
+test('a 20k-message chain from one sender is valid end to end, before and after a removal', () => {
+  const index = buildIndex([create(), member(1, 'add', B)]);
+  const N = 20_000;
+  let prev = null;
+  for (let i = 0; i < N; i += 1) {
+    const m = msg(B, { epoch: 1, prev });
+    const c = classify(index, m);
+    if (c.verdict !== 'accept') assert.fail(`message ${i}: ${JSON.stringify(c)}`);
+    addRecord(index, m);
+    prev = m.id;
+  }
+  addRecord(index, member(2, 'remove', B, { keepHead: prev }));
+  const v = inboxVerdicts(index, INBOX);
+  assert.equal(v.valid.length, N);
+  assert.deepEqual([v.invalid, v.pending, v.rejected], [[], [], []]);
 });
 
 // Invariant: a re-added member writes again by citing the new epoch, on top of its last valid message.

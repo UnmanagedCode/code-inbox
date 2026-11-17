@@ -27,25 +27,24 @@ export function createIndex() {
     msgs: new Map(), // inbox id → [rec], in acceptance order
     pending: new Map(), // record id → {id, payload, …}: verified, route-bound, waiting for a dependency
     rejected: new Map(), // record id → {reason, type, inbox, signer}: refused for good
-    version: 0, // bumped on every change; the memo below is valid for one version
-    memo: { version: -1, verdicts: new Map(), chains: new Map() },
+    // Settled message verdicts (accept/reject; never pending) and completed kept-chain walks. A walk that ended is
+    // fixed by the hash chain; a settled verdict changes only through a record that is not a msg or an announce
+    // (membership and removals, invites, responses, inbox-creates), which clears `verdicts`. A new message, a pending
+    // record or a refusal can only settle what was undecided, and undecided verdicts are never kept.
+    verdicts: new Map(),
+    chains: new Map(),
   };
 }
 
-export function addPending(index, rec) { index.pending.set(rec.id, rec); index.version += 1; }
-export function removePending(index, id) { index.pending.delete(id); index.version += 1; }
-export function addRejected(index, id, info) { index.rejected.set(id, info); index.version += 1; }
-
-function memoOf(index) {
-  if (index.memo.version !== index.version) index.memo = { version: index.version, verdicts: new Map(), chains: new Map() };
-  return index.memo;
-}
+export const addPending = (index, rec) => { index.pending.set(rec.id, rec); };
+export const removePending = (index, id) => { index.pending.delete(id); };
+export const addRejected = (index, id, info) => { index.rejected.set(id, info); };
 
 // Adds an accepted record to the index (mutates it). Idempotent by id.
 export function addRecord(index, rec) {
   if (index.byId.has(rec.id)) return;
   index.byId.set(rec.id, rec);
-  index.version += 1;
+  if (rec.payload.type !== 'msg' && rec.payload.type !== 'announce') index.verdicts.clear();
   index.maxSeq = Math.max(index.maxSeq, rec.seq);
   const p = rec.payload;
   switch (p.type) {
@@ -122,8 +121,7 @@ export const currentMembers = (index, inboxId) => membersAt(index, inboxId, curr
 // ids reached are exactly messages the owner had accepted. Resolves {ids, missing}: `missing` is the first link not
 // seen here yet (null when the walk ended: at null, at a rejected link, or at a record that is not the member's).
 function keptChain(index, removal) {
-  const memo = memoOf(index);
-  const cached = memo.chains.get(removal.id);
+  const cached = index.chains.get(removal.id);
   if (cached) return cached;
   const { inbox, member, keepHead } = removal.payload;
   const ids = new Set();
@@ -137,7 +135,7 @@ function keptChain(index, removal) {
     cur = p.prev;
   }
   const result = { ids, missing };
-  memo.chains.set(removal.id, result);
+  if (missing === null) index.chains.set(removal.id, result);
   return result;
 }
 
@@ -145,7 +143,7 @@ const accept = { verdict: 'accept' };
 const pending = (reason) => ({ verdict: 'pending', reason });
 const reject = (reason) => ({ verdict: 'reject', reason });
 
-function classifyMsg(index, rec) {
+function classifyMsg(index, rec, local) {
   const p = rec.payload;
   const invite = personalInvite(index, p.inbox);
   if (invite) {
@@ -167,7 +165,7 @@ function classifyMsg(index, rec) {
     if (!prev) return pending('PREV_UNSEEN');
     const pp = prev.payload;
     if (pp.type !== 'msg' || pp.signer !== p.signer || pp.inbox !== p.inbox) return reject('BAD_PREV');
-    const pv = verdictOf(index, prev);
+    const pv = index.verdicts.get(prev.id) ?? local?.get(prev.id) ?? verdictOf(index, prev);
     if (pv.verdict === 'reject') return reject('PREV_REJECTED');
     if (pv.verdict === 'pending') return pending('PREV_UNSETTLED');
   }
@@ -183,11 +181,26 @@ function classifyMsg(index, rec) {
   return accept;
 }
 
-// The verdict of an accepted message against everything known now, memoized per index version.
+// The verdict of a message against everything known now. Iterative: it follows `prev` down through accepted
+// messages to the first one already settled (or a root), then judges the path from there up, so a chain of any
+// length costs one pass and no stack. Settled verdicts are kept (index.verdicts); pending ones only for this pass.
 function verdictOf(index, rec) {
-  const memo = memoOf(index);
-  let v = memo.verdicts.get(rec.id);
-  if (!v) { v = classifyMsg(index, rec); memo.verdicts.set(rec.id, v); }
+  const settled = index.verdicts.get(rec.id);
+  if (settled) return settled;
+  const path = [];
+  const onPath = new Set();
+  for (let cur = rec; cur && !index.verdicts.has(cur.id) && !onPath.has(cur.id);) {
+    path.push(cur);
+    onPath.add(cur.id);
+    const prev = cur.payload.type === 'msg' && typeof cur.payload.prev === 'string' ? index.byId.get(cur.payload.prev) : null;
+    cur = prev?.payload.type === 'msg' ? prev : null;
+  }
+  const local = new Map();
+  let v;
+  for (let i = path.length - 1; i >= 0; i -= 1) {
+    v = classifyMsg(index, path[i], local);
+    if (v.verdict === 'pending') local.set(path[i].id, v); else if (index.byId.has(path[i].id)) index.verdicts.set(path[i].id, v); else local.set(path[i].id, v);
+  }
   return v;
 }
 

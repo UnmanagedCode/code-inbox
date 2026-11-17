@@ -64,7 +64,7 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 ### Message validity is recomputed
 
-`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal whose kept chain does not reach a message (and so everything built on it), or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install. Verdicts are memoized per index version (`memoOf`), bumped on every change to the accepted, pending or refused sets.
+`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal whose kept chain does not reach a message (and so everything built on it), or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install. `verdictOf` follows `prev` iteratively down to the first settled message and judges the path upward, so chain length costs neither stack nor a re-walk. Settled verdicts (valid or refused) are kept in `index.verdicts` and cleared only when a record other than a `msg` or `announce` is accepted (membership, removals, invites, responses); a completed kept-chain walk is kept per removal. Undecided verdicts are never kept.
 
 ## Notifier lifecycle
 
