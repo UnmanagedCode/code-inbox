@@ -93,7 +93,7 @@ Module responsibilities, the data dir and the ingest pipeline: [docs/architectur
 | `READ_LIMIT_DEFAULT`, `READ_LIMIT_MAX` | `src/engine.js` | `read_messages` page size |
 | `OUTBOX_RETRY_MS` | `src/engine.js` | How often writes waiting in the outbox are re-sent |
 | `TCP_LOOKUP_MS` | `src/transport/addr.js` | How long a TCP or hub host's DNS lookup may take when settings are checked |
-| `HUB_DEFAULT_PORT`, `HUB_MAX_LINKS`, `HUB_MAX_HANDSHAKING`, `HUB_MAX_STREAMS`, `HUB_WRITE_BUFFER_MAX`, `HUB_CONTROL_BUFFER_MAX` | `src/hub/hub.js` | The hub's default port (host `127.0.0.1`); link, handshake and per-link stream caps; stream data held toward one stream end; control-frame room per link. The hub holds at most `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` + `HUB_CONTROL_BUFFER_MAX` toward one link ([docs/hub.md → Limits](docs/hub.md#limits-srchubhubjs-srctransportframesjs)) |
+| `HUB_DEFAULT_PORT`, `HUB_MAX_LINKS`, `HUB_MAX_HANDSHAKING`, `HUB_MAX_STREAMS`, `HUB_WRITE_BUFFER_MAX`, `HUB_CONTROL_BUFFER_MAX` | `src/hub/hub.js` | The hub's default port (host `127.0.0.1`); link, handshake and per-link stream caps; stream data held toward one stream end; how far a link's whole total (data and control frames) may pass its data total. The hub holds at most `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` + `HUB_CONTROL_BUFFER_MAX` toward one link ([docs/hub.md → Limits](docs/hub.md#limits-srchubhubjs-srctransportframesjs)) |
 | `HUB_FRAME_MAX`, `HUB_CHUNK_BYTES`, `HUB_WATCH_MAX` | `src/transport/frames.js` | Hub-link frame size; tunneled bytes per `data` frame; fps per watch |
 | `HUB_STREAM_BUFFER_MAX` | `src/transport/hubClient.js` | Inbound bytes a paused stream holds before it is closed |
 

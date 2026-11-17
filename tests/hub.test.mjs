@@ -595,6 +595,42 @@ test('filling every stream to a non-reading receiver closes streams, never its l
   assert.ok(of(R.frames, 'close').every((f) => f.reason === 'LIMIT'));
 });
 
+// Invariant (review R1): control frames owed to a link that holds its whole data budget and does not read are
+// dropped and counted, never the link: here the receiver itself asks for `present` answers it cannot take.
+test('control frames a full link cannot take are dropped, never the link', async (t) => {
+  const accepted = [];
+  const createServer = (onConn) => net.createServer((s) => { accepted.push(s); onConn(s); });
+  const limits = { maxStreams: 2, writeBufferMax: 8192, controlBufferMax: 1024 };
+  const { hub, port } = await startHub(t, { limits, createServer });
+  const [r, a] = [await newIdentity(), await newIdentity()];
+  const R = await rawHubLink(port, [r]);
+  const A = await rawHubLink(port, [a]);
+  closeAll(t, R, A);
+  A.send({ t: 'open', s: 1, to: r.fp });
+  A.send({ t: 'open', s: 3, to: r.fp });
+  await R.nextOf('incoming');
+  await R.nextOf('incoming');
+  accepted[0].cork();
+  // Each stream end just under its cap: together the link's data total, all but a frame's worth.
+  const chunk = 'D'.repeat(2600);
+  for (const s of [1, 3]) for (let i = 0; i < 3; i += 1) A.send({ t: 'data', s, b: chunk });
+  A.send({ t: 'ping' });
+  await A.nextOf('pong');
+  assert.deepEqual(of(A.frames, 'close'), [], 'no stream over its cap');
+  const held = accepted[0].writableLength;
+  assert.ok(held > limits.maxStreams * limits.writeBufferMax - 3000, `${held} bytes of data held`);
+  const before = hub.stats().dropped;
+  for (let id = 1; id <= 60; id += 1) R.send({ t: 'watch', id, fps: [a.fp] });
+  await waitFor(() => hub.stats().dropped > before, 'present answers to be dropped');
+  assert.ok(accepted[0].writableLength <= limits.maxStreams * limits.writeBufferMax + limits.controlBufferMax);
+  assert.equal(hub.stats().links, 2);
+  accepted[0].uncork();
+  R.send({ t: 'ping' });
+  await R.nextOf('pong');
+  assert.equal(R.closed, false);
+  assert.equal(of(R.frames, 'data').length, 6, 'every data chunk arrived');
+});
+
 // Invariant (conductor note 1, client side): a session's back-pressure counts only its own unflushed bytes, so a
 // session with bytes waiting on the shared hub link does not close another session on that link.
 test('a busy session on a hub link does not close another session on it', async (t) => {

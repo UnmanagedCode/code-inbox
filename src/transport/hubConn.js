@@ -14,12 +14,13 @@ import { makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
  * @param {{handshakeMs, frameMs, idleMs, pingMs, writeBufferMax}} o.limits   writeBufferMax: unflushed link bytes
  * @param {boolean} [o.dropOverflow]   a frame that would pass writeBufferMax is dropped (send → false) instead of
  *                                     destroying the link: the hub, so no stream or peer can cost a client its link
+ * @param {() => void} [o.onDrop]      each frame dropped that way, its own pings and pongs included
  * @param {(conn, fps: string[]) => void} [o.onRegistered]  hub: a registration verified, before `ok` is sent
  * @param {(conn) => void} [o.onReady]
  * @param {(conn, frame) => void} o.onFrame             every ready-phase frame but ping/pong/bye; may throw FrameError
  * @param {(conn) => void} o.onClose                    once, ready or not
  */
-export function createHubConn({ socket, role, signers = [], limits, dropOverflow = false, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
+export function createHubConn({ socket, role, signers = [], limits, dropOverflow = false, onDrop = () => {}, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
   const decoder = createDecoder({ maxFrame: TCP_HELLO_FRAME_MAX });
   const myNonce = newHandshakeNonce();
   let phase = 'hello';
@@ -36,7 +37,6 @@ export function createHubConn({ socket, role, signers = [], limits, dropOverflow
     // Resolves true once ready, false if the link ends first.
     established: new Promise((r) => { settle = r; }),
     send,
-    buffered: () => socket.writableLength,
     close,
     destroy,
   };
@@ -47,7 +47,7 @@ export function createHubConn({ socket, role, signers = [], limits, dropOverflow
   function send(frame, onFlushed) {
     if (conn.closed || socket.destroyed) return false;
     const buf = Buffer.isBuffer(frame) ? frame : encodeFrame(frame);
-    if (dropOverflow && socket.writableLength + buf.length > limits.writeBufferMax) return false;
+    if (dropOverflow && socket.writableLength + buf.length > limits.writeBufferMax) { onDrop(); return false; }
     socket.write(buf, onFlushed);
     if (socket.writableLength > limits.writeBufferMax) { destroy(); return false; }
     return true;
