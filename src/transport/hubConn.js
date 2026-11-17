@@ -12,12 +12,14 @@ import { makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
  * @param {'hub'|'client'} o.role
  * @param {{fp, publicRaw, signProof}[]} [o.signers]   client: every identity to register
  * @param {{handshakeMs, frameMs, idleMs, pingMs, writeBufferMax}} o.limits   writeBufferMax: unflushed link bytes
+ * @param {boolean} [o.dropOverflow]   a frame that would pass writeBufferMax is dropped (send → false) instead of
+ *                                     destroying the link: the hub, so no stream or peer can cost a client its link
  * @param {(conn, fps: string[]) => void} [o.onRegistered]  hub: a registration verified, before `ok` is sent
  * @param {(conn) => void} [o.onReady]
  * @param {(conn, frame) => void} o.onFrame             every ready-phase frame but ping/pong/bye; may throw FrameError
  * @param {(conn) => void} o.onClose                    once, ready or not
  */
-export function createHubConn({ socket, role, signers = [], limits, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
+export function createHubConn({ socket, role, signers = [], limits, dropOverflow = false, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
   const decoder = createDecoder({ maxFrame: TCP_HELLO_FRAME_MAX });
   const myNonce = newHandshakeNonce();
   let phase = 'hello';
@@ -34,15 +36,19 @@ export function createHubConn({ socket, role, signers = [], limits, schedule, on
     // Resolves true once ready, false if the link ends first.
     established: new Promise((r) => { settle = r; }),
     send,
+    buffered: () => socket.writableLength,
     close,
     destroy,
   };
 
   // `frame`: an object, or bytes already encoded. `onFlushed` runs once the bytes leave the process (or the socket
-  // dies). Over `writeBufferMax` unflushed bytes the link is destroyed.
+  // dies). Over `writeBufferMax` unflushed bytes the link is destroyed, or with `dropOverflow` the frame is not
+  // written. False when nothing was written.
   function send(frame, onFlushed) {
     if (conn.closed || socket.destroyed) return false;
-    socket.write(Buffer.isBuffer(frame) ? frame : encodeFrame(frame), onFlushed);
+    const buf = Buffer.isBuffer(frame) ? frame : encodeFrame(frame);
+    if (dropOverflow && socket.writableLength + buf.length > limits.writeBufferMax) return false;
+    socket.write(buf, onFlushed);
     if (socket.writableLength > limits.writeBufferMax) { destroy(); return false; }
     return true;
   }

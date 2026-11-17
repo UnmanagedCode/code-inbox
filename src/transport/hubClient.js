@@ -136,7 +136,7 @@ function hubLink({ url, connect }) {
     const linkLimits = { handshakeMs: lim.handshakeMs, frameMs: lim.frameMs, idleMs: lim.idleMs, pingMs: lim.pingMs, writeBufferMax: lim.maxConnections * lim.writeBufferMax };
     let conn = null; // the current link connection: connecting or registered
     let error = null;
-    let halted = false; // replaced by a duplicate registration: no reconnect until a binding starts again
+    let halted = false; // replaced by a duplicate registration: no reconnect until a binding starts or detaches
     let failures = 0;
     let retry = null; // cancel of the scheduled reconnect
     let present = new Set();
@@ -304,8 +304,10 @@ function hubLink({ url, connect }) {
         leave();
         connectNow();
       },
+      // Re-registers the identities that remain, whatever the link's state: up, backing off, or stopped by a duplicate
+      // (the detached identity may have been the duplicated one).
       identitiesChanged() {
-        if (!conn) return;
+        halted = false;
         leave();
         connectNow();
       },

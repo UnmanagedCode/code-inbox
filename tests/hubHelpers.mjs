@@ -145,18 +145,21 @@ export async function tunnelPeer(link, identity, target, { s = 1, onFrame } = {}
 
 // A test-only hub that lies, built on hubConn (role `hub`). It verifies registrations like the real one, answers a
 // watch with every registered fp in it, relays streams faithfully by default and records what each link sent.
+//   refuse: answer every registration `bye PROOF`; `accepted` counts the connections made
 //   route(to, from) → the link an `open` goes to (default: the one that registered `to`), or null for ABSENT
 //   onOpen(link, f) → true when the test handled the open itself
 //   inject(link, s, frame) writes an endpoint frame into stream `s` of `link`; notify(link, frame) a hub frame
 //   linkOf(fp), received(link) → the frames that link sent
-export async function lyingHub(t, { route, onOpen } = {}) {
+export async function lyingHub(t, { route, onOpen, refuse = false } = {}) {
   const links = new Set();
   const byFp = new Map();
   const limits = { ...SESSION_LIMITS, writeBufferMax: 64 * 1024 * 1024 };
+  let accepted = 0;
   const srv = net.createServer((socket) => {
+    accepted += 1;
     const link = createHubConn({
       socket, role: 'hub', limits, schedule: (fn, ms) => { const x = setTimeout(fn, ms); x.unref(); return () => clearTimeout(x); },
-      onRegistered: (c, fps) => { for (const fp of fps) byFp.set(fp, c); },
+      onRegistered: (c, fps) => { if (refuse) c.close('PROOF'); else for (const fp of fps) byFp.set(fp, c); },
       onReady: () => {},
       onFrame: (c, f) => {
         c.got.push(f);
@@ -195,6 +198,7 @@ export async function lyingHub(t, { route, onOpen } = {}) {
   const lying = {
     port,
     url: `hub://127.0.0.1:${port}`,
+    get accepted() { return accepted; },
     linkOf: (fp) => byFp.get(fp) ?? null,
     received: (link) => link.got,
     // The stream id `link` uses for the stream it shares with `other` (a relayed pair), or null.

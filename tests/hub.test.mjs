@@ -12,7 +12,7 @@ import { HUB_FRAME_MAX, HUB_WATCH_MAX, TCP_HELLO_FRAME_MAX } from '../src/transp
 import { makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
 import { createHubEndpoint, resolveHubConfig } from '../src/transport/hubClient.js';
 import { routeKey } from '../src/transport/index.js';
-import { TCP_REDIAL_MAX_MS, createTcpEndpoint } from '../src/transport/tcp.js';
+import { TCP_REDIAL_MAX_MS, TCP_REDIAL_MIN_MS, createTcpEndpoint } from '../src/transport/tcp.js';
 import { fakeClock, makeInstall, silentLog, tmpDir } from './helpers.mjs';
 import { hubNode, lyingHub, rawHubLink, startHub, tunnelPeer } from './hubHelpers.mjs';
 import { freePort, memCursors, personal, rawConnect, settle, stubSink, stubView, waitFor } from './tcpHelpers.mjs';
@@ -182,6 +182,72 @@ test('a client that re-registers its own identities is not stopped as its own du
   closeAll(t, m);
   m.send({ t: 'open', s: 1, to: alice.fp });
   assert.equal((await m.tunnel(1).nextOf('hello')).t, 'hello');
+});
+
+// Invariant (review C2): a connection the client has left never arms a reconnect: after re-registering on a detach,
+// or after close() with a binding still attached, the redial delay passes with exactly the links expected.
+test('a link the client left arms no reconnect', async (t) => {
+  const clock = fakeClock();
+  const { hub, url } = await startHub(t);
+  const shared = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
+  const alice = await hubNode('alice', { url, endpoint: shared, schedule: clock.schedule, now: clock.now });
+  const carol = await hubNode('carol', { url, endpoint: shared, schedule: clock.schedule, now: clock.now });
+  t.after(async () => { await alice.close(); await carol.close(); shared.close(); });
+  await waitFor(() => hub.stats().fps === 2 && alice.connected(), 'both identities on one link');
+  await carol.close();
+  await waitFor(() => hub.stats().fps === 1 && hub.stats().links === 1 && alice.connected(), 'alice re-registered alone');
+  clock.advance(2 * TCP_REDIAL_MIN_MS);
+  await sleep(50);
+  assert.deepEqual([hub.stats().links, alice.connected(), alice.transport.stats().hub.error], [1, true, null]);
+
+  const own = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
+  const bob = await hubNode('bob', { url, endpoint: own, schedule: clock.schedule, now: clock.now });
+  closeAll(t, bob);
+  await waitFor(() => bob.connected() && hub.stats().links === 2, 'bob registered');
+  own.close(); // the binding stays attached
+  await waitFor(() => hub.stats().links === 1, 'bob\'s link to go');
+  clock.advance(2 * TCP_REDIAL_MIN_MS);
+  await sleep(50);
+  assert.equal(hub.stats().links, 1);
+});
+
+// Invariant (review C1): detaching an identity re-registers the rest even after HUB_DUPLICATE stopped the link: a
+// copy of the detached identity no longer conflicts, so the client comes back.
+test('detaching the duplicated identity brings a stopped client back', async (t) => {
+  const { hub, port, url } = await startHub(t);
+  const shared = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog });
+  const alice = await hubNode('alice', { url, endpoint: shared });
+  const carol = await hubNode('carol', { url, endpoint: shared });
+  t.after(async () => { await alice.close(); await carol.close(); shared.close(); });
+  await waitFor(() => hub.stats().fps === 2 && alice.connected(), 'both identities on one link');
+  const copy = await rawHubLink(port, [carol.identity]);
+  closeAll(t, copy);
+  await waitFor(() => alice.transport.stats().hub.error?.code === 'HUB_DUPLICATE', 'HUB_DUPLICATE');
+  await carol.close();
+  await waitFor(() => alice.connected(), 'alice back on the hub');
+  assert.equal(alice.transport.stats().hub.error, null);
+  assert.equal(copy.closed, false);
+  assert.equal(hub.stats().fps, 2);
+});
+
+// Invariant (review C4): a hub that refuses the registration proof shows HUB_REFUSED, and the client keeps trying
+// with backoff (a refusal is not a duplicate).
+test('a hub that refuses the registration shows HUB_REFUSED and the client retries', async (t) => {
+  const clock = fakeClock();
+  const lying = await lyingHub(t, { refuse: true });
+  const alice = await hubNode('alice', { url: lying.url, schedule: clock.schedule, now: clock.now });
+  closeAll(t, alice);
+  await waitFor(() => alice.transport.stats().hub.error?.code === 'HUB_REFUSED', 'HUB_REFUSED');
+  assert.equal(lying.accepted, 1);
+  clock.advance(TCP_REDIAL_MIN_MS);
+  await waitFor(() => lying.accepted === 2, 'a reconnect after the backoff');
+  await sleep(20);
+  assert.equal(alice.transport.stats().hub.error.code, 'HUB_REFUSED');
+  clock.advance(TCP_REDIAL_MIN_MS);
+  await sleep(50);
+  assert.equal(lying.accepted, 2, 'the second wait is longer: backoff doubles');
+  clock.advance(TCP_REDIAL_MIN_MS);
+  await waitFor(() => lying.accepted === 3, 'the third attempt');
 });
 
 // ---- end-to-end authenticity through an untrusted hub ----
@@ -494,6 +560,39 @@ test('a slow receiver loses only the stream over its own cap', async (t) => {
   accepted[0].uncork();
   await waitFor(() => of(R.frames, 'data').length === 4, 'all four chunks at R');
   assert.deepEqual([...of(S1.frames, 'close'), ...of(S2.frames, 'close'), ...of(R.frames, 'close')], []);
+});
+
+// Invariant (review S1): stream caps never cost the receiver its link. A sender that fills every stream it may open
+// to a receiver that does not read, then keeps opening and filling, gets only LIMIT closes; the hub holds at most
+// its stated per-link bound toward the receiver, which keeps its link and reads everything once it reads again.
+test('filling every stream to a non-reading receiver closes streams, never its link', async (t) => {
+  const accepted = [];
+  const createServer = (onConn) => net.createServer((s) => { accepted.push(s); onConn(s); });
+  const limits = { maxStreams: 4, writeBufferMax: 8192, controlBufferMax: 4096 };
+  const { hub, port } = await startHub(t, { limits, createServer });
+  const [r, a] = [await newIdentity(), await newIdentity()];
+  const R = await rawHubLink(port, [r]);
+  const A = await rawHubLink(port, [a]);
+  closeAll(t, R, A);
+  accepted[0].cork();
+  const chunk = 'C'.repeat(2500);
+  let s = 1;
+  for (let round = 0; round < 3; round += 1) {
+    const opened = [];
+    for (let i = 0; i < limits.maxStreams; i += 1, s += 2) { A.send({ t: 'open', s, to: r.fp }); opened.push(s); }
+    for (let i = 0; i < 4; i += 1) for (const x of opened) A.send({ t: 'data', s: x, b: chunk });
+    A.send({ t: 'ping' });
+    await A.nextOf('pong');
+    await waitFor(() => opened.every((x) => A.frames.some((f) => f.t === 'close' && f.s === x)), `round ${round}: every stream closed`);
+    for (const x of opened) assert.equal(A.frames.find((f) => f.t === 'close' && f.s === x).reason, 'LIMIT');
+    assert.ok(accepted[0].writableLength <= limits.maxStreams * limits.writeBufferMax + limits.controlBufferMax, `round ${round}: ${accepted[0].writableLength} bytes held`);
+  }
+  assert.equal(hub.stats().links, 2);
+  accepted[0].uncork();
+  R.send({ t: 'ping' });
+  await R.nextOf('pong');
+  assert.equal(R.closed, false);
+  assert.ok(of(R.frames, 'close').every((f) => f.reason === 'LIMIT'));
 });
 
 // Invariant (conductor note 1, client side): a session's back-pressure counts only its own unflushed bytes, so a

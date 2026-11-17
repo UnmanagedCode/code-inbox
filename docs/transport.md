@@ -22,7 +22,7 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 - The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (directory records: every known identity).
 - Recipients in `pending` (or all of them, if `send` throws) go to the outbox; a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
-- `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP.
+- `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP, and through a hub the frame's `from` proven end to end by the remote endpoint in the handshake tunneled through the hub stream (never the hub's word).
 - `assertTransport` checks the shape of every transport the engine is given.
 - Outside the interface, the network transports (TCP, hub) also expose `stats()`: a diagnostic the tests read, and the engine reads for display only (`state().transport.hub`).
 - `tests/transportContract.test.mjs` runs one contract against every implementation.

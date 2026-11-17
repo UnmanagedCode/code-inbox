@@ -15,6 +15,7 @@ export const HUB_MAX_LINKS = 1024;
 export const HUB_MAX_HANDSHAKING = 64;
 export const HUB_MAX_STREAMS = 64; // per link, opened or received
 export const HUB_WRITE_BUFFER_MAX = 4 * 1024 * 1024; // per stream end: unflushed bytes the hub holds toward it
+export const HUB_CONTROL_BUFFER_MAX = 64 * 1024; // per link, on top of its stream data: room for control frames
 
 export const HUB_LIMITS = {
   handshakeMs: SESSION_LIMITS.handshakeMs,
@@ -25,6 +26,7 @@ export const HUB_LIMITS = {
   maxHandshaking: HUB_MAX_HANDSHAKING,
   maxStreams: HUB_MAX_STREAMS,
   writeBufferMax: HUB_WRITE_BUFFER_MAX,
+  controlBufferMax: HUB_CONTROL_BUFFER_MAX,
 };
 
 const defaultSchedule = (fn, ms) => {
@@ -56,9 +58,12 @@ export function isLoopbackHost(host) {
  */
 export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits = {}, schedule = defaultSchedule, createServer = net.createServer } = {}) {
   const lim = { ...HUB_LIMITS, ...limits };
-  // Unflushed bytes a link may hold: every stream end at its cap. Data never exceeds it (each end is capped), so
-  // only control frames piling up on a link that does not read can.
-  const linkLimits = { ...lim, writeBufferMax: lim.maxStreams * lim.writeBufferMax };
+  // What the hub holds toward one link, at most: stream data up to `dataMax` (every stream end at its cap; counted
+  // across the link, so ends of closed streams still unflushed count too) plus `controlBufferMax` for control frames.
+  // A frame the link cannot take is dropped, never the link: a peer that stops reading misses `close`, `incoming` or
+  // `presence` notices (its sessions time out, pulls recover) and keeps its link and identities.
+  const dataMax = lim.maxStreams * lim.writeBufferMax;
+  const linkLimits = { ...lim, writeBufferMax: dataMax + lim.controlBufferMax };
   const links = new Set();
   const byFp = new Map(); // fp → the ready link that proved it
   const watchers = new Map(); // fp → Set<link> watching it
@@ -69,8 +74,13 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
   const handshaking = () => [...links].filter((c) => !c.ready).length;
   const streamCount = () => [...links].reduce((n, c) => n + (c.streams?.size ?? 0), 0) / 2;
 
+  // A control frame for `c`: dropped (and counted) when the link cannot take it.
+  function control(c, frame) {
+    if (!c.send(frame) && !c.closed) counters.dropped += 1;
+  }
+
   function notify(fp, online, except) {
-    for (const w of watchers.get(fp) ?? []) if (w !== except) w.send({ t: 'presence', fp, online });
+    for (const w of watchers.get(fp) ?? []) if (w !== except) control(w, { t: 'presence', fp, online });
   }
 
   // Forgets a stream pair; the end that did not ask hears `close {reason}`.
@@ -78,8 +88,8 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     const { peer } = end;
     end.conn.streams.delete(end.s);
     peer.conn.streams.delete(peer.s);
-    peer.conn.send({ t: 'close', s: peer.s, reason });
-    if (tellBoth) end.conn.send({ t: 'close', s: end.s, reason });
+    control(peer.conn, { t: 'close', s: peer.s, reason });
+    if (tellBoth) control(end.conn, { t: 'close', s: end.s, reason });
   }
 
   function setWatch(c, fps) {
@@ -112,9 +122,9 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     if (f.t === 'open') {
       if (c.streams.has(f.s)) throw new FrameError('PROTOCOL', `stream ${f.s} is already open`);
       const target = byFp.get(f.to);
-      if (c.streams.size >= lim.maxStreams) { c.send({ t: 'close', s: f.s, reason: 'LIMIT' }); return; }
-      if (!target || target === c) { c.send({ t: 'close', s: f.s, reason: 'ABSENT' }); return; }
-      if (target.streams.size >= lim.maxStreams) { c.send({ t: 'close', s: f.s, reason: 'LIMIT' }); return; }
+      if (c.streams.size >= lim.maxStreams) { control(c, { t: 'close', s: f.s, reason: 'LIMIT' }); return; }
+      if (!target || target === c) { control(c, { t: 'close', s: f.s, reason: 'ABSENT' }); return; }
+      if (target.streams.size >= lim.maxStreams) { control(c, { t: 'close', s: f.s, reason: 'LIMIT' }); return; }
       const s2 = target.nextS;
       target.nextS += 2;
       const mine = { conn: c, s: f.s, bytes: 0, peer: null };
@@ -122,24 +132,27 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
       mine.peer = theirs;
       c.streams.set(f.s, mine);
       target.streams.set(s2, theirs);
-      target.send({ t: 'incoming', s: s2 });
+      control(target, { t: 'incoming', s: s2 });
     } else if (f.t === 'data') {
       const end = c.streams.get(f.s);
       if (!end) { counters.dropped += 1; return; } // it raced a close
       const { peer } = end;
       const buf = encodeFrame({ t: 'data', s: peer.s, b: f.b });
-      // A receiver that does not keep up loses this stream, never its link or its other streams.
-      if (peer.bytes + buf.length > lim.writeBufferMax) { dropPair(end, 'LIMIT', true); return; }
+      // A receiver that does not keep up loses this stream, never its link, nor its other streams before the link's
+      // whole data budget is held.
+      const to = peer.conn;
+      if (peer.bytes + buf.length > lim.writeBufferMax || to.dataBytes + buf.length > dataMax) { dropPair(end, 'LIMIT', true); return; }
       peer.bytes += buf.length;
+      to.dataBytes += buf.length;
       let flushed = false;
-      const release = () => { if (!flushed) { flushed = true; peer.bytes -= buf.length; } };
-      if (!peer.conn.send(buf, release)) release();
+      const release = () => { if (!flushed) { flushed = true; peer.bytes -= buf.length; to.dataBytes -= buf.length; } };
+      if (!to.send(buf, release)) { release(); if (!to.closed) dropPair(end, 'LIMIT', true); }
     } else if (f.t === 'close') {
       const end = c.streams.get(f.s);
       if (end) dropPair(end, 'CLOSED');
     } else if (f.t === 'watch') {
       setWatch(c, f.fps);
-      c.send({ t: 'present', id: f.id, fps: [...c.watch].filter((fp) => byFp.has(fp) && byFp.get(fp) !== c) });
+      control(c, { t: 'present', id: f.id, fps: [...c.watch].filter((fp) => byFp.has(fp) && byFp.get(fp) !== c) });
     }
   }
 
@@ -157,8 +170,9 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
 
   function accept(socket) {
     if (links.size >= lim.maxLinks || handshaking() >= lim.maxHandshaking) { socket.destroy(); return; }
-    const c = createHubConn({ socket, role: 'hub', limits: linkLimits, schedule, onRegistered, onReady, onFrame, onClose });
+    const c = createHubConn({ socket, role: 'hub', limits: linkLimits, dropOverflow: true, schedule, onRegistered, onReady, onFrame, onClose });
     c.streams = new Map(); // s → {conn, s, bytes, peer}
+    c.dataBytes = 0; // unflushed stream data toward this link, every end counted
     c.nextS = 2;
     c.watch = new Set();
     links.add(c);
