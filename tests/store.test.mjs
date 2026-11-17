@@ -59,3 +59,23 @@ test('settings with shareDir migrate to transport once and the migration is idem
   assert.deepEqual((await createStore(none).load()).settings, { name: null, transport: null, notifyTarget: null });
   assert.equal('shareDir' in JSON.parse(fs.readFileSync(file(none), 'utf8')), false);
 });
+
+// Invariant (T7): a damaged outbox.json can never steer a send: entries with an invalid route or a recipient that is
+// not a fingerprint are dropped, each logged.
+test('outbox entries with an invalid route or recipient are dropped on load', async () => {
+  const dataDir = tmpDir();
+  await createStore(dataDir).load();
+  const fp = 'a'.repeat(64);
+  const bytes = Buffer.from('x').toString('base64');
+  fs.writeFileSync(path.join(dataDir, FILES.outbox), JSON.stringify([
+    { route: { kind: 'mailbox', fp }, to: [fp], bytes },
+    { route: { kind: 'inbox', id: '../../escape' }, to: [], bytes },
+    { route: { kind: 'directory' }, to: ['not a fingerprint'], bytes },
+    { route: { kind: 'directory' }, to: [] },
+    'junk',
+  ]));
+  const log = captureLog();
+  const loaded = await createStore(dataDir, { log }).load();
+  assert.deepEqual(loaded.outbox.map((e) => e.route), [{ kind: 'mailbox', fp }]);
+  assert.equal(log.lines.filter((l) => l.includes('outbox.json')).length, 4);
+});

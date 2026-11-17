@@ -17,6 +17,9 @@ export const TCP_MAX_CONNECTIONS = 64;
 export const TCP_MAX_HANDSHAKING = 16;
 export const TCP_REDIAL_MIN_MS = 1000;
 export const TCP_REDIAL_MAX_MS = 5 * 60_000;
+export const TCP_LOOKUP_MS = 5000; // a host's DNS lookup when TCP settings are checked
+
+const defaultLookup = (name) => dns.lookup(name, { all: true });
 
 const DEFAULT_LIMITS = {
   ...SESSION_LIMITS,
@@ -79,18 +82,26 @@ export function validateTcpConfig(input) {
 // validateTcpConfig, then the wildcard rule on what a non-literal host and advertised host resolve to: a name such as
 // `0`, `00.0.0.0` or `0x0.0.0.0` passes as a hostname but resolves to 0.0.0.0. A host that does not resolve is
 // refused; an advertised host that does not resolve here is allowed (peers may resolve it where this install cannot).
-// Refuses TCP_INVALID; resolves the normalized config. `lookup` is dns.lookup with {all: true} (tests may inject one).
-export async function resolveTcpConfig(input, { lookup = (h) => dns.lookup(h, { all: true }) } = {}) {
+// A lookup slower than `lookupMs` (TCP_LOOKUP_MS) is refused, for either name. Refuses TCP_INVALID; resolves the
+// normalized config. `lookup(name)` → [{address, family}] is dns.lookup with {all: true} unless injected (tests).
+export async function resolveTcpConfig(input, { lookup = defaultLookup, lookupMs = TCP_LOOKUP_MS } = {}) {
   const cfg = validateTcpConfig(input);
   const refuse = (why) => { throw new CodedError('TCP_INVALID', why); };
   const resolved = async (name, what, mustResolve) => {
     if (net.isIP(name) !== 0) return;
     let addrs;
+    let cancel;
     try {
-      addrs = await lookup(name);
+      addrs = await Promise.race([
+        lookup(name),
+        new Promise((_, reject) => { const t = setTimeout(() => reject(Object.assign(new Error(`no answer within ${lookupMs} ms`), { timedOut: true })), lookupMs); t.unref?.(); cancel = () => clearTimeout(t); }),
+      ]);
     } catch (err) {
+      if (err.timedOut) refuse(`${what} ${name}: the lookup timed out (${err.message})`);
       if (mustResolve) refuse(`${what} ${name} does not resolve (${err.code ?? err.message})`);
       return;
+    } finally {
+      cancel?.();
     }
     const wild = addrs.find((a) => isWildcardHost(a.address));
     if (wild) refuse(`${what} ${name} resolves to ${wild.address}, every interface: name an address`);

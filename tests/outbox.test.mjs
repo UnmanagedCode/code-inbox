@@ -2,12 +2,13 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { OUTBOX_RETRY_MS } from '../src/engine.js';
+import { OUTBOX_RETRY_MS, createEngine } from '../src/engine.js';
 import { decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
 import { createStore } from '../src/store.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
-import { fakeClock, makeInstall, makeNetwork, silentLog, syncAll, tmpDir, tree } from './helpers.mjs';
+import { TCP_REDIAL_MAX_MS, TCP_REDIAL_MIN_MS } from '../src/transport/tcp.js';
+import { captureLog, fakeClock, makeInstall, makeNetwork, silentLog, syncAll, tmpDir, tree } from './helpers.mjs';
 import { countingListener, tcpNode, waitFor } from './tcpHelpers.mjs';
 
 // The outbox keeps every write a transport could not take, and the engine re-sends it on its own: after a transport
@@ -41,7 +42,7 @@ test('a send while the share is unmounted stays in the outbox, creates nothing, 
   // The action succeeds; its write waits.
   assert.ok((await a.engine.sendMessage(inbox, 'while unmounted')).id);
   assert.equal(outboxOf(a), 1);
-  assert.equal(a.engine.state().transport.unavailable, true);
+  assert.equal(a.engine.state().transport.outboxError.code, 'SHARE_UNAVAILABLE');
   assert.equal(fs.existsSync(shareDir), false, 'nothing recreated the share on the local disk');
   await tick(clock, a); // still unmounted: still waiting
   assert.equal(outboxOf(a), 1);
@@ -49,7 +50,7 @@ test('a send while the share is unmounted stays in the outbox, creates nothing, 
   mount();
   await tick(clock, a);
   assert.equal(outboxOf(a), 0);
-  assert.equal(a.engine.state().transport.unavailable, false);
+  assert.equal(a.engine.state().transport.outboxError, null);
   await b.engine.sync();
   assert.deepEqual(b.engine.messages(inbox).map((m) => m.body), ['while unmounted']);
 });
@@ -64,7 +65,7 @@ test('an announce addressed to nobody, written while the share is missing, reach
   await a.engine.announce(); // no identity known: `to` is []
   assert.equal(outboxOf(a), 1, 'the write is owed though nobody is named');
   assert.equal(fs.existsSync(shareDir), false);
-  fs.mkdirSync(shareDir);
+  fs.mkdirSync(path.join(shareDir, SHARE_ROOT), { recursive: true }); // the mount appears, holding the share's root
   await tick(clock, a);
   assert.equal(outboxOf(a), 0);
   const files = Object.keys(tree(path.join(shareDir, SHARE_ROOT)));
@@ -148,25 +149,152 @@ test('the retry timer is armed only while the outbox holds anything, and stops w
   assert.equal(clock.pending() <= idle, true, 'stopping cleared the retry timer');
 });
 
-// Over TCP the timer re-sends through `send`, so a recipient that is unreachable is dialed only as its address's
-// backoff allows: many retry ticks in a row add no dials.
-test('outbox retries over TCP do not storm an unreachable recipient with dials', async (t) => {
+// Invariant (T3): over TCP the timer re-sends through `send`, so an unreachable recipient is dialed only as its
+// address's redial backoff allows: the dial times follow the doubling schedule, each at the first retry tick at or
+// after the backoff ends, never one dial per tick.
+test('outbox retries over TCP follow the redial backoff, doubling up to its maximum', async (t) => {
   const clock = fakeClock();
   const dead = await countingListener();
-  const alice = await tcpNode('alice', { schedule: clock.schedule });
+  const alice = await tcpNode('alice', { schedule: clock.schedule, now: clock.now });
   t.after(async () => { await alice.close(); await dead.close(); });
   const bob = await loadIdentity(tmpDir());
   const card = encodeCard(encodeRecord(bob, { type: 'announce', signer: bob.fp, ts: Date.now(), name: 'bob', addr: [dead.addr] }).bytes);
-  await alice.engine.importCard(card);
+  const t0 = clock.now();
+  await alice.engine.importCard(card); // dials bob once, in the background
   await alice.engine.invite(bob.fp);
   assert.equal(outboxOf(alice), 1);
-  await waitFor(() => dead.count >= 1, 'the first dial');
-  const first = dead.count;
-  for (let i = 0; i < 20; i += 1) {
-    clock.advance(OUTBOX_RETRY_MS);
-    await alice.engine.setName('alice'); // queues behind the retry flush (both take the engine lock)
+  const settled = () => waitFor(() => alice.transport.stats().connections === 0, 'the dial to settle');
+  await waitFor(() => dead.count === 1, 'the first dial');
+  await settled();
+  const dials = [0];
+  for (let i = 0; i < 40; i += 1) {
+    const before = dead.count;
+    await tick(clock, alice);
+    await settled();
+    if (dead.count > before) dials.push(clock.now() - t0);
+    assert.ok(dead.count - before <= 1, 'at most one dial per tick');
   }
-  await new Promise((r) => setTimeout(r, 50));
-  assert.ok(dead.count <= first + 1, `${dead.count - first} dials after 20 retry ticks`);
+  // The schedule: after the k-th failure wait min(MIN·2^(k-1), MAX), then dial at the next retry tick.
+  const expected = [0];
+  for (let k = 1, at = 0; ; k += 1) {
+    const ready = at + Math.min(TCP_REDIAL_MIN_MS * 2 ** (k - 1), TCP_REDIAL_MAX_MS);
+    at = Math.ceil(ready / OUTBOX_RETRY_MS) * OUTBOX_RETRY_MS;
+    if (at > 40 * OUTBOX_RETRY_MS) break;
+    expected.push(at);
+  }
+  assert.deepEqual(dials, expected);
+  assert.ok(dials.length < 20, `${dials.length} dials in 40 ticks`);
   assert.equal(outboxOf(alice), 1);
+});
+
+// Invariant (T1): a write a re-send cannot make (here SHARE_UNSAFE: its writer subdir became a link) keeps waiting,
+// is shown with its code and logged once, not on every tick; fixing the share delivers it and clears the error.
+test('a re-send refused SHARE_UNSAFE keeps the entry, surfaces the error once, and clears after a fix', async (t) => {
+  const clock = fakeClock();
+  const log = captureLog();
+  const { shareDir, installs } = await makeNetwork(['alice', 'bob'], { schedule: clock.schedule, log });
+  const [a, b] = installs;
+  t.after(async () => { for (const x of installs) await x.close(); });
+  const { id, inbox } = await a.engine.invite(b.fp);
+  await syncAll(installs);
+  await b.engine.respondInvite(id, true);
+  await syncAll(installs);
+  const mount = unmount(shareDir);
+  await a.engine.sendMessage(inbox, 'held');
+  mount();
+  const own = path.join(shareDir, SHARE_ROOT, 'inboxes', inbox, a.fp);
+  const outside = tmpDir('code-inbox-outside-');
+  fs.mkdirSync(path.dirname(own), { recursive: true });
+  fs.rmSync(own, { recursive: true, force: true });
+  fs.symlinkSync(outside, own);
+  const unsafeLines = () => log.lines.filter((l) => l.includes('SHARE_UNSAFE')).length;
+  for (let i = 0; i < 4; i += 1) await tick(clock, a);
+  assert.equal(outboxOf(a), 1);
+  assert.equal(a.engine.state().transport.outboxError.code, 'SHARE_UNSAFE');
+  assert.equal(unsafeLines(), 1, 'logged once for four failing ticks');
+  assert.deepEqual(fs.readdirSync(outside), []);
+  fs.rmSync(own);
+  await tick(clock, a);
+  assert.equal(outboxOf(a), 0);
+  assert.equal(a.engine.state().transport.outboxError, null);
+  await b.engine.sync();
+  assert.deepEqual(b.engine.messages(inbox).map((m) => m.body), ['held']);
+});
+
+// Invariant (T2): an existing share dir without the share's root (an unmounted mount point is an empty directory)
+// takes no write: it waits, SHARE_UNAVAILABLE, until the root appears.
+test('a share dir without its root takes no write until the root appears', async (t) => {
+  const clock = fakeClock();
+  const shareDir = tmpDir('code-inbox-mountpoint-');
+  const dataDir = tmpDir('code-inbox-data-');
+  fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ name: 'alice', transport: { kind: 'file-share', dir: shareDir }, notifyTarget: null }));
+  const a = await makeInstall(null, { dataDir, schedule: clock.schedule });
+  t.after(() => a.close());
+  await a.engine.announce();
+  assert.equal(outboxOf(a), 1);
+  assert.equal(a.engine.state().transport.outboxError.code, 'SHARE_UNAVAILABLE');
+  assert.deepEqual(fs.readdirSync(shareDir), [], 'nothing written under the mount point');
+  fs.mkdirSync(path.join(shareDir, SHARE_ROOT), { recursive: true });
+  await tick(clock, a);
+  assert.equal(outboxOf(a), 0);
+  assert.equal(Object.keys(tree(path.join(shareDir, SHARE_ROOT, 'directory', a.fp))).length, 1);
+});
+
+// Invariant (T2): saving a share creates its root, so a share saved by a human takes writes at once.
+test('saving a share creates its root', async (t) => {
+  const shareDir = tmpDir('code-inbox-share-');
+  const a = await makeInstall(shareDir, { name: 'alice' });
+  t.after(() => a.close());
+  assert.ok(fs.statSync(path.join(shareDir, SHARE_ROOT)).isDirectory());
+  assert.equal(outboxOf(a), 0);
+});
+
+// Invariant (T6): the share/data dir overlap is re-checked at write time: a share that appears after boot as a link
+// to a place containing the data dir is never written through. A fresh action is refused; a queued write waits.
+test('a share that appears as a link above the data dir is refused SHARE_UNSAFE at write time', async (t) => {
+  const clock = fakeClock();
+  const base = tmpDir('code-inbox-base-');
+  const dataDir = path.join(base, 'data');
+  fs.mkdirSync(dataDir);
+  const shareDir = path.join(tmpDir('code-inbox-mnt-'), 'share');
+  fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ name: 'alice', transport: { kind: 'file-share', dir: shareDir }, notifyTarget: null }));
+  const a = await makeInstall(null, { dataDir, schedule: clock.schedule });
+  t.after(() => a.close());
+  await a.engine.announce(); // queued: the share is not there
+  fs.mkdirSync(path.join(base, SHARE_ROOT), { recursive: true });
+  fs.symlinkSync(base, shareDir);
+  await tick(clock, a);
+  assert.equal(outboxOf(a), 1);
+  assert.equal(a.engine.state().transport.outboxError.code, 'SHARE_UNSAFE');
+  await assert.rejects(a.engine.announce(), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(path.join(base, SHARE_ROOT)), [], 'nothing written next to the data dir');
+});
+
+// An engine over a stub transport whose send is `send`: the outbox's reaction to each kind of throw.
+async function stubEngine(t, send, log) {
+  const dataDir = tmpDir('code-inbox-data-');
+  const store = createStore(dataDir, { log: silentLog });
+  await store.load();
+  const identity = await loadIdentity(dataDir);
+  const transport = { capabilities: { directory: true, push: false }, addresses: () => [], start: async () => {}, setInterest() {}, send, sync: async () => {}, stop: async () => {} };
+  const engine = createEngine({ store, identity, log, schedule: fakeClock().schedule, makeTransport: () => transport });
+  t.after(() => engine.stop());
+  await engine.boot();
+  await engine.setTcp({ port: 0 }); // any config: the stub ignores it
+  await engine.setName('alice');
+  return engine;
+}
+
+// Invariant (T5): a write nobody is named for is kept when its send fails retryably (a system error) and dropped,
+// with a log line, when it fails otherwise.
+test('an owed write with no recipient is kept on a system error and dropped, logged, on any other', async (t) => {
+  const log = captureLog();
+  const io = await stubEngine(t, async () => { throw Object.assign(new Error('disk trouble'), { code: 'EIO' }); }, log);
+  await io.announce();
+  assert.equal(io.state().diagnostics.outbox, 1);
+  assert.equal(io.state().transport.outboxError.code, 'EIO');
+  const bug = await stubEngine(t, async () => { throw new Error('a bug'); }, log);
+  await bug.announce();
+  assert.equal(bug.state().diagnostics.outbox, 0);
+  assert.ok(log.lines.some((l) => l.includes('dropped') && l.includes('a bug')), log.lines.join('\n'));
 });

@@ -53,7 +53,7 @@ function memoryHub() {
 
 const useShare = (engine, shareDir) => engine.setShare(shareDir);
 const IMPLEMENTATIONS = {
-  fileShare: () => ({ makeTransport: (identity, shareDir) => createFileShare({ shareDir, selfFp: identity.fp, pollMs: 3_600_000, log: silentLog }), configure: useShare }),
+  fileShare: () => ({ makeTransport: (identity, shareDir, _view, store) => createFileShare({ shareDir, dataDir: store.dataDir, selfFp: identity.fp, pollMs: 3_600_000, log: silentLog }), configure: useShare }),
   memoryPush: () => { const hub = memoryHub(); return { makeTransport: (identity) => hub.makeTransport(identity), configure: useShare, hub }; },
   tcp: () => ({
     makeTransport: (identity, _shareDir, view, store, config) => createTcp({

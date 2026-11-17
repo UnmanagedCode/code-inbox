@@ -5,6 +5,7 @@ import path from 'node:path';
 import { CodedError } from '../errors.js';
 import { TMP_PREFIX, writeFileAtomic } from '../fsAtomic.js';
 import { FP_RE, RECORD_MAX_BYTES } from '../records.js';
+import { isRoute } from './index.js';
 
 // The v1 transport: a directory every install can reach (Dropbox, SMB, NFS). Layout under <shareDir>/code-inbox/v1/
 // (docs/protocol.md → Share layout); every writer writes only below its own fingerprint subdir and never rewrites
@@ -36,12 +37,25 @@ export function checkShareDirPath(dir, dataDir) {
   return dir;
 }
 
-// The overlap rule on real paths (symlinks resolved), for a share dir that exists (`real` is its realpath).
-async function checkRealOverlap(dir, real, dataDir) {
-  const refuse = shareRefusal(dir);
+// Why a real path (symlinks resolved) overlaps the real data dir, or null.
+async function realOverlap(real, dataDir) {
   const realData = await fs.realpath(dataDir);
-  if (isInside(realData, real)) refuse('is inside the data dir (through a link)');
-  if (isInside(real, realData)) refuse('contains the data dir (through a link)');
+  if (isInside(realData, real)) return 'is inside the data dir (through a link)';
+  if (isInside(real, realData)) return 'contains the data dir (through a link)';
+  return null;
+}
+
+// The overlap rule on real paths, for a share dir that exists (`real` is its realpath).
+async function checkRealOverlap(dir, real, dataDir) {
+  const why = await realOverlap(real, dataDir);
+  if (why) shareRefusal(dir)(why);
+}
+
+// Creates the share's root (`<dir>/SHARE_ROOT`) when a human saves the share: from then on a send requires it to
+// exist, which tells a mounted share from an empty mount point.
+export async function ensureShareRoot(dir) {
+  await fs.mkdir(path.join(dir, SHARE_ROOT), { recursive: true });
+  return dir;
 }
 
 // The check of a stored share dir at boot: checkShareDirPath, plus the real-path overlap rule when the dir resolves
@@ -104,7 +118,8 @@ async function readCapped(file) {
 const tick = () => new Promise((r) => setImmediate(r));
 
 /** @returns {import('./index.js').Transport} */
-export function createFileShare({ shareDir, selfFp, pollMs = SHARE_POLL_MS, now = Date.now, log = console }) {
+// `dataDir` is the install's data dir: every write re-checks that the share does not overlap it.
+export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL_MS, now = Date.now, log = console }) {
   const root = path.join(shareDir, SHARE_ROOT);
   let interest = [];
   let sink = null;
@@ -157,18 +172,38 @@ export function createFileShare({ shareDir, selfFp, pollMs = SHARE_POLL_MS, now 
     }
   }
 
-  // This install's own subdir for `route`, created if missing. Refused (SHARE_UNSAFE) when it is a symlink or not a
-  // real directory, or resolves outside the share: a peer could otherwise redirect this install's writes.
+  // This install's own subdir for `route`, created if missing (the root itself must exist). Refused (SHARE_UNSAFE)
+  // when its path leaves the root before anything is created, when it is a symlink or not a real directory, or when
+  // it resolves outside the share: a peer could otherwise redirect this install's writes.
   async function ownDir(route) {
     const parent = routeDir(root, route);
-    await fs.mkdir(parent, { recursive: true });
     const dir = path.join(parent, selfFp);
+    const resolvedRoot = path.resolve(root);
+    if (!isRoute(route) || !isInside(resolvedRoot, path.resolve(dir)) || path.resolve(dir) === resolvedRoot) {
+      throw new CodedError('SHARE_UNSAFE', `the route ${JSON.stringify(route).slice(0, 80)} does not stay inside the share`);
+    }
+    await fs.mkdir(parent, { recursive: true });
     try { await fs.mkdir(dir); } catch (err) { if (err.code !== 'EEXIST') throw err; }
     const st = await fs.lstat(dir);
     if (st.isSymbolicLink() || !st.isDirectory()) throw new CodedError('SHARE_UNSAFE', `${dir} is not a real directory`);
     const [real, realRoot] = await Promise.all([fs.realpath(dir), fs.realpath(root)]);
     if (!isInside(realRoot, real)) throw new CodedError('SHARE_UNSAFE', `${dir} resolves outside the share`);
     return dir;
+  }
+
+  // Before any write: the share's root must already exist (else SHARE_UNAVAILABLE: an unmounted mount point, or a
+  // share never saved), and neither the share dir nor its root may resolve into or above the data dir (else
+  // SHARE_UNSAFE: a link that appeared after the share was checked).
+  async function checkWritable() {
+    let st;
+    try { st = await fs.stat(root); } catch (err) {
+      if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
+    }
+    if (!st?.isDirectory()) throw new CodedError('SHARE_UNAVAILABLE', `the share ${shareDir} has no ${SHARE_ROOT} (not mounted?)`);
+    for (const p of [shareDir, root]) {
+      const why = await realOverlap(await fs.realpath(p), dataDir);
+      if (why) throw new CodedError('SHARE_UNSAFE', `${p} ${why}`);
+    }
   }
 
   async function scan() {
@@ -201,12 +236,10 @@ export function createFileShare({ shareDir, selfFp, pollMs = SHARE_POLL_MS, now 
     },
     setInterest(routes) { interest = [...routes]; },
     // The share stores everything, so every recipient counts as delivered.
-    // Refused SHARE_UNAVAILABLE (retryable, nothing created) while the configured dir itself does not exist: a
-    // share whose mount is not up must not be recreated on the local disk, where the mount would later hide it.
+    // Refused SHARE_UNAVAILABLE (retryable, nothing created) while the share's root does not exist: a share whose
+    // mount is not up must not be recreated on the local disk, where the mount would later hide it.
     async send(bytes, { route, to }) {
-      let rootOk = false;
-      try { rootOk = (await fs.stat(shareDir)).isDirectory(); } catch (err) { if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err; }
-      if (!rootOk) throw new CodedError('SHARE_UNAVAILABLE', `the share dir ${shareDir} is not available (not mounted?)`);
+      await checkWritable();
       const dir = await ownDir(route);
       const name = `${String(now()).padStart(13, '0')}-${crypto.randomBytes(16).toString('hex')}.rec`;
       await writeFileAtomic(path.join(dir, name), bytes, 0o644);

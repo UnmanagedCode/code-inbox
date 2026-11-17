@@ -594,7 +594,9 @@ test('an owed admission completes after a boot listen failure followed by setTcp
 // Invariant (D7): a listen or advertised host that resolves to every interface is refused like 0.0.0.0, however it
 // is spelt; a listen host that does not resolve is refused, an advertised one need not resolve here.
 test('a host that resolves to an unspecified address is refused TCP_INVALID', async (t) => {
-  const alice = await tcpNode('alice');
+  // What a resolver answers for these spellings (inet_aton reads each as 0.0.0.0); injected, so no resolver is needed.
+  const lookup = async (name) => (['0', '00.0.0.0', '0x0.0.0.0'].includes(name) ? [{ address: '0.0.0.0', family: 4 }] : [{ address: '127.0.0.1', family: 4 }]);
+  const alice = await tcpNode('alice', { lookup });
   closeAll(t, alice);
   for (const name of ['0', '00.0.0.0', '0x0.0.0.0']) {
     await assert.rejects(alice.engine.setTcp({ host: name, port: 0, advertise: '127.0.0.1' }), { code: 'TCP_INVALID' }, `host ${name}`);
@@ -630,4 +632,21 @@ test('a listener that fails after it is up frees its port and keeps its sessions
   raw.send({ t: 'ping' });
   assert.equal((await raw.nextOf('pong')).t, 'pong');
   assert.equal(endpoint.stats().sessions.length, 1);
+});
+
+// Invariant (T4): a host's DNS lookup runs before the engine lock is taken (a slow resolver blocks no other action)
+// and is bounded: a lookup that does not answer in time is refused TCP_INVALID.
+test('TCP settings are resolved outside the engine lock, with a timeout', async (t) => {
+  let release;
+  const gate = new Promise((r) => { release = r; });
+  const lookup = async (name) => { if (name === 'slow.example') await gate; return [{ address: '10.0.0.7', family: 4 }]; };
+  const alice = await tcpNode('alice', { lookup });
+  closeAll(t, alice);
+  const saving = alice.engine.setTcp({ port: 0, advertise: 'slow.example' });
+  assert.deepEqual(await alice.engine.setName('alice2'), { name: 'alice2' }, 'another action ran while the lookup waited');
+  release();
+  assert.equal((await saving).advertise, 'slow.example');
+  const never = () => new Promise(() => {});
+  await assert.rejects(resolveTcpConfig({ host: 'hang.example', advertise: '127.0.0.1' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
+  await assert.rejects(resolveTcpConfig({ advertise: 'hang.example' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
 });

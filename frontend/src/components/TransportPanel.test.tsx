@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { TransportPanel, isLoopback, isWildcard } from './TransportPanel';
 import type { State, TransportView } from '../types';
 
-const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null, unavailable: false };
+const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null };
 const stateWith = (transport: Partial<TransportView> = {}, outbox = 0) => ({ transport: { ...NONE, ...transport }, diagnostics: { outbox } }) as unknown as State;
 
 function stubFetch() {
@@ -78,14 +78,14 @@ describe('TransportPanel', () => {
     expect(screen.getByRole('textbox', { name: 'Advertised host' })).toBeTruthy();
   });
 
-  // Invariant: the human can see that writes are waiting, and why when the share is not mounted.
-  it('shows an unavailable share and the writes waiting', () => {
+  // Invariant: the human can see that writes are waiting, and the code of the last failure that holds them.
+  it('shows the writes waiting and why the last attempt failed', () => {
     const { rerender } = render(<TransportPanel state={stateWith({ kind: 'file-share', configured: true, dir: '/srv/share' })} refresh={() => {}} />);
-    expect(screen.queryByRole('status', { name: 'Share unavailable' })).toBeNull();
     expect(screen.queryByRole('status', { name: 'Writes waiting' })).toBeNull();
-    rerender(<TransportPanel state={stateWith({ kind: 'file-share', configured: true, dir: '/srv/share', unavailable: true }, 2)} refresh={() => {}} />);
-    expect(screen.getByRole('status', { name: 'Share unavailable' })).toBeTruthy();
-    expect(screen.getByRole('status', { name: 'Writes waiting' }).textContent).toContain('2');
+    rerender(<TransportPanel state={stateWith({ kind: 'file-share', configured: true, dir: '/srv/share', outboxError: { code: 'SHARE_UNSAFE', message: 'not a real directory' } }, 2)} refresh={() => {}} />);
+    const waiting = screen.getByRole('status', { name: 'Writes waiting' });
+    expect(waiting.textContent).toContain('2');
+    expect(waiting.textContent).toContain('SHARE_UNSAFE');
   });
 
   // Invariant: a transport that failed to start says why, by code.

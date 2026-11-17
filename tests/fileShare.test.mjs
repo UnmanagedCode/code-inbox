@@ -15,7 +15,8 @@ async function recordingShare({ answer = () => ({ retry: false }) } = {}) {
   const shareDir = tmpDir('code-inbox-share-');
   const me = await loadIdentity(tmpDir());
   const offers = [];
-  const t = createFileShare({ shareDir, selfFp: me.fp, pollMs: 3_600_000 });
+  fs.mkdirSync(path.join(shareDir, SHARE_ROOT), { recursive: true }); // a saved share holds its root
+  const t = createFileShare({ shareDir, dataDir: tmpDir('code-inbox-data-'), selfFp: me.fp, pollMs: 3_600_000 });
   t.setInterest([{ kind: 'directory' }]);
   await t.start({ record: async (i) => { offers.push(i); return answer(i); }, peerOnline() {} });
   await t.sync(); // drains the scan start() launched, so it cannot race files the test writes next
@@ -217,4 +218,18 @@ test('a dotted name does not defeat the share/data dir overlap check', async () 
   const sibling = path.join(base, '..share');
   fs.mkdirSync(sibling);
   assert.equal(await validateShareDir(sibling, dottedData), sibling);
+});
+
+// Invariant (T7): a route that would leave the share is refused before anything is created.
+test('a send on a route that leaves the share creates nothing and is refused SHARE_UNSAFE', async () => {
+  const { shareDir, me, t, root } = await recordingShare();
+  for (const route of [{ kind: 'inbox', id: '../../../../escape' }, { kind: 'mailbox', fp: '../../../escape2' }]) {
+    await assert.rejects(t.send(announceOf(me, 'alice'), { route, to: [] }), { code: 'SHARE_UNSAFE' });
+  }
+  for (const name of ['escape', 'escape2']) {
+    assert.equal(fs.existsSync(path.join(path.dirname(shareDir), name)), false);
+    assert.equal(fs.existsSync(path.join(shareDir, name)), false);
+  }
+  assert.deepEqual(fs.readdirSync(root), []);
+  await t.stop();
 });

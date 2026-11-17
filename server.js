@@ -16,13 +16,15 @@ import { createTcp } from './src/transport/tcp.js';
 
 // The engine's transport factory: (settings.transport, engine view) → a Transport. `pollMs` and `tcpSyncMs`
 // override the file share's poll and the TCP maintain interval (tests).
-export function transportFactory({ identity, store, pollMs, tcpSyncMs, log }) {
+// `now` and `schedule` reach the TCP endpoint (redial backoff, session timers) when given (tests).
+export function transportFactory({ identity, store, pollMs, tcpSyncMs, now, schedule, log }) {
   return (config, view) => (config.kind === 'tcp'
     ? createTcp({
       host: config.host, port: config.port, advertise: config.advertise,
       identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: tcpSyncMs, log,
+      ...(now ? { now } : {}), ...(schedule ? { schedule } : {}),
     })
-    : createFileShare({ shareDir: config.dir, selfFp: identity.fp, pollMs, log }));
+    : createFileShare({ shareDir: config.dir, dataDir: store.dataDir, selfFp: identity.fp, pollMs, log }));
 }
 
 // Builds one install; the caller listens. `pollMs`, `tcpSyncMs` and `schedule` (the notifier's timers and the

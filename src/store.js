@@ -2,6 +2,8 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ensurePrivateDir, readJson, writeFileAtomic, writeJson } from './fsAtomic.js';
 import { withLock } from './mutex.js';
+import { FP_RE } from './records.js';
+import { isRoute } from './transport/index.js';
 
 // The install's local state under the data dir, written only by this backend (docs/architecture.md → Data dir).
 // Every write goes through one lock per data dir. accepted.ndjson is append-only and assigns the acceptance seq.
@@ -77,7 +79,7 @@ export function createStore(dataDir, { log = console } = {}) {
         accepted,
         pending: await readNdjson(file('pending'), log),
         rejected: await readLines(file('rejected'), log),
-        outbox: (await readJson(file('outbox'), [])).map((e) => ({ ...e, bytes: Buffer.from(e.bytes, 'base64') })),
+        outbox: validOutbox(await readJson(file('outbox'), []), log),
         cursors: await readJson(file('cursors'), {}),
         notify: await readJson(file('notify'), { watermark: 0 }),
         contacts: await readJson(file('contacts'), []),
@@ -122,6 +124,15 @@ export function createStore(dataDir, { log = console } = {}) {
     loadPeerCursors: () => readJson(file('peerCursors'), {}),
     savePeerCursors: (c) => locked(() => writeJson(file('peerCursors'), c)),
   };
+}
+
+// The outbox entries that can be sent: a valid route, recipients that are fingerprints, bytes. Any other entry is
+// dropped and logged: a send must never take a path or an address from a damaged file.
+function validOutbox(list, log) {
+  if (!Array.isArray(list)) { log.warn('code-inbox: outbox.json is not a list: ignored'); return []; }
+  const ok = (e) => e && typeof e === 'object' && isRoute(e.route) && Array.isArray(e.to) && e.to.every((fp) => typeof fp === 'string' && FP_RE.test(fp)) && typeof e.bytes === 'string';
+  return list.filter((e, i) => ok(e) || (log.warn(`code-inbox: outbox.json entry ${i} is invalid: dropped`), false))
+    .map((e) => ({ route: e.route, to: e.to, bytes: Buffer.from(e.bytes, 'base64') }));
 }
 
 function writeFileLines(file, list) {

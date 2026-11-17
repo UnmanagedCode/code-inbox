@@ -77,8 +77,13 @@ export function TransportPanel({ state, refresh }: { state: State; refresh: () =
         {t.kind === 'tcp' && <><dt>Reachable at</dt><dd className="mono">{t.addresses.length ? t.addresses.join(', ') : '—'}</dd></>}
       </dl>
       {t.error && <p role="alert" className="error">{t.error.code}: {t.error.message}</p>}
-      {t.unavailable && <p role="status" aria-label="Share unavailable" className="warning">The share directory is not available (not mounted?). Writes wait and are retried until it appears.</p>}
-      {state.diagnostics.outbox > 0 && <p role="status" aria-label="Writes waiting" className="muted">{state.diagnostics.outbox} write(s) waiting in the outbox, retried until delivered.</p>}
+      {state.diagnostics.outbox > 0 && (
+        <div role="status" aria-label="Writes waiting">
+          <p className="muted">{state.diagnostics.outbox} write(s) waiting in the outbox, retried until delivered.</p>
+          {t.outboxError && <p className="warning">Last attempt: {t.outboxError.code}: {t.outboxError.message}</p>}
+          {t.outboxError?.code === 'SHARE_UNAVAILABLE' && <p className="muted">The share looks unmounted. If it is mounted and new, save the share once more.</p>}
+        </div>
+      )}
       <fieldset>
         <legend>Transport</legend>
         <label><input type="radio" name="transport" checked={kind === 'file-share'} onChange={() => setKind('file-share')} /> File share</label>
