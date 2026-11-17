@@ -49,11 +49,13 @@ All ingest and every action run under one engine lock (`withLock('engine:<dataDi
 5. **Classify** (`state.classify`): `reject` is counted; `pending` is stored in `pending.ndjson`; `accept` appends to `accepted.ndjson` (assigning the next acceptance seq), adds to the index and emits `message` for a `msg`.
 6. **Drain pending:** after an accept, every pending record is re-classified until no more progress.
 7. **Pins and interest:** newly shown names are pinned; the routes of interest (`interestOf`) are pushed to the transport.
-8. **Reactions:** an accepted response to this install's own shared invite admits the invitee (a `member add`).
+8. **Reactions:** an accepted response to this install's own shared invite admits the invitee (a `member add`) while `admissionDue` holds ([protocol.md → Admission](protocol.md#admission-after-an-accepted-shared-invite)).
+
+**Boot recovery:** after rebuilding the index, pending entries already accepted are dropped and the pending set is drained once; after the transport starts, every admission `admissionDue` still owes is written. That closes the crash windows between accepting a record and acting on it.
 
 **Sending** (`publish`): sign → `transport.send` (recipients in `pending`, or all of them if the send throws, go to the outbox) → ingest locally like any other record. The outbox is re-sent on every `engine.sync()` and, for a peer, on `peerOnline`.
 
-**`sendMessage(inbox, body)`** is the one path for both surfaces. In order it refuses `SHARE_UNCONFIGURED`, `INBOX_UNKNOWN` (no such inbox known), `NOT_MEMBER` (known, but not a party or current member), `BAD_REQUEST` (not a non-empty string), `BODY_TOO_LARGE` (over `BODY_MAX_BYTES`, or the encoded record over `RECORD_MAX_BYTES`). A shared message cites the current epoch.
+**`sendMessage(inbox, body)`** is the one path for both surfaces. In order it refuses `SHARE_UNCONFIGURED`, `INBOX_UNKNOWN` (no such inbox known), `NOT_MEMBER` (known, but not a party or current member), `BAD_REQUEST` (not a non-empty string), `BODY_TOO_LARGE` (over `BODY_MAX_BYTES`, or `encodeRecord`'s `RECORD_TOO_LARGE`). A shared message cites the current epoch and, as `prev`, this install's last accepted message in that inbox.
 
 ### Acceptance seq, not `ts`
 
@@ -61,12 +63,13 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 ### Message validity is recomputed
 
-`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal that does not keep a message, or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install.
+`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal whose kept chain does not reach a message, or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install.
 
 ## Notifier lifecycle
 
 - **Start:** loads the watermark; listens for `message` events; arms a flush if mail is already owed.
 - **Owed mail** is derived, never counted: `engine.unseenSince(watermark)`, valid messages from others in this install's inboxes. So a restart neither loses nor repeats a notification.
+- **Flushes never overlap:** a timer that fires while one is in flight re-arms instead, so no message is read as owed by two flushes.
 - **Flush** (after `NOTIFY_DEBOUNCE_MS`): GET instances → target row → `idle`? → `send_prompt` → on delivery persist the watermark (the highest seq included). Otherwise record why in `lastError` and re-arm after `NOTIFY_RETRY_MS`. Mail that arrived during a delivery arms the next flush.
 - **Assign** (`setTarget`): watermark = current max seq (existing mail is never announced) → store the target → `POST autostart {autoStart: true}`; the result is kept for the page.
 - The scheduler and clock are injected (`schedule(fn, ms)` → cancel, `now()`); tests drive them with a fake clock.
@@ -74,8 +77,8 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 ## File-share transport
 
 - `start` scans now and then every `pollMs` (`SHARE_POLL_MS`); `sync()` queues one scan; scans never overlap.
-- A scan lists every route of interest, each writer subdir (fingerprints only) and each `FILE_RE` file. A path handed over for good is never re-read; a retry answer is cached by (path, size, mtime). Reads are capped at `RECORD_MAX_BYTES + 1` bytes. The scan yields to the event loop every few dozen files so `/api/health` stays responsive.
-- `send` writes atomically under `<route dir>/<selfFp>/` and reports every recipient delivered: the share stores everything.
+- A scan lists every route of interest, each writer subdir (fingerprints only, real directories only) and each `FILE_RE` file (`lstat`: real files only). A failure offering one file is logged and retried next scan; it never ends the route's scan. A path handed over for good is never re-read; a retry answer is cached by (path, size, mtime). Reads are capped at `RECORD_MAX_BYTES + 1` bytes. The scan yields to the event loop every few dozen files so `/api/health` stays responsive.
+- `send` writes atomically under `<route dir>/<selfFp>/`, refused `SHARE_UNSAFE` if that subdir is a symlink, not a directory, or resolves outside the share. It reports every recipient delivered: the share stores everything.
 - Swapping the share stops the old transport without waiting (its scan may be queued behind the engine lock); its sink ignores anything it still offers.
 
 ## Tests
@@ -93,4 +96,5 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 - `tests/transportContract.test.mjs` runs one contract against the file share and an in-memory push transport (offline peers, outbox, `peerOnline`).
 - `tests/concurrency.test.mjs` forks `tests/fixtures/writer.mjs` processes that write one inbox at once.
 - `tests/boot.test.mjs` spawns `node server.js` with a scrubbed env.
+- `tests/recovery.test.mjs` writes a data dir as a crashed backend would leave it (a pending record whose dependency is accepted; an accepted acceptance with no admission) and boots a fresh install from it.
 - `frontend/src/test/setup.ts` makes `fetch` a tripwire; UI tests stub it per test.

@@ -33,7 +33,7 @@ The panel shows the install's fingerprint (first 32 hex, in groups of 4), its an
 - The list shows every inbox this install belongs to, its kind, member count and unread count (messages from others past the read cursor agents advance).
 - A personal inbox is named after the other party; a shared inbox by its own name.
 - **Inbox view:**
-  - members, then the messages, oldest first, then a **compose box**;
+  - members, then the messages in acceptance order (the order this install received them, not the senders' clocks), then a **compose box**;
   - for the owner of a shared inbox: **Remove** per member and **Invite a member** (from the directory).
 
 #### Compose box

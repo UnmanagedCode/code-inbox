@@ -35,12 +35,12 @@ The bytes of a record (a file on the share) are exactly:
 
 | Constant (`src/records.js`) | Bounds |
 |---|---|
-| `RECORD_MAX_BYTES` | a whole record |
+| `RECORD_MAX_BYTES` | a whole record. `encodeRecord` refuses to sign a larger one (`RECORD_TOO_LARGE`), so no install signs, or accepts from itself, a record its readers would reject |
 | `BODY_MAX_BYTES` | a message body, as UTF-8 bytes. A send whose encoded record would still exceed `RECORD_MAX_BYTES` (heavily escaped characters) is refused `BODY_TOO_LARGE` too |
 | `NAME_RE` | identity and inbox names: one short token, so a peer-chosen name cannot carry markup or prose into a prompt |
 | `ADDR_MAX`, `ADDR_MAX_CHARS` | `announce.addr` |
 
-Ids and nonces are 32 lowercase hex (`ID_RE`); fingerprints 64 (`FP_RE`); `ts` is a non-negative integer (ms since the epoch, the signer's clock, never trusted for ordering).
+Ids and nonces are 32 lowercase hex (`ID_RE`); fingerprints 64 (`FP_RE`); `ts` is an integer from 0 to `TS_MAX` (ms since the epoch, the signer's clock, never trusted for ordering). A `msg` body is non-empty.
 
 ### Self-certifying inbox ids
 
@@ -61,12 +61,12 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 | `invite-response` | `to`, `invite` (record id), `inbox`, `accept: boolean` | mailbox(`to` = inviter) | the invite's `to` is the signer, its signer is `to`, same inbox (`RESPONSE_MISMATCH`) | the invite is unseen |
 | `join-request` | `to` (owner), `inbox` | mailbox(owner) | the inbox's owner is `to` (`NOT_OWNER`) | the `inbox-create` is unseen |
 | `join-response` | `to`, `request` (record id), `inbox`, `accept: false` | mailbox(requester) | the signer is the request's `to`, `to` its signer (`RESPONSE_MISMATCH`). A decline only: an admission is a `member` record | the request is unseen |
-| `member` | `inbox`, `seq ≥ 1`, `op: add\|remove`, `member`, `keep?: msgId[]` (remove only) | inbox(id) | the signer is the owner (`NOT_OWNER`), `member` is not the owner (`BAD_MEMBER_OP`) | the `inbox-create` is unseen |
-| `msg` | `inbox`, `body`, `epoch?` (shared inboxes only) | inbox(id) | see below | see below |
+| `member` | `inbox`, `seq ≥ 1`, `op: add\|remove`, `member`, `keepHead: msgId\|null` (on every remove, never on an add) | inbox(id) | the signer is the owner (`NOT_OWNER`), `member` is not the owner (`BAD_MEMBER_OP`) | the `inbox-create` is unseen |
+| `msg` | `inbox`, `body`, and on a shared inbox both `epoch` and `prev: msgId\|null` (the same sender's previous message in that inbox; null for its first) | inbox(id) | see below | see below |
 
 **A message to a personal inbox** is valid when its signer is the inviter or invitee (`NOT_PARTY`), it carries no `epoch` (`BAD_EPOCH`), and the invite's response accepts (`INVITE_DECLINED`). Pending while no response is seen.
 
-**A message to a shared inbox** is valid when it carries an `epoch` (`BAD_EPOCH`), the signer was a member at that epoch (`NOT_MEMBER`), and for every later `member remove` of the signer the message id is in that record's `keep` (`REMOVED`). Pending while the inbox or the epoch is unseen.
+**A message to a shared inbox** is valid when it carries an `epoch` (`BAD_EPOCH`), the signer was a member at that epoch (`NOT_MEMBER`), and for every later `member remove` of the signer the message lies on that removal's kept chain (`REMOVED`; see [Removal](#removal)). Pending while the inbox or the epoch is unseen, or while a link of the kept chain is (`CHAIN_UNSEEN`).
 
 ### Membership by epoch
 
@@ -77,10 +77,24 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 ### Removal
 
-- On removal the owner's install lists in `keep` the ids of the member's messages it has accepted.
-- Every reader then decides the same way, with no clock involved: a message cited at an epoch before the removal is valid only if kept. A backdated `epoch` does not help.
+- Every shared-inbox message names its sender's previous message there in `prev`, so each sender's messages form a hash chain.
+- On removal the owner's install writes `keepHead`: the id of the member's last message it accepted (acceptance order), or `null`. The record has a fixed size however much the member wrote.
+- **Kept chain:** `keepHead`, then each `prev` back, while each link is a message by the member in that inbox (`keptChain`, `src/state.js`).
+- A message cited at an epoch before the removal is valid only if it is on the kept chain. Every reader decides the same way, with no clock involved:
+  - a backdated `epoch` does not help;
+  - a later message (its `prev` is the head or anything on the chain) is off the chain;
+  - a fork, or a message pre-signed before the removal but not accepted by the owner by then, is off the chain.
+- While a link of the chain is not known yet, a message off the known part is **pending** (`CHAIN_UNSEEN`); the arriving link itself is on the chain.
 - After a re-add, messages citing the new epoch are valid again.
 - Validity is recomputed against everything known, so a message accepted before a removal that does not keep it becomes **hidden** everywhere.
+
+### Admission after an accepted shared invite
+
+The owner's install writes the `member add` itself when it accepts the invitee's acceptance, and again at boot for any acceptance accepted before a crash. It does so only while `admissionDue` (`src/state.js`) holds:
+
+- the invite's effective response (the lowest record id among its responses) accepts;
+- the invitee is not a current member;
+- the invite was accepted on the owner's install after the invitee's last `member` record (acceptance seqs, both written by the owner). A re-signed or replayed acceptance of an invite that predates a removal admits nobody; a fresh invite does.
 
 ### Names
 
@@ -106,11 +120,13 @@ inboxes/<inboxId>/<signerFp>/<ts13>-<rand32hex>.rec
 ```
 
 - A writer writes only below its own fingerprint subdir, by tmp + fsync + rename; tmp names start `.tmp-`. No file is ever rewritten.
+- Before writing, the writer subdir must be a real directory (not a symlink) resolving inside the share; otherwise the send is refused `SHARE_UNSAFE` and the record stays in the outbox.
+- Readers skip writer subdirs and record files that are symlinks, and open files without following links.
 - Readers offer only names matching `FILE_RE` (`^\d{13}-[0-9a-f]{32}\.rec$`, `src/transport/fileShare.js`) in subdirs that are a fingerprint. That skips tmp files and sync-client conflict copies.
 
 ## REST routes
 
-All under the backend root; the page calls them relative (`api/...`). Every answer carries the CSP (`CSP`, `src/http.js`), `nosniff`, `no-referrer` and `no-store`.
+All under the backend root; the page calls them relative (`api/...`). Every HTTP answer carries the CSP (`CSP`, `src/http.js`), `nosniff`, `no-referrer` and `no-store`; the bare 400 for a request Node cannot parse (`clientError`) carries only the CSP and `nosniff`. A malformed percent-escape in a path segment is 400 `BAD_REQUEST`.
 
 **Request guard, every POST:** a browser's `Sec-Fetch-Site` must be `same-origin` or `none`; without that header, an `Origin` is refused (403 `FORBIDDEN`). Then `Content-Type: application/json` (415 `UNSUPPORTED_MEDIA_TYPE`). A request body over `MAX_REQUEST_BYTES` is 413 `PAYLOAD_TOO_LARGE`.
 
@@ -120,7 +136,7 @@ All under the backend root; the page calls them relative (`api/...`). Every answ
 |---|---|---|
 | `GET api/health` | — | `{ok: true}` |
 | `GET api/state` | — | `{identity, share, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`) |
-| `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, oldest first |
+| `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, in acceptance order |
 | `GET api/sessions` | — | `{sessions: [{sessionId, label, status, live}], target, autoStart}`: cc's top-level conductors; 503 `CONDUCTOR_UNAVAILABLE` without cc |
 | `POST api/identity` | `{name}` | `{name}` |
 | `POST api/share` | `{dir}` | `{shareDir}` |
@@ -132,7 +148,7 @@ All under the backend root; the page calls them relative (`api/...`). Every answ
 | `POST api/inboxes/:id/join` | `{}` | `{id}` |
 | `POST api/join-requests/:id/respond` | `{accept: boolean}` | `{id}` (a `member` record or a `join-response`) |
 | `POST api/inboxes/:id/members/:fp/remove` | `{}` | `{id}` |
-| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `SHARE_UNCONFIGURED` 409, `BODY_TOO_LARGE` 413 |
+| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `SHARE_UNCONFIGURED` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
 | `POST api/notify` | `{sessionId}` or `{sessionId: null}` | `{target, autoStart}`; `SESSION_UNKNOWN` unless a top-level conductor |
 | `POST api/mcp` | cc's tool call | below |
 
