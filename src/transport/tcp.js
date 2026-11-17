@@ -29,8 +29,19 @@ const DEFAULT_LIMITS = {
 
 const HOSTNAME_RE = /^(?=.{1,253}$)[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?)*$/;
 const ADDR_RE = /^tcp:\/\/(\[[0-9A-Fa-f:.]+\]|[A-Za-z0-9.-]+):(\d{1,5})$/;
-const WILDCARDS = new Set(['0.0.0.0', '::']);
 const isHost = (h) => typeof h === 'string' && (net.isIP(h) !== 0 || HOSTNAME_RE.test(h));
+
+// The unspecified addresses, compared as parsed addresses: `::0`, `0:0:0:0:0:0:0:0` and `::ffff:0.0.0.0` are `::`
+// or `0.0.0.0` too.
+const UNSPECIFIED = new net.BlockList();
+UNSPECIFIED.addAddress('0.0.0.0', 'ipv4');
+UNSPECIFIED.addAddress('::', 'ipv6');
+
+// Whether `host` is an IP literal for "every interface" (listening on it is not one address peers can dial).
+export function isWildcardHost(host) {
+  const family = net.isIP(host);
+  return family !== 0 && UNSPECIFIED.check(host, family === 6 ? 'ipv6' : 'ipv4');
+}
 
 export const formatTcpAddr = (host, port) => `tcp://${net.isIPv6(host) ? `[${host}]` : host}:${port}`;
 
@@ -58,9 +69,9 @@ export function validateTcpConfig(input) {
   if (!isHost(host)) refuse('host must be an IP address or a hostname');
   const port = given(p) ? p : TCP_DEFAULT_PORT;
   if (!Number.isSafeInteger(port) || port < 0 || port > 65535) refuse('port must be an integer 0–65535');
-  if (WILDCARDS.has(host) && !given(a)) refuse(`listening on ${host} needs an advertised host`);
+  if (isWildcardHost(host) && !given(a)) refuse(`listening on ${host} needs an advertised host`);
   const advertise = given(a) ? a : host;
-  if (!isHost(advertise) || WILDCARDS.has(advertise)) refuse('advertise must be a reachable IP address or hostname');
+  if (!isHost(advertise) || isWildcardHost(advertise)) refuse('advertise must be a reachable IP address or hostname');
   return { host, port, advertise };
 }
 
@@ -156,13 +167,14 @@ export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT,
       let budget = TCP_BATCH_BYTES;
       const routes = f.routes.map(({ route, since }) => {
         const r = b.view.serve(f.from, route, since, Math.max(0, budget));
-        if (r.status !== 'ok') return { route, status: 'denied', recs: [], more: false, head: r.head };
+        if (r.status !== 'ok') return { route, status: 'denied' };
         for (const x of r.recs) budget -= x.bytes.length;
         return { route, status: 'ok', recs: r.recs.map((x) => ({ seq: x.seq, rec: Buffer.from(x.bytes).toString('base64url') })), more: r.more, head: r.head };
       });
       s.write({ t: 'recs', id: f.id, from: f.to, to: f.from, routes });
     } else if (f.t === 'whois') {
-      const recs = f.fps.map((fp) => b.view.announceOf(fp)).filter(Boolean).map((x) => Buffer.from(x).toString('base64url'));
+      // Only announces of identities the requester shares an inbox with: no oracle for this install's contacts.
+      const recs = f.fps.map((fp) => b.view.announceFor(f.from, fp)).filter(Boolean).map((x) => Buffer.from(x).toString('base64url'));
       s.write({ t: 'cards', id: f.id, from: f.to, to: f.from, recs });
     }
   }
@@ -172,18 +184,30 @@ export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT,
     newSession(socket, 'accept');
   }
 
+  // A listener that fails after it is up is closed (its port freed) and forgotten; peers already connected keep
+  // their sessions, and the next start() listens again.
+  function forget(srv) {
+    if (server !== srv) return;
+    server = null;
+    listening = null;
+    boundPort = null;
+  }
+
   function listen() {
     if (listening) return listening;
     const srv = net.createServer(onConnection);
     server = srv;
     listening = new Promise((resolve, reject) => {
-      srv.once('error', (err) => {
-        if (server === srv) { server = null; listening = null; }
-        reject(err);
-      });
+      const failed = (err) => { forget(srv); reject(err); };
+      srv.once('error', failed);
       srv.listen(port, host, () => {
+        srv.off('error', failed);
+        srv.on('error', (err) => {
+          log.warn(`code-inbox: the TCP listener failed and was closed: ${err.message}`);
+          forget(srv);
+          srv.close();
+        });
         boundPort = srv.address().port;
-        srv.on('error', (err) => log.warn(`code-inbox: the TCP listener failed: ${err.message}`));
         resolve();
       });
     });
@@ -235,9 +259,10 @@ export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT,
   const setCursor = (b, fp, key, seq) => { b.cursorData = { ...b.cursorData, [fp]: { ...b.cursorData[fp], [key]: seq } }; };
 
   // Pulls `routes` from `fp` on `s`, records signed by `fp` past this binding's cursor, until no route has more.
-  // A cursor moves only once its batch has been offered; a denied route keeps its cursor.
+  // Only routes `fp` could serve by this install's own state are named (view.mayPull), so a peer learns no route
+  // key it has no part in. A cursor moves only once its batch has been offered; a denied route keeps its cursor.
   async function pullFrom(b, s, fp, routes) {
-    let todo = [...routes];
+    let todo = routes.filter((r) => b.view.mayPull(fp, r));
     while (todo.length && b.sink && !s.closed) {
       const chunk = todo.slice(0, TCP_PULL_ROUTES_MAX);
       const rest = todo.slice(TCP_PULL_ROUTES_MAX);
@@ -248,8 +273,8 @@ export function createTcpEndpoint({ host = '127.0.0.1', port = TCP_DEFAULT_PORT,
         const key = routeKey(r.route);
         const since = asked.get(key);
         let last = since;
-        const ordered = r.recs.every((x) => { const okSeq = x.seq > last && x.seq <= r.head; last = x.seq; return okSeq; });
-        if (since === undefined || answered.has(key) || (r.head >= since && !ordered)) { s.close('PROTOCOL'); return; }
+        const ordered = r.status !== 'ok' || r.recs.every((x) => { const okSeq = x.seq > last && x.seq <= r.head; last = x.seq; return okSeq; });
+        if (since === undefined || answered.has(key) || (r.status === 'ok' && r.head >= since && !ordered)) { s.close('PROTOCOL'); return; }
         answered.add(key);
       }
       const again = [];

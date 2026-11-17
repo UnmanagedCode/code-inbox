@@ -351,3 +351,25 @@ test('cardStale turns true when the address changes and false after announcing',
   assert.equal(a.engine.state().transport.cardStale, false);
   assert.notEqual(a.engine.state().transport.card, first.card);
 });
+
+// Invariant: a stored transport config is validated at boot like a saved one; an invalid one boots unconfigured with
+// its reason shown, and never crashes the backend.
+test('an invalid stored transport boots unconfigured with its error', async (t) => {
+  const cases = [
+    [{ kind: 'tcp', host: '::0', port: 0, advertise: null }, 'TCP_INVALID'],
+    [{ kind: 'tcp', host: '127.0.0.1', port: 70000, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    [{ kind: 'file-share', dir: path.join(tmpDir(), 'missing') }, 'SHARE_INVALID'],
+    [{ kind: 'carrier-pigeon' }, 'TRANSPORT_INVALID'],
+  ];
+  for (const [transport, code] of cases) {
+    const dataDir = tmpDir('code-inbox-data-');
+    fs.mkdirSync(dataDir, { recursive: true });
+    fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ name: 'alice', transport, notifyTarget: null }));
+    const x = await makeInstall(null, { dataDir });
+    t.after(() => x.close());
+    const st = x.engine.state().transport;
+    assert.equal(st.configured, false, code);
+    assert.equal(st.error.code, code);
+    await assert.rejects(x.engine.announce(), { code: 'TRANSPORT_UNCONFIGURED' });
+  }
+});

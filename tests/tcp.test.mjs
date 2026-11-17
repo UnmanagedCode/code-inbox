@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import net from 'node:net';
 import path from 'node:path';
 import { loadIdentity } from '../src/identity.js';
-import { encodeRecord } from '../src/records.js';
+import { decodeRecord, encodeRecord } from '../src/records.js';
 import { FILES } from '../src/store.js';
 import { TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, encodeFrame } from '../src/transport/frames.js';
 import { proofSigner } from '../src/transport/handshake.js';
@@ -144,6 +144,28 @@ test('a proof bound to another target or role is refused', async (t) => {
   const dHello = await acc.nextOf('hello');
   assert.equal((await acc.nextOf('prove')).target, target.fp);
   acc.send({ t: 'prove', ids: acceptProofs([target], 'dial', myNonce, dHello.nonce, [dialer.fp]) });
+  assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
+  await syncing;
+  assert.deepEqual(dialer.endpoint.stats().sessions, []);
+});
+
+test('a dialer refuses an acceptor that validly proves someone other than its target', async (t) => {
+  const target = await newIdentity();
+  const impostor = await newIdentity();
+  const conns = [];
+  const srv = net.createServer((s) => conns.push(rawConn(s)));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { for (const c of conns) c.destroy(); srv.close(); });
+  const dialer = await stubEndpoint(t, { view: stubView({ contacts: [target.fp], addrs: { [target.fp]: [`tcp://127.0.0.1:${srv.address().port}`] } }) });
+  const syncing = dialer.transport.sync();
+  await waitFor(() => conns.length === 1, 'the dial');
+  const acc = conns[0];
+  const myNonce = crypto.randomBytes(32).toString('hex');
+  acc.send({ t: 'hello', v: 1, nonce: myNonce });
+  const dHello = await acc.nextOf('hello');
+  await acc.nextOf('prove');
+  // A correct accept proof (role, nonces, bound to the dialer) by an identity the dialer never asked for.
+  acc.send({ t: 'prove', ids: acceptProofs([impostor], 'accept', myNonce, dHello.nonce, [dialer.fp]) });
   assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
   await syncing;
   assert.deepEqual(dialer.endpoint.stats().sessions, []);
@@ -338,7 +360,30 @@ test('inbox and mailbox records are served only to parties or members', async (t
   const routes = [{ kind: 'inbox', id: inbox }, { kind: 'mailbox', fp: bob.fp }, { kind: 'directory' }];
   raw.send({ t: 'pull', id: 7, from: carol.fp, to: alice.fp, routes: routes.map((route) => ({ route, since: 0 })) });
   const recs = await raw.nextOf('recs');
-  assert.deepEqual(recs.routes.map((r) => [routeKey(r.route), r.status, r.recs.length > 0]), [[`inbox:${inbox}`, 'denied', false], [`mailbox:${bob.fp}`, 'denied', false], ['directory', 'ok', true]]);
+  assert.deepEqual(recs.routes.map((r) => [routeKey(r.route), r.status, (r.recs?.length ?? 0) > 0]), [[`inbox:${inbox}`, 'denied', false], [`mailbox:${bob.fp}`, 'denied', false], ['directory', 'ok', true]]);
+  // A denial says nothing about how much alice holds.
+  for (const r of recs.routes.slice(0, 2)) assert.deepEqual(Object.keys(r).sort(), ['route', 'status']);
+});
+
+test('a peer\'s pull names only the routes it could serve', async (t) => {
+  const alice = await tcpNode('alice');
+  const bob = await tcpNode('bob');
+  t.after(async () => { await alice.close(); await bob.close(); });
+  await bob.engine.importCard(alice.card());
+  await settle([alice, bob]);
+  const inbox = await personal(alice, bob);
+  const { id: team } = await alice.engine.createSharedInbox('team');
+  assert.ok(alice.engine.state().inboxes.some((b) => b.id === inbox));
+  // A stranger connects: alice's pull on the new session names her directory and her mailbox, nothing else.
+  const mallory = await newIdentity();
+  const raw = await rawPeer(alice.transport.stats().listening.port, mallory, alice.fp);
+  closeAll(t, raw);
+  const pull = await raw.nextOf('pull');
+  assert.deepEqual(pull.routes.map((r) => routeKey(r.route)).sort(), ['directory', `mailbox:${alice.fp}`]);
+  await alice.engine.sync();
+  const pulls = raw.frames.filter((f) => f.t === 'pull');
+  for (const p of pulls) for (const r of p.routes) assert.ok(!routeKey(r.route).startsWith('inbox:'), `${routeKey(r.route)} was named to a stranger`);
+  assert.ok(!JSON.stringify(raw.frames).includes(team) && !JSON.stringify(raw.frames).includes(inbox));
 });
 
 test('members discover each other through a verified whois hint', async (t) => {
@@ -361,6 +406,18 @@ test('members discover each other through a verified whois hint', async (t) => {
   await settle(all, 3);
   assert.deepEqual(bob.engine.messages(team).map((m) => m.body), ['hi bob']);
   assert.ok(carol.transport.stats().sessions.some((s) => s.remote.includes(bob.fp)), 'carol reached bob directly');
+
+  // alice answers whois about bob to a co-member of bob's (carol), and to nobody else.
+  const port = alice.transport.stats().listening.port;
+  const whois = async (identity) => {
+    const raw = await rawPeer(port, identity, alice.fp);
+    raw.send({ t: 'whois', id: 9, from: identity.fp, to: alice.fp, fps: [bob.fp] });
+    const cards = await raw.nextOf('cards');
+    raw.destroy();
+    return cards.recs.map((r) => decodeRecord(Buffer.from(r, 'base64url')).payload);
+  };
+  assert.deepEqual((await whois(carol.identity)).map((p) => [p.type, p.signer]), [['announce', bob.fp]]);
+  assert.deepEqual(await whois(await newIdentity()), []);
 
   // A whois reply signed by anyone but the identity asked about is never a dial hint.
   const dave = await newIdentity();
@@ -464,7 +521,12 @@ test('TCP listens on loopback unless a host is given', async (t) => {
   assert.equal(alice.transport.stats().listening.host, '127.0.0.1');
   assert.match(alice.engine.state().transport.addresses[0], /^tcp:\/\/127\.0\.0\.1:\d+$/);
   await assert.rejects(alice.engine.setTcp({ host: '0.0.0.0', port: 0 }), { code: 'TCP_INVALID' });
-  await assert.rejects(alice.engine.setTcp({ host: '::', port: 0 }), { code: 'TCP_INVALID' });
+  // Every spelling of the unspecified address is a wildcard, as a host and as an advertised host.
+  for (const host of ['::', '::0', '0:0:0:0:0:0:0:0', '0000::', '::ffff:0.0.0.0']) {
+    await assert.rejects(alice.engine.setTcp({ host, port: 0 }), { code: 'TCP_INVALID' }, host);
+    await assert.rejects(alice.engine.setTcp({ advertise: host, port: 0 }), { code: 'TCP_INVALID' }, `advertise ${host}`);
+  }
+  assert.equal(alice.engine.state().transport.configured, true);
 });
 
 test('re-saving TCP settings on the same port rebinds', async (t) => {
@@ -499,4 +561,32 @@ test('a port in use refuses TCP_LISTEN_FAILED and leaves the transport unconfigu
   await alice.engine.setTcp({ port });
   assert.equal(alice.engine.state().transport.configured, true);
   assert.equal(alice.engine.state().transport.error, null);
+});
+
+// Invariant: an admission owed when no transport could start (the port was taken at boot) is written as soon as a
+// transport starts, without another restart.
+test('an owed admission completes after a boot listen failure followed by setTcp', async (t) => {
+  const port = await freePort();
+  let alice = await tcpNode('alice', { port });
+  const bob = await tcpNode('bob');
+  const aliceDir = alice.dataDir;
+  const busy = net.createServer();
+  t.after(async () => { await alice.close(); await bob.close(); if (busy.listening) busy.close(); });
+  await bob.engine.importCard(alice.card());
+  await settle([alice, bob]);
+  const { id: team } = await alice.engine.createSharedInbox('team');
+  const inv = await alice.engine.inviteMember(team, bob.fp);
+  await settle([alice, bob]);
+  await alice.close();
+  await bob.engine.respondInvite(inv.id, true);
+  // alice's backend accepted bob's acceptance and stopped before admitting him.
+  const response = (await bob.store.load()).accepted.find((e) => decodeRecord(e.bytes).payload.type === 'invite-response');
+  await alice.store.appendAccepted({ id: response.id, route: response.route, bytes: response.bytes });
+  await new Promise((r) => busy.listen(port, '127.0.0.1', r));
+  alice = await tcpNode('alice', { dataDir: aliceDir, configure: false });
+  assert.equal(alice.engine.state().transport.error.code, 'TCP_LISTEN_FAILED');
+  assert.deepEqual(alice.engine.listInboxes()[0].members.map((m) => m.fp), [alice.fp]);
+  await new Promise((r) => busy.close(r));
+  await alice.engine.setTcp({ port });
+  assert.deepEqual(alice.engine.listInboxes()[0].members.map((m) => m.fp).sort(), [alice.fp, bob.fp].sort());
 });

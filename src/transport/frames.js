@@ -107,10 +107,10 @@ const SCHEMAS = {
   recs: [['t', 'id', 'from', 'to', 'routes'], (f) => {
     fromTo(f); reqId(f);
     const routes = list(f.routes, 1, TCP_PULL_ROUTES_MAX, 'routes').map((r) => {
-      if (!exact(r, ['route', 'status', 'recs', 'more', 'head']) || !isUint(r.head) || typeof r.more !== 'boolean') bad('a served route is not exactly {route, status, recs, more, head}');
-      if (r.status !== 'ok' && r.status !== 'denied') bad('status must be ok or denied');
-      if (!Array.isArray(r.recs)) bad('recs must be an array');
-      if (r.status === 'denied' && (r.recs.length || r.more)) bad('a denied route carries no records');
+      // A denial carries nothing but the route: no head, so it says nothing of what the server holds.
+      if (exact(r, ['route', 'status']) && r.status === 'denied') return { route: route(r.route), status: 'denied' };
+      if (!exact(r, ['route', 'status', 'recs', 'more', 'head']) || r.status !== 'ok') bad('a served route is exactly {route, status:"denied"} or {route, status:"ok", recs, more, head}');
+      if (!isUint(r.head) || typeof r.more !== 'boolean' || !Array.isArray(r.recs)) bad('a served route needs recs, more and head');
       const recs = r.recs.map((x) => {
         if (!exact(x, ['seq', 'rec']) || !Number.isSafeInteger(x.seq) || x.seq < 1) bad('a served record is not exactly {seq, rec}');
         return { seq: x.seq, rec: recordBytes(x.rec) };

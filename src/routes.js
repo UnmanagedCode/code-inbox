@@ -65,8 +65,6 @@ export function buildRoutes({ engine, notifier, cc, mcp }) {
     post(/^\/api\/share$/, ({ body }) => engine.setShare(field(body, 'dir'))),
     post(/^\/api\/tcp$/, ({ body }) => engine.setTcp({ host: field(body, 'host'), port: field(body, 'port'), advertise: field(body, 'advertise') })),
     post(/^\/api\/contacts$/, ({ body }) => engine.importCard(field(body, 'card'))),
-    post(/^\/api\/tcp$/, ({ body }) => engine.setTcp({ host: field(body, 'host'), port: field(body, 'port'), advertise: field(body, 'advertise') })),
-    post(/^\/api\/contacts$/, ({ body }) => engine.importCard(field(body, 'card'))),
     post(/^\/api\/announce$/, () => engine.announce()),
     post(/^\/api\/invites$/, ({ body }) => engine.invite(field(body, 'to'))),
     post(new RegExp(`^/api/invites/${id}/respond$`), ({ params, body }) => engine.respondInvite(params[0], field(body, 'accept'))),

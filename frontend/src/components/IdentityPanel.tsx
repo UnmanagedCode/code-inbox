@@ -22,7 +22,7 @@ export function IdentityPanel({ state, refresh }: { state: State; refresh: () =>
         <dt>Announced as</dt><dd>{identity.announcedName ?? '—'} ({NAME_STATUS[identity.nameStatus] ?? identity.nameStatus})</dd>
       </dl>
       <form className="row" onSubmit={(e) => { e.preventDefault(); void run(() => api.setName(name)); }}>
-        <label className="grow stack"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. laptop-tim" /></label>
+        <label className="grow stack"><span>Name</span><input value={name} onChange={(e) => setName(e.target.value)} placeholder="e.g. my-machine" /></label>
         <button type="submit" disabled={busy}>Save name</button>
       </form>
       <div className="row">

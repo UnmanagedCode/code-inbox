@@ -405,6 +405,29 @@ export function mayRead(index, reader, route) {
   return !!currentMembers(index, route.id)?.has(reader);
 }
 
+// Whether this install (`self`) should ask `peer` for its records on `route`, judged by this install's own state:
+// the directory always; `self`'s mailbox; an inbox only when `peer` is a party of that personal inbox or a current
+// member of that shared inbox. Pulls name nothing else, so a peer learns no route key it has no part in.
+export function mayPull(index, self, peer, route) {
+  if (route.kind === 'mailbox') return route.fp === self;
+  return mayRead(index, peer, route);
+}
+
+// Whether `a` and `b` are the two parties of a personal inbox or both current members of a shared inbox, as this
+// install knows them: the only case in which `a` may learn `b`'s announce from this install (TCP whois).
+export function sharesInbox(index, a, b) {
+  if (a === b) return false;
+  for (const recs of index.personalInvites.values()) {
+    const { signer, to } = lowestId(recs).payload;
+    if ((signer === a && to === b) || (signer === b && to === a)) return true;
+  }
+  for (const id of index.inboxCreates.keys()) {
+    const members = currentMembers(index, id);
+    if (members?.has(a) && members.has(b)) return true;
+  }
+  return false;
+}
+
 // The identities `self` has a relationship with, so may dial: `imported` (card imports), the counterparties of
 // records it signed (`to`, `member`), and the parties and members of every inbox it belongs to. Never `self`.
 export function contactsOf(index, self, imported) {

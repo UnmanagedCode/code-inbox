@@ -61,7 +61,7 @@ All ingest and every action run under one engine lock (`withLock('engine:<dataDi
 7. **Pins and interest:** newly shown names are pinned; the routes of interest (`interestOf`) are pushed to the transport.
 8. **Reactions:** an accepted response to this install's own shared invite admits the invitee (a `member add`) while `admissionDue` holds ([protocol.md → Admission](protocol.md#admission-after-an-accepted-shared-invite)).
 
-**Boot recovery:** after rebuilding the index, pending entries already accepted are dropped and the pending set is drained once; after the transport starts, every admission `admissionDue` still owes is written. That closes the crash windows between accepting a record and acting on it.
+**Boot recovery:** after rebuilding the index, pending entries already accepted are dropped and the pending set is drained once; whenever a transport starts (at boot, or later when a human saves one after a boot that started none), every admission `admissionDue` still owes is written. That closes the crash windows between accepting a record and acting on it.
 
 **Sending** (`publish`): sign → `transport.send` (recipients in `pending`, or all of them if the send throws, go to the outbox) → ingest locally like any other record. A `SHARE_UNSAFE` send is the exception: the action is refused with that code and nothing is admitted or queued. The outbox is re-sent on every `engine.sync()` and, for a peer, on `peerOnline`.
 
@@ -93,8 +93,9 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 ## TCP transport lifecycle
 
-- **Start** (`startTransport` → `start(sink)`): attach the binding (closing the endpoint's sessions if it already had others), listen (a failure leaves no transport and refuses `TCP_LISTEN_FAILED`; at boot it is logged and shown in `state().transport.error`, not fatal), load `peer-cursors.json`, run `maintain` and then every `syncMs`.
-- **Maintain:** whois for contacts with no address → dial contacts without a session → pull every route of interest from every session. Maintain runs and pulls of one binding never overlap.
+- **Start** (`startTransport` → `start(sink)`): at boot the stored config is validated first (an invalid one starts nothing; the refusal is shown in `state().transport.error`). Then attach the binding (closing the endpoint's sessions if it already had others), listen (a failure leaves no transport and refuses `TCP_LISTEN_FAILED`; at boot it is logged and shown, not fatal), load `peer-cursors.json`, run `maintain` and then every `syncMs`. After any successful start (boot, `setShare`, `setTcp`) the engine writes every admission still owed (`reconcileAdmissions`).
+- **Listener errors** after it is up close the listener (freeing the port) and forget it; existing sessions stay.
+- **Maintain:** whois for contacts with no address → dial contacts without a session → pull from every session the routes of interest that peer could serve (`view.mayPull`). Maintain runs and pulls of one binding never overlap.
 - **Session ready:** `peerOnline` (the engine flushes its outbox for that peer) and a pull of the binding's interest from that peer.
 - **Inbound frames** of one session are processed one at a time, each awaited; `rec` waits for the engine lock through `sink.record`. Writes never wait on inbound processing, so a `send` under the engine lock cannot deadlock against it.
 - **Stop:** closes the listener synchronously before anything is awaited, then every socket and timer, and never awaits a pending sink call (the engine lock may hold it). The engine drops whatever the old sink still offers.

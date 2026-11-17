@@ -195,9 +195,9 @@ proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON
 | `t` | Fields | Meaning |
 |---|---|---|
 | `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise |
-| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since` |
-| `recs` | `id, from, to, routes:[{route, status:'ok'\|'denied', recs:[{seq, rec}], more, head}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route has `recs:[]`, `more:false`. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq |
-| `whois` | `id, from, to, fps` | Ask for the current announces of `fps` |
+| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since`. Names only routes `to` could serve by the asker's own state ([transport.md → Scoped pulls](transport.md#maintain-pulls-and-cursors)) |
+| `recs` | `id, from, to, routes:[{route, status:'ok', recs:[{seq, rec}], more, head} \| {route, status:'denied'}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route is exactly `{route, status:'denied'}`: no `head`, so it reveals nothing of what the server holds. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq |
+| `whois` | `id, from, to, fps` | Ask for the current announces of `fps`. Answered only for those that share an inbox with `from` on the answering install; the others are left out |
 | `cards` | `id, from, to, recs:[rec]` | Answer to `whois`: dial hints only, never ingested |
 | `ping` / `pong` | — | Keepalive every `TCP_PING_MS` |
 | `bye` | `reason`: `PROOF`, `PROTOCOL`, `DUPLICATE`, `LIMIT`, `STOP` | Sent before a deliberate close |
@@ -221,7 +221,7 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | Route | Body | Answer |
 |---|---|---|
 | `GET api/health` | — | `{ok: true}` |
-| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, addresses, card, cardStale, error}`: `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the configured TCP listener could not start |
+| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, addresses, card, cardStale, error}`: `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the stored transport was invalid at boot (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID`) or the TCP listener could not start (`TCP_LISTEN_FAILED`) |
 | `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, in acceptance order |
 | `GET api/sessions` | — | `{sessions: [{sessionId, label, status, live}], target, autoStart}`: cc's top-level conductors; 503 `CONDUCTOR_UNAVAILABLE` without cc |
 | `POST api/identity` | `{name}` | `{name}` |

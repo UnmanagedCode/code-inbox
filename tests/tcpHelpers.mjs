@@ -83,7 +83,7 @@ export async function rawConnect(port, opts) {
 
 // A minimal well-behaved peer's answers: every pull denied, no cards, pongs.
 function answer(f, conn) {
-  if (f.t === 'pull') conn.send({ t: 'recs', id: f.id, from: f.to, to: f.from, routes: f.routes.map(({ route }) => ({ route, status: 'denied', recs: [], more: false, head: 0 })) });
+  if (f.t === 'pull') conn.send({ t: 'recs', id: f.id, from: f.to, to: f.from, routes: f.routes.map(({ route }) => ({ route, status: 'denied' })) });
   if (f.t === 'whois') conn.send({ t: 'cards', id: f.id, from: f.to, to: f.from, recs: [] });
   if (f.t === 'ping') conn.send({ t: 'pong' });
 }
@@ -107,9 +107,10 @@ export async function rawPeer(port, identity, target, { onFrame, nonce = newHand
 // The acceptor's proof `signers` would give a dialer: used by a raw acceptor to answer (rightly or not).
 export const acceptProofs = (signers, role, myNonce, dialerNonce, dialerFps) => makeProofs(signers.map(proofSigner), role, myNonce, dialerNonce, boundFps(dialerFps));
 
-// A stand-in engine view: `contacts`, `addrs` (fp → [addr]), `announces` (fp → bytes), `serve`.
-export function stubView({ contacts = [], addrs = {}, announces = {}, serve = (_r, _route, _since, _b) => ({ status: 'denied', head: 0 }) } = {}) {
-  return { contacts: () => contacts, addrsOf: (fp) => addrs[fp] ?? [], announceOf: (fp) => announces[fp] ?? null, serve };
+// A stand-in engine view: `contacts`, `addrs` (fp → [addr]), `announces` (fp → bytes, for any requester), `serve`;
+// every route may be pulled from anyone.
+export function stubView({ contacts = [], addrs = {}, announces = {}, serve = () => ({ status: 'denied' }) } = {}) {
+  return { contacts: () => contacts, addrsOf: (fp) => addrs[fp] ?? [], announceFor: (_requester, fp) => announces[fp] ?? null, mayPull: () => true, serve };
 }
 
 export function stubSink() {

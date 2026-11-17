@@ -36,13 +36,17 @@ The engine builds its transport with `makeTransport(config, view)` (`server.js` 
 | `view.` | Returns | Source |
 |---|---|---|
 | `addrsOf(fp)` | `string[]`: the `addr` of `fp`'s current announce (shown or not), else `[]` | `directory()` |
-| `announceOf(fp)` | the bytes of `fp`'s current announce, or `null` | `directory()` identity `id` → the engine's announce bytes |
+| `announceFor(requester, fp)` | the bytes of `fp`'s current announce if `requester` and `fp` share an inbox here, else `null` | `sharesInbox` (`src/state.js`), then `directory()` identity `id` → the engine's announce bytes |
+| `mayPull(peer, route)` | whether to name `route` in a pull from `peer`: the directory, this install's own mailbox, or an inbox `peer` is a party or current member of here | `mayPull` (`src/state.js`) |
 | `contacts()` | the dial set: card-imported identities (`contacts.json`), counterparties of records this install signed (`to`, `member`), parties and members of every inbox it belongs to | `contactsOf` (`src/state.js`) |
-| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied', head}` | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq |
+| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied'}` (no `head`: a denial reveals nothing of what is held) | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq |
 
-`mayRead(index, reader, route)`: the directory to any proven identity; a mailbox to its owner; a personal inbox to its inviter and invitee; a shared inbox to its current members; nothing else.
+- `mayRead(index, reader, route)`: the directory to any proven identity; a mailbox to its owner; a personal inbox to its inviter and invitee; a shared inbox to its current members; nothing else.
+- `sharesInbox(index, a, b)`: `a` and `b` are the two parties of a personal inbox, or both current members of a shared inbox, as this install knows them.
 
 ### Selecting a transport
+
+A stored transport is validated at boot as when it was saved (`validateTcpConfig`, `validateShareDir`). An invalid one starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
 
 One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise}`.
 
@@ -83,7 +87,7 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 - The listener starts on the first `start()`. Starting or stopping a binding on a live endpoint closes its sessions: they re-handshake with the new identity set when next needed.
 - `stop()` closes the listener **synchronously, before anything is awaited**, then every socket, and never awaits a pending sink call. Re-saving TCP settings on the same port therefore rebinds at once, under the engine lock.
 - `stats()` → `{listening, connections, handshaking, sessions: [{role, remote: [fp]}], handshakeFailures, dropped}`. The Transport object exposes it too (tests and the multi-identity checks use it).
-- `validateTcpConfig({host, port, advertise})`: host an IP literal or hostname (default `127.0.0.1`); port an integer 0–65535 (default `TCP_DEFAULT_PORT`; 0 = ephemeral); `advertise` defaults to host and is required (and must not be a wildcard) when host is `0.0.0.0` or `::`. Otherwise `TCP_INVALID`.
+- `validateTcpConfig({host, port, advertise})`: host an IP literal or hostname (default `127.0.0.1`); port an integer 0–65535 (default `TCP_DEFAULT_PORT`; 0 = ephemeral); `advertise` defaults to host and is required (and must not be a wildcard) when host is a wildcard. Wildcards are decided on the parsed address (`isWildcardHost`): `0.0.0.0` and every spelling of `::` (`::0`, `0:0:0:0:0:0:0:0`, `::ffff:0.0.0.0`, …). Otherwise `TCP_INVALID`.
 
 ### Pooling and duplicates
 
@@ -104,9 +108,10 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 
 1. **Whois:** for every contact without a session and without any address, ask every connected session for its announce.
 2. **Dial** contacts without a session (backoff permitting), awaiting each handshake.
-3. **Pull** every route of interest from every remote fingerprint on every session.
+3. **Pull** from every remote fingerprint on every session the routes of interest it could serve.
 
-- **On session ready:** `peerOnline(fp)` for every remote fingerprint and local binding, then a pull of that binding's interest from it. The directory route is always in the interest, so this is the announce exchange at the handshake.
+- **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A peer that completes a handshake learns no other route key (no inbox id it has no part in).
+- **On session ready:** `peerOnline(fp)` for every remote fingerprint and local binding, then a (scoped) pull of that binding's interest from it. The directory is always pulled, so this is the announce exchange at the handshake.
 - **New routes:** `setInterest` schedules (never awaits; it runs under the engine lock) a pull of each newly added route from every session.
 - **A pull** asks for records signed by the remote identity on each route with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress.
 - **Cursors** are per (peer fp, route key), persisted in `peer-cursors.json`. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
@@ -116,11 +121,12 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 
 - **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine still checks `payload.signer === writer` and `routeFor(payload) === route`. A peer therefore pushes and serves only records it signed itself; a relayed third-party record is refused `ROUTE_MISMATCH`, like a file in the wrong share subdir.
 - **Contact-card import** is the one path where the writer is not a transport identity: `engine.importCard` accepts only an `announce` and ingests it with route `directory` and writer = its signer. Every other check still runs.
+- **Whois answers only for a shared inbox.** A peer asking about `fp` gets `fp`'s announce only if the two share an inbox on this install (`view.announceFor`): the member-discovery case. Anything else is answered with nothing, so whois is no oracle for this install's contacts or third parties' addresses.
 - **Whois hints are never ingested.** A `cards` reply is used only for the `tcp://` addresses of announces that decode, are `announce`s, and are signed by a fingerprint that was asked for. The engine receives that identity's announce from the identity itself, by the pull after the handshake. A forged or mismatched hint is dropped; a hint pointing at the wrong place fails the handshake proof.
 
 ### Known limitations
 
-- **A member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time; another member or the owner cannot pass it on.
+- **A member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time; another member or the owner cannot pass it on. A removed member is no longer pulled from, so a member who joins after a removal never receives the removed member's earlier messages.
 - **Both ends must be online at once** (or the sender keeps the record in its outbox until the recipient reconnects).
 - **Plaintext, loopback by default** (below).
 
@@ -147,11 +153,17 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
    - The writer is the proven `from`: pushes and pulls carry only the sender's own records.
    - A `pull` is gated by `mayRead`: inbox records go only to its parties or current members, a mailbox only to its owner. This is least privilege, not confidentiality (see 2).
    - Pushes on routes outside the addressed identity's interest are dropped, as the share reads only routes of interest.
-   - `whois` replies never reach the engine; card import accepts only announces.
-7. **Dial-hint residue.** A dial address comes from an announce: one a contact signed (pulled from it or imported from its card), or one fetched by `whois` and signed by the contact asked about. Such an address can name any host and port. So **an identity in the dial set (an inbox owner or member, a card a human imported, a counterparty) can steer this process into a TCP connect plus one `hello` frame to an address of its choosing.** What bounds it:
+   - `whois` is answered only about identities the requester shares an inbox with here; replies never reach the engine. Card import accepts only announces.
+   - Pulls name only routes the peer could serve by this install's state (scoped pulls): a peer learns no inbox id it has no part in, and a denied answer carries no `head`, so it learns nothing of how many records are held.
+7. **Dial-hint residue.** A dial address comes from an announce: one a contact signed (pulled from it or imported from its card), or one fetched by `whois` and signed by the contact asked about. Such an address can name any host and port. So **an identity in the dial set (an inbox owner or member, a card a human imported, a counterparty) can steer this process into a TCP connect to an address of its choosing.** What leaves the process on such a connection:
+   - at once, `hello`: the protocol version and a fresh random nonce;
+   - as soon as anything answers with a well-formed `hello`, the dialer's `prove`: the target fingerprint, the raw public key of **every identity attached to the endpoint**, and per key a signature over `PROOF_DOMAIN` ‖ `["dial", dialer nonce, answerer nonce, target]`. The listener at the steered address learns which identities share this endpoint.
+   - nothing else: no record, route, or other frame is sent before the answerer proves the target identity in its own `prove`.
+
+   The signatures cannot be reused: each is bound to this connection's two nonces (any other acceptor contributes a different nonce), to the `dial` role (never valid as an accept proof), to the target fingerprint (refused by any endpoint where that identity is not attached), and to `PROOF_DOMAIN` (never a record signature). What bounds the residue:
    - only identities in the dial set can do it; a stranger's announce never causes a dial (dial policy);
    - each address is dialed at most once per backoff period, so a failing target is retried at most at the backoff schedule;
-   - before the remote proves the target identity, only the `hello` frame (a version and a random nonce) is sent: no proof, record, or identity leaves the process.
+   - the steering identity already knows the target fingerprint; with one identity per install (production), the public key it learns is the install's own, published in its announce anyway.
 
 ## Sketched follow-up (not built): hub client (`hubClient.js`)
 

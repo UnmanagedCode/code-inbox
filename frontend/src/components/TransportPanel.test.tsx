@@ -1,6 +1,6 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { TransportPanel } from './TransportPanel';
+import { TransportPanel, isLoopback, isWildcard } from './TransportPanel';
 import type { State, TransportView } from '../types';
 
 const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null };
@@ -29,10 +29,10 @@ describe('TransportPanel', () => {
     fireEvent.click(screen.getByRole('radio', { name: 'TCP (direct)' }));
     type('Listen host', '0.0.0.0');
     type('Port', '5000');
-    type('Advertised host (required)', 'laptop.lan');
+    type('Advertised host (required)', 'peer.example');
     fireEvent.click(screen.getByRole('button', { name: 'Save TCP' }));
     await waitFor(() => expect(refresh).toHaveBeenCalled());
-    expect(calls).toEqual([{ url: 'api/tcp', body: { host: '0.0.0.0', port: 5000, advertise: 'laptop.lan' } }]);
+    expect(calls).toEqual([{ url: 'api/tcp', body: { host: '0.0.0.0', port: 5000, advertise: 'peer.example' } }]);
   });
 
   // Invariant: empty fields are left to the backend's defaults.
@@ -54,6 +54,19 @@ describe('TransportPanel', () => {
     expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
     type('Listen host', '127.0.0.2');
     expect(screen.queryByRole('note', { name: 'Exposure warning' })).toBeNull();
+    // A hostname that only looks like loopback is exposed like any other.
+    type('Listen host', '127.example.com');
+    expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
+    type('Listen host', '127.0.0.256');
+    expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
+  });
+
+  // Invariant: loopback means an actual loopback literal or localhost; wildcard means an all-zero literal.
+  it('classifies hosts by address, not by prefix', () => {
+    for (const h of ['', 'localhost', '127.0.0.1', '127.255.0.9', '::1']) expect(isLoopback(h), h).toBe(true);
+    for (const h of ['127.example.com', '127.0.0.256', '1270.0.0.1', '10.0.0.1', '0.0.0.0', '::']) expect(isLoopback(h), h).toBe(false);
+    for (const h of ['0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0', '0000::']) expect(isWildcard(h), h).toBe(true);
+    for (const h of ['::1', '0.0.0.1', 'example.com', '127.0.0.1']) expect(isWildcard(h), h).toBe(false);
   });
 
   // Invariant: a transport that failed to start says why, by code.

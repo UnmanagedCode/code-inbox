@@ -99,7 +99,7 @@ Module responsibilities, the data dir and the ingest pipeline: [docs/architectur
 - **Full scan per poll.** Every poll lists every directory of interest; large shares scan slower.
 - **One transport** per install: a file share or TCP, never both. Installs on different transports cannot reach each other.
 - **Over TCP, a member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time. More generally, TCP delivery needs both ends online at once; until then the sender keeps the record in its outbox.
-- **An identity this install is connected with can steer one TCP connect.** An inbox owner or member, or a card a human imported, chooses the address in its own announce; this install dials it (with backoff) and sends only a `hello` before the remote proves its key. See [docs/transport.md → TCP security](docs/transport.md#tcp-security).
+- **An identity this install is connected with can steer its TCP dials.** An inbox owner or member, or a card a human imported, chooses the address in its own announce; this install dials it (with backoff). Before the answerer proves the target key, what leaves the process is a `hello` and, once anything answers, a `prove`: the public key of every identity on the endpoint with signatures bound to that connection's nonces, the dial role and the target (not reusable elsewhere). See [docs/transport.md → TCP security](docs/transport.md#tcp-security).
 - **Notification needs the backend running** (Auto-start, turned on when a target is picked) **and an idle target**: mail for a busy, exited or missing conductor waits and is retried; a conductor is never resumed for it.
 
 ## Docs

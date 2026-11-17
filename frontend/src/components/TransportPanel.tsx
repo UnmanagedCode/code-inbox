@@ -6,9 +6,15 @@ import { Panel } from './Panel';
 
 type Kind = 'file-share' | 'tcp';
 
-// Reachable from this machine only: no warning. Anything else opens the port to the network.
-const isLoopback = (h: string) => h === '' || h === 'localhost' || h === '::1' || /^127\./.test(h);
-const isWildcard = (h: string) => h === '0.0.0.0' || h === '::';
+const IPV4_RE = /^(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)(\.(25[0-5]|2[0-4]\d|1\d\d|[1-9]?\d)){3}$/;
+
+// Reachable from this machine only, so no warning: empty (the backend's 127.0.0.1), `localhost`, an IPv4 literal
+// in 127.0.0.0/8, or `::1`. A hostname that merely starts with 127 is not: it resolves wherever its DNS says.
+export const isLoopback = (h: string) => h === '' || h === 'localhost' || h === '::1' || (IPV4_RE.test(h) && h.startsWith('127.'));
+
+// "Every interface": 0.0.0.0 or an IPv6 literal of only zeros (`::`, `::0`, `0:0:0:0:0:0:0:0`). The backend decides
+// on the parsed address (validateTcpConfig); this only labels the advertised host as required.
+export const isWildcard = (h: string) => h === '0.0.0.0' || (h.includes(':') && /^[0:]+$/.test(h));
 
 const DESCRIBE: Record<Kind, string> = { 'file-share': 'file share', tcp: 'TCP (direct)' };
 

@@ -4,8 +4,8 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayRead, removePending, currentEpoch, currentMembers, directory, inboxesOf,
-  interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
+  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayPull, mayRead, removePending, currentEpoch, currentMembers, directory,
+  inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharesInbox,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { validateShareDir } from './transport/fileShare.js';
@@ -285,10 +285,10 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
   // ---- what a transport may read (docs/transport.md → The engine view). Synchronous, in memory, lock-free. ----
 
   // This install's own records on `route` with an acceptance seq past `since`, as many as fit in `budget` bytes,
-  // if `reader` may read the route.
+  // if `reader` may read the route. A denial says nothing else, not even how many records this install holds.
   function serve(reader, route, since, budget) {
+    if (!isRoute(route) || !mayRead(index, reader, route)) return { status: 'denied' };
     const head = index.maxSeq;
-    if (!isRoute(route) || !mayRead(index, reader, route)) return { status: 'denied', head };
     const list = ownLog.get(routeKey(route)) ?? [];
     let lo = 0;
     let hi = list.length;
@@ -306,8 +306,10 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
   const view = {
     addrsOf: (fp) => dir().identities.get(fp)?.addr ?? [],
-    announceOf,
+    // `fp`'s announce for `requester`, only when the two share an inbox here (member discovery); else null.
+    announceFor: (requester, fp) => (sharesInbox(index, requester, fp) ? announceOf(fp) : null),
     contacts: () => contactsOf(index, self, imported),
+    mayPull: (peer, route) => mayPull(index, self, peer, route),
     serve,
   };
 
@@ -365,8 +367,18 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       if (index.pending.size !== loaded.pending.length) await store.savePending([...index.pending.values()]);
       await persistNewPins();
       if (settings.transport) {
+        // A stored config is checked like a saved one: an invalid one leaves no transport, with the reason shown.
+        let config;
         try {
-          await startTransport(settings.transport);
+          config = await validStoredTransport(settings.transport);
+        } catch (err) {
+          if (!(err instanceof CodedError)) throw err;
+          transportError = { code: err.code, message: err.message };
+          log.warn(`code-inbox: the stored transport is invalid, none started: ${err.message}`);
+          return;
+        }
+        try {
+          await startTransport(config);
         } catch (err) {
           if (err.code !== 'TCP_LISTEN_FAILED') throw err;
           log.warn(`code-inbox: ${err.message}`);
@@ -414,6 +426,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         settings = { ...settings, transport: { kind: 'file-share', dir: shareDir } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
+        await reconcileAdmissions();
         return { shareDir };
       });
     },
@@ -426,6 +439,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         settings = { ...settings, transport: { kind: 'tcp', ...cfg } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
+        // Admissions owed since a boot that started no transport (e.g. the port was taken then).
+        await reconcileAdmissions();
         return { ...cfg, addresses: transport.addresses() };
       });
     },
@@ -659,6 +674,17 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       };
     },
   };
+
+  // The stored transport config, validated as when it was saved: refused SHARE_INVALID, TCP_INVALID or
+  // TRANSPORT_INVALID (an unknown kind).
+  async function validStoredTransport(cfg) {
+    if (cfg?.kind === 'tcp') {
+      const { host, port, advertise } = cfg;
+      return { kind: 'tcp', ...validateTcpConfig({ host, port, advertise }) };
+    }
+    if (cfg?.kind === 'file-share') return { kind: 'file-share', dir: await validateShareDir(cfg.dir, store.dataDir) };
+    throw new CodedError('TRANSPORT_INVALID', `unknown transport kind ${JSON.stringify(cfg?.kind)?.slice(0, 40)}`);
+  }
 
   // Swaps in the transport for `config`. The old one is stopped without waiting: its scan or pull may be queued
   // behind the engine lock the caller holds. Its sink ignores whatever it still offers. A TCP listener that cannot

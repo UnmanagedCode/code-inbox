@@ -18,6 +18,7 @@ async function recordingShare({ answer = () => ({ retry: false }) } = {}) {
   const t = createFileShare({ shareDir, selfFp: me.fp, pollMs: 3_600_000 });
   t.setInterest([{ kind: 'directory' }]);
   await t.start({ record: async (i) => { offers.push(i); return answer(i); }, peerOnline() {} });
+  await t.sync(); // drains the scan start() launched, so it cannot race files the test writes next
   return { shareDir, me, t, offers, root: path.join(shareDir, SHARE_ROOT) };
 }
 
