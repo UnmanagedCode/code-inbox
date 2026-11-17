@@ -16,7 +16,7 @@ const shareFiles = (shareDir, ...parts) => {
 };
 const unshare = (dataDir) => {
   const file = path.join(dataDir, FILES.settings);
-  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), shareDir: null }));
+  fs.writeFileSync(file, JSON.stringify({ ...JSON.parse(fs.readFileSync(file, 'utf8')), transport: null }));
 };
 
 // Invariant: a pending record whose dependency was accepted before a crash is accepted at boot, and a pending entry

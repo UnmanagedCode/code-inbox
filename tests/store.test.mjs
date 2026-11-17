@@ -39,3 +39,43 @@ test('load creates the data dir 0700', async () => {
   await createStore(dataDir).load();
   assert.equal(fs.statSync(dataDir).mode & 0o777, 0o700);
 });
+
+// Invariant: a data dir written before the transport setting existed boots into the current settings shape, once.
+test('settings with shareDir migrate to transport once and the migration is idempotent', async () => {
+  const file = (d) => path.join(d, FILES.settings);
+  const dataDir = tmpDir();
+  fs.writeFileSync(file(dataDir), JSON.stringify({ name: 'alice', shareDir: '/srv/share', notifyTarget: null }));
+  const loaded = await createStore(dataDir).load();
+  assert.deepEqual(loaded.settings, { name: 'alice', transport: { kind: 'file-share', dir: '/srv/share' }, notifyTarget: null });
+  const onDisk = fs.readFileSync(file(dataDir), 'utf8');
+  assert.deepEqual(JSON.parse(onDisk), loaded.settings);
+  const mtime = fs.statSync(file(dataDir)).mtimeMs;
+  assert.deepEqual((await createStore(dataDir).load()).settings, loaded.settings);
+  assert.equal(fs.readFileSync(file(dataDir), 'utf8'), onDisk);
+  assert.equal(fs.statSync(file(dataDir)).mtimeMs, mtime);
+
+  const none = tmpDir();
+  fs.writeFileSync(file(none), JSON.stringify({ name: null, shareDir: null, notifyTarget: null }));
+  assert.deepEqual((await createStore(none).load()).settings, { name: null, transport: null, notifyTarget: null });
+  assert.equal('shareDir' in JSON.parse(fs.readFileSync(file(none), 'utf8')), false);
+});
+
+// Invariant (T7): a damaged outbox.json can never steer a send: entries with an invalid route or a recipient that is
+// not a fingerprint are dropped, each logged.
+test('outbox entries with an invalid route or recipient are dropped on load', async () => {
+  const dataDir = tmpDir();
+  await createStore(dataDir).load();
+  const fp = 'a'.repeat(64);
+  const bytes = Buffer.from('x').toString('base64');
+  fs.writeFileSync(path.join(dataDir, FILES.outbox), JSON.stringify([
+    { route: { kind: 'mailbox', fp }, to: [fp], bytes },
+    { route: { kind: 'inbox', id: '../../escape' }, to: [], bytes },
+    { route: { kind: 'directory' }, to: ['not a fingerprint'], bytes },
+    { route: { kind: 'directory' }, to: [] },
+    'junk',
+  ]));
+  const log = captureLog();
+  const loaded = await createStore(dataDir, { log }).load();
+  assert.deepEqual(loaded.outbox.map((e) => e.route), [{ kind: 'mailbox', fp }]);
+  assert.equal(log.lines.filter((l) => l.includes('outbox.json')).length, 4);
+});

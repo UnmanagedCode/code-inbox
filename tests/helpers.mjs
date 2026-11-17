@@ -74,10 +74,10 @@ const live = new Set();
 process.once('exit', () => { for (const a of live) a.server.close(); });
 
 // One whole install (store, identity, engine over the file share, notifier, MCP, HTTP app) with its own temp data
-// dir. The share is polled only when a test calls `engine.sync()` (or `syncAll`). `env` reaches cc.js (fakeCc's).
+// dir. The share is polled (and TCP maintained) only when a test calls `engine.sync()` (or `syncAll`). `env` reaches cc.js (fakeCc's).
 // With `name`, the share is set and the name announced. `rest(method, path, body)` calls the app as the page does.
-export async function makeInstall(shareDir, { name, env = {}, schedule, dataDir = tmpDir('code-inbox-data-') } = {}) {
-  const app = await wire({ dataDir, distDir: path.join(dataDir, 'no-dist'), env, pollMs: 3_600_000, schedule, log: silentLog });
+export async function makeInstall(shareDir, { name, env = {}, schedule, now, dataDir = tmpDir('code-inbox-data-'), log = silentLog } = {}) {
+  const app = await wire({ dataDir, distDir: path.join(dataDir, 'no-dist'), env, pollMs: 3_600_000, tcpSyncMs: 3_600_000, schedule, now, log });
   live.add(app);
   let port = null;
   const install = {

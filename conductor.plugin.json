@@ -212,7 +212,7 @@
       {
         "name": "send_message",
         "audience": "all",
-        "description": "Send a message to an inbox this install is a party or member of. It is signed with the install identity and delivered to every other party or member. Refused with NOT_MEMBER, INBOX_UNKNOWN, SHARE_UNCONFIGURED, SHARE_UNSAFE or BODY_TOO_LARGE.",
+        "description": "Send a message to an inbox this install is a party or member of. It is signed with the install identity and delivered to every other party or member. Refused with NOT_MEMBER, INBOX_UNKNOWN, TRANSPORT_UNCONFIGURED, SHARE_UNSAFE or BODY_TOO_LARGE.",
         "inputSchema": {
           "type": "object",
           "required": [

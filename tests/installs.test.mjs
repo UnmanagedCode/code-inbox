@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { encodeRecord } from '../src/records.js';
+import { encodeCard, encodeRecord } from '../src/records.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
 import { connectPersonal, makeInstall, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
@@ -312,4 +312,105 @@ test('a replayed acceptance re-admits nobody; a fresh invite does', async () => 
   await syncAll(installs);
   assert.deepEqual(a.engine.listInboxes()[0].members.map((m) => m.name).sort(), ['alice', 'bob']);
   await closeAll(installs);
+});
+
+// Invariant: a card import admits only another identity's genuine announce; anything else is refused CARD_INVALID
+// and admits nothing.
+test('importCard accepts only another identity\'s announce', async (t) => {
+  const a = await makeInstall(null);
+  const b = await makeInstall(null);
+  t.after(async () => { for (const x of [a, b]) await x.close(); });
+  await a.engine.setTcp({ port: 0 });
+  await b.engine.setTcp({ port: 0 });
+  await b.engine.setName('bob');
+  await b.engine.announce();
+  const bobId = await loadIdentity(b.dataDir);
+  const notAnnounce = encodeCard(encodeRecord(bobId, { type: 'join-request', signer: b.fp, ts: Date.now(), to: a.fp, inbox: 'd'.repeat(32) }).bytes);
+  const own = await a.engine.setName('alice').then(() => a.engine.announce()).then(() => a.engine.state().transport.card);
+  const tampered = b.engine.state().transport.card.replace(/.{4}$/, 'AAAA');
+  for (const card of [notAnnounce, own, tampered, 'hello', '']) await assert.rejects(a.engine.importCard(card), { code: 'CARD_INVALID' }, card.slice(0, 30));
+  assert.deepEqual(a.engine.state().directory, []);
+  assert.deepEqual(await a.engine.importCard(b.engine.state().transport.card), { fp: b.fp, name: 'bob', shown: true });
+  assert.deepEqual(a.engine.state().directory.map((d) => d.name), ['bob']);
+});
+
+// Invariant: the card on the page is stale exactly while the announced addresses differ from where the install listens.
+test('cardStale turns true when the address changes and false after announcing', async (t) => {
+  const a = await makeInstall(null);
+  t.after(() => a.close());
+  await a.engine.setTcp({ port: 0 });
+  await a.engine.setName('alice');
+  assert.equal(a.engine.state().transport.card, null);
+  await a.engine.announce();
+  const first = a.engine.state().transport;
+  assert.equal(first.cardStale, false);
+  await a.engine.setTcp({ port: 0 }); // a new ephemeral port
+  assert.notDeepEqual(a.engine.state().transport.addresses, first.addresses);
+  assert.equal(a.engine.state().transport.cardStale, true);
+  await a.engine.announce();
+  assert.equal(a.engine.state().transport.cardStale, false);
+  assert.notEqual(a.engine.state().transport.card, first.card);
+});
+
+// Invariant: a stored transport config is validated at boot like a saved one; an invalid one boots unconfigured with
+// its reason shown, and never crashes the backend.
+test('an invalid stored transport boots unconfigured with its error', async (t) => {
+  const inData = (dataDir) => path.join(dataDir, 'share');
+  const cases = [
+    [{ kind: 'tcp', host: '::0', port: 0, advertise: null }, 'TCP_INVALID'],
+    [{ kind: 'tcp', host: '127.0.0.1', port: 70000, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    [{ kind: 'file-share', dir: 'relative/share' }, 'SHARE_INVALID'],
+    [{ kind: 'file-share', dir: inData }, 'SHARE_INVALID'],
+    [{ kind: 'file-share', dir: (dataDir) => path.dirname(dataDir) }, 'SHARE_INVALID'],
+    [{ kind: 'carrier-pigeon' }, 'TRANSPORT_INVALID'],
+    // A name that resolves to every interface.
+    [{ kind: 'tcp', host: '0x0.0.0.0', port: 0, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    // Links into, and above, the data dir: caught on the real path once the stored path exists.
+    [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(dataDir, l); return l; } }, 'SHARE_INVALID'],
+    [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(path.dirname(dataDir), l); return l; } }, 'SHARE_INVALID'],
+    // A share whose root (`code-inbox`) is a link elsewhere.
+    [{ kind: 'file-share', dir: () => { const s = tmpDir('code-inbox-share-'); fs.symlinkSync(tmpDir('code-inbox-elsewhere-'), path.join(s, 'code-inbox')); return s; } }, 'SHARE_UNSAFE'],
+  ];
+  for (const [transport, code] of cases) {
+    const dataDir = tmpDir('code-inbox-data-');
+    fs.mkdirSync(dataDir, { recursive: true });
+    const stored = typeof transport.dir === 'function' ? { ...transport, dir: transport.dir(dataDir) } : transport;
+    fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ name: 'alice', transport: stored, notifyTarget: null }));
+    const x = await makeInstall(null, { dataDir });
+    t.after(() => x.close());
+    const st = x.engine.state().transport;
+    assert.equal(st.configured, false, code);
+    assert.equal(st.error.code, code);
+    assert.ok(st.kind === null || st.kind === transport.kind, 'kind is a known kind or null');
+    if (code === 'TRANSPORT_INVALID') assert.equal(st.kind, null);
+    await assert.rejects(x.engine.announce(), { code: 'TRANSPORT_UNCONFIGURED' });
+  }
+});
+
+// Invariant: a stored share dir that does not exist (yet) at boot is not a configuration error: the share is
+// scanned and picked up once the directory appears, without a human saving it again.
+test('a stored share dir absent at boot stays configured and is picked up once it appears', async (t) => {
+  const shareDir = path.join(tmpDir('code-inbox-mount-'), 'share');
+  const dataDir = tmpDir('code-inbox-data-');
+  fs.writeFileSync(path.join(dataDir, 'settings.json'), JSON.stringify({ name: 'alice', transport: { kind: 'file-share', dir: shareDir }, notifyTarget: null }));
+  const a = await makeInstall(null, { dataDir });
+  t.after(() => a.close());
+  const st = a.engine.state().transport;
+  assert.deepEqual([st.kind, st.configured, st.error], ['file-share', true, null]);
+  await a.engine.sync();
+  assert.deepEqual(a.engine.state().directory, []);
+  // The mount appears; another install announces on it.
+  fs.mkdirSync(shareDir);
+  const b = await makeInstall(shareDir, { name: 'bob' });
+  t.after(() => b.close());
+  await a.engine.sync();
+  assert.deepEqual(a.engine.state().directory.map((d) => d.name), ['bob']);
+});
+
+// Invariant: saving a share keeps the full check: the directory must exist and be writable.
+test('saving a share dir that does not exist is refused SHARE_INVALID', async (t) => {
+  const a = await makeInstall(null);
+  t.after(() => a.close());
+  await assert.rejects(a.engine.setShare(path.join(tmpDir(), 'missing')), { code: 'SHARE_INVALID' });
+  assert.equal(a.engine.state().transport.configured, false);
 });

@@ -65,10 +65,10 @@ test('send_message is refused for a non-member: NOT_MEMBER; for an inbox never s
   for (const x of installs) await x.close();
 });
 
-// Invariant: without a share no send happens.
-test('send_message without a configured share is refused: SHARE_UNCONFIGURED', async () => {
+// Invariant: without a transport no send happens.
+test('send_message without a configured transport is refused: TRANSPORT_UNCONFIGURED', async () => {
   const x = await makeInstall(null);
-  assert.equal((await mcpCall(assert, x.mcp, 'send_message', { inbox: 'e'.repeat(32), body: 'hi' }, 'json')).code, 'SHARE_UNCONFIGURED');
+  assert.equal((await mcpCall(assert, x.mcp, 'send_message', { inbox: 'e'.repeat(32), body: 'hi' }, 'json')).code, 'TRANSPORT_UNCONFIGURED');
   await x.close();
 });
 

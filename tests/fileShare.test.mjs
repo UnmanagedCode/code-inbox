@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { loadIdentity } from '../src/identity.js';
 import { encodeRecord } from '../src/records.js';
-import { FILE_RE, SHARE_ROOT, createFileShare } from '../src/transport/fileShare.js';
+import { FILE_RE, SHARE_ROOT, checkShareDirPath, checkStoredShareDir, createFileShare, validateShareDir } from '../src/transport/fileShare.js';
 import { makeInstall, makeNetwork, syncAll, tmpDir, tree } from './helpers.mjs';
 
 const TS = 1_700_000_000_000;
@@ -15,9 +15,11 @@ async function recordingShare({ answer = () => ({ retry: false }) } = {}) {
   const shareDir = tmpDir('code-inbox-share-');
   const me = await loadIdentity(tmpDir());
   const offers = [];
-  const t = createFileShare({ shareDir, selfFp: me.fp, pollMs: 3_600_000 });
+  fs.mkdirSync(path.join(shareDir, SHARE_ROOT), { recursive: true }); // a saved share holds its root
+  const t = createFileShare({ shareDir, dataDir: tmpDir('code-inbox-data-'), selfFp: me.fp, pollMs: 3_600_000 });
   t.setInterest([{ kind: 'directory' }]);
   await t.start({ record: async (i) => { offers.push(i); return answer(i); }, peerOnline() {} });
+  await t.sync(); // drains the scan start() launched, so it cannot race files the test writes next
   return { shareDir, me, t, offers, root: path.join(shareDir, SHARE_ROOT) };
 }
 
@@ -196,4 +198,73 @@ test('symlinked record files and writer subdirs are not read', async () => {
   await t.sync();
   assert.deepEqual(offers, []);
   await t.stop();
+});
+
+// Invariant: only a `..` path component leaves a directory: a share named `..share` inside the data dir, or a data
+// dir named `..data` inside the share, is an overlap like any other.
+test('a dotted name does not defeat the share/data dir overlap check', async () => {
+  const dataDir = tmpDir('code-inbox-data-');
+  const inside = path.join(dataDir, '..share');
+  fs.mkdirSync(inside);
+  const base = tmpDir('code-inbox-base-');
+  const dottedData = path.join(base, '..data');
+  fs.mkdirSync(dottedData);
+  for (const [dir, data] of [[inside, dataDir], [base, dottedData]]) {
+    assert.throws(() => checkShareDirPath(dir, data), { code: 'SHARE_INVALID' }, dir);
+    await assert.rejects(checkStoredShareDir(dir, data), { code: 'SHARE_INVALID' }, dir);
+    await assert.rejects(validateShareDir(dir, data), { code: 'SHARE_INVALID' }, dir);
+  }
+  // A sibling whose name merely starts with dots is not an overlap.
+  const sibling = path.join(base, '..share');
+  fs.mkdirSync(sibling);
+  assert.equal(await validateShareDir(sibling, dottedData), sibling);
+});
+
+// Invariant (T7): a route that would leave the share is refused before anything is created.
+test('a send on a route that leaves the share creates nothing and is refused SHARE_UNSAFE', async () => {
+  const { shareDir, me, t, root } = await recordingShare();
+  for (const route of [{ kind: 'inbox', id: '../../../../escape' }, { kind: 'mailbox', fp: '../../../escape2' }]) {
+    await assert.rejects(t.send(announceOf(me, 'alice'), { route, to: [] }), { code: 'SHARE_UNSAFE' });
+  }
+  for (const name of ['escape', 'escape2']) {
+    assert.equal(fs.existsSync(path.join(path.dirname(shareDir), name)), false);
+    assert.equal(fs.existsSync(path.join(shareDir, name)), false);
+  }
+  assert.deepEqual(fs.readdirSync(root), []);
+  await t.stop();
+});
+
+// Invariant (U4): directories are created one component at a time and never through a link a peer planted in the
+// share: neither a linked inbox dir nor a linked `inboxes` creates anything outside the share.
+test('a planted link inside the share creates nothing outside it', async () => {
+  const { me, t, root } = await recordingShare();
+  const inboxId = 'c'.repeat(32);
+  const outside = tmpDir('code-inbox-outside-');
+  fs.mkdirSync(path.join(root, 'inboxes'), { recursive: true });
+  fs.symlinkSync(outside, path.join(root, 'inboxes', inboxId));
+  await assert.rejects(t.send(announceOf(me, 'alice'), { route: { kind: 'inbox', id: inboxId }, to: [] }), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+  fs.rmSync(path.join(root, 'inboxes'), { recursive: true });
+  const outside2 = tmpDir('code-inbox-outside-');
+  fs.symlinkSync(outside2, path.join(root, 'inboxes'));
+  await assert.rejects(t.send(announceOf(me, 'alice'), { route: { kind: 'inbox', id: inboxId }, to: [] }), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside2), []);
+  await t.stop();
+});
+
+// Invariant (U4): saving a share whose `code-inbox` is a link is refused, and nothing is created through the link.
+test('a share whose code-inbox is a link is refused at save time', async (t) => {
+  const shareDir = tmpDir('code-inbox-share-');
+  const outside = tmpDir('code-inbox-outside-');
+  fs.symlinkSync(outside, path.join(shareDir, 'code-inbox'));
+  const a = await makeInstall(null);
+  t.after(() => a.close());
+  await assert.rejects(a.engine.setShare(shareDir), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+  // A `v1` link one level down is refused the same way.
+  fs.rmSync(path.join(shareDir, 'code-inbox'));
+  fs.mkdirSync(path.join(shareDir, 'code-inbox'));
+  fs.symlinkSync(outside, path.join(shareDir, 'code-inbox', 'v1'));
+  await assert.rejects(a.engine.setShare(shareDir), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
 });

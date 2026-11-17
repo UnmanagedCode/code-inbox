@@ -5,10 +5,14 @@ import { loadIdentity } from '../src/identity.js';
 import { createStore } from '../src/store.js';
 import { assertTransport, routeKey } from '../src/transport/index.js';
 import { createFileShare } from '../src/transport/fileShare.js';
+import { proofSigner } from '../src/transport/handshake.js';
+import { createTcp } from '../src/transport/tcp.js';
 import { silentLog, tmpDir } from './helpers.mjs';
 
 // One contract, run against every Transport implementation: it proves the engine works through the interface
-// alone. Each implementation provides `network()` → {makeTransport(identity, shareDir), settle()}.
+// alone. Each implementation provides makeTransport(identity, shareDir, view, store, config) and configure(engine,
+// shareDir). A transport without a directory (`directory: false`) bootstraps the way humans do: every node after
+// the first imports node 0's contact card, so node 0 learns the others only from the handshake.
 
 // An in-memory push transport: records reach online peers' sinks immediately; a send to an offline peer comes back
 // `pending`, and when the peer comes online every other transport's sink hears peerOnline(fp). Directory records
@@ -47,9 +51,16 @@ function memoryHub() {
   };
 }
 
+const useShare = (engine, shareDir) => engine.setShare(shareDir);
 const IMPLEMENTATIONS = {
-  fileShare: () => ({ makeTransport: (identity, shareDir) => createFileShare({ shareDir, selfFp: identity.fp, pollMs: 3_600_000, log: silentLog }), push: false }),
-  memoryPush: () => { const hub = memoryHub(); return { makeTransport: (identity) => hub.makeTransport(identity), push: true, hub }; },
+  fileShare: () => ({ makeTransport: (identity, shareDir, _view, store) => createFileShare({ shareDir, dataDir: store.dataDir, selfFp: identity.fp, pollMs: 3_600_000, log: silentLog }), configure: useShare }),
+  memoryPush: () => { const hub = memoryHub(); return { makeTransport: (identity) => hub.makeTransport(identity), configure: useShare, hub }; },
+  tcp: () => ({
+    makeTransport: (identity, _shareDir, view, store, config) => createTcp({
+      ...config, identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: 3_600_000, log: silentLog,
+    }),
+    configure: (engine) => engine.setTcp({ port: 0 }),
+  }),
 };
 
 async function network(impl, names) {
@@ -62,22 +73,31 @@ async function network(impl, names) {
     await store.load();
     const identity = await loadIdentity(dataDir);
     const node = { name, fp: identity.fp, store, transport: null };
-    node.engine = createEngine({ store, identity, log: silentLog, makeTransport: () => { node.transport = net.makeTransport(identity, shareDir); return node.transport; } });
+    node.engine = createEngine({
+      store, identity, log: silentLog,
+      makeTransport: (config, view) => { node.transport = net.makeTransport(identity, shareDir, view, store, config); return node.transport; },
+    });
     await node.engine.boot();
-    await node.engine.setShare(shareDir);
+    await net.configure(node.engine, shareDir);
     await node.engine.setName(name);
     nodes.push(node);
   }
   const settle = async () => { for (let i = 0; i < 2; i += 1) for (const n of nodes) await n.engine.sync(); };
   for (const n of nodes) await n.engine.announce();
+  if (!nodes[0].transport.capabilities.directory) {
+    const card = nodes[0].engine.state().transport.card;
+    for (const n of nodes.slice(1)) await n.engine.importCard(card);
+  }
   await settle();
   return { ...net, nodes, settle, close: async () => { for (const n of nodes) await n.engine.stop(); } };
 }
 
 for (const impl of Object.keys(IMPLEMENTATIONS)) {
   // Invariant: every implementation has the Transport shape the engine relies on.
-  test(`${impl}: has the Transport shape`, () => {
-    const t = IMPLEMENTATIONS[impl]().makeTransport({ fp: 'f'.repeat(64) }, tmpDir());
+  test(`${impl}: has the Transport shape`, async () => {
+    const dataDir = tmpDir();
+    const store = createStore(dataDir, { log: silentLog });
+    const t = IMPLEMENTATIONS[impl]().makeTransport(await loadIdentity(dataDir), tmpDir(), {}, store, { port: 0 });
     assert.equal(assertTransport(t), t);
     assert.ok(Array.isArray(t.addresses()));
   });

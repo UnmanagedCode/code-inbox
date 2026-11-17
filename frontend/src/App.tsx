@@ -2,6 +2,7 @@ import { useCallback, useEffect, useState } from 'react';
 import { api, describe } from './api';
 import type { State } from './types';
 import { usePoll } from './usePoll';
+import { ContactsPanel } from './components/ContactsPanel';
 import { DiagnosticsPanel } from './components/DiagnosticsPanel';
 import { DirectoryPanel } from './components/DirectoryPanel';
 import { IdentityPanel } from './components/IdentityPanel';
@@ -9,6 +10,7 @@ import { InboxList } from './components/InboxList';
 import { InboxView, POLL_MS } from './components/InboxView';
 import { InvitesPanel } from './components/InvitesPanel';
 import { NotificationsPanel } from './components/NotificationsPanel';
+import { TransportPanel } from './components/TransportPanel';
 
 // The page is routed by its query string: `?inbox=<id>` opens one inbox; no query shows the overview.
 const inboxFromLocation = () => new URLSearchParams(window.location.search).get('inbox');
@@ -46,6 +48,8 @@ export function App() {
           <InvitesPanel state={state} refresh={refresh} />
           <DirectoryPanel state={state} refresh={refresh} />
           <IdentityPanel state={state} refresh={refresh} />
+          <TransportPanel state={state} refresh={refresh} />
+          {state.transport.kind === 'tcp' && <ContactsPanel state={state} refresh={refresh} />}
           <NotificationsPanel state={state} refresh={refresh} />
           <DiagnosticsPanel diagnostics={state.diagnostics} />
         </>

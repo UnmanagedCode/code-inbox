@@ -176,7 +176,7 @@ test('the messages route and send_message refuse the same inputs with the same c
   const cases = [
     { what: 'a non-member inbox', x: b, inbox: foreign, body: 'hi', code: 'NOT_MEMBER', status: 409 },
     { what: 'an unknown inbox', x: b, inbox: 'f'.repeat(32), body: 'hi', code: 'INBOX_UNKNOWN', status: 404 },
-    { what: 'no share', x: lonely, inbox: own, body: 'hi', code: 'SHARE_UNCONFIGURED', status: 409 },
+    { what: 'no transport', x: lonely, inbox: own, body: 'hi', code: 'TRANSPORT_UNCONFIGURED', status: 409 },
     { what: 'an oversize body', x: b, inbox: own, body: 'x'.repeat(BODY_MAX_BYTES + 1), code: 'BODY_TOO_LARGE', status: 413 },
     { what: 'an oversize escaped body', x: b, inbox: own, body: '\u0001'.repeat(BODY_MAX_BYTES), code: 'BODY_TOO_LARGE', status: 413 },
   ];
@@ -233,4 +233,31 @@ test('a symlinked writer subdir refuses the send with SHARE_UNSAFE on REST and M
   assert.equal(a.engine.state().diagnostics.outbox, 0);
   assert.deepEqual(fs.readdirSync(outside), []);
   await a.close();
+});
+
+// Invariant: the TCP and contact routes map the engine's refusals onto their statuses; a send with no transport at
+// all is TRANSPORT_UNCONFIGURED.
+test('POST api/tcp and POST api/contacts answer their codes', async (t) => {
+  const a = await makeInstall(null);
+  const b = await makeInstall(null);
+  t.after(async () => { for (const x of [a, b]) await x.close(); });
+  const send = await a.rest('POST', `/api/inboxes/${'e'.repeat(32)}/messages`, { body: 'hi' });
+  assert.deepEqual([send.status, send.json.code], [409, 'TRANSPORT_UNCONFIGURED']);
+  const bad = await a.rest('POST', '/api/tcp', { host: '0.0.0.0', port: 0 });
+  assert.deepEqual([bad.status, bad.json.code], [400, 'TCP_INVALID']);
+  const badPort = await a.rest('POST', '/api/tcp', { port: 70000 });
+  assert.deepEqual([badPort.status, badPort.json.code], [400, 'TCP_INVALID']);
+  const ok = await a.rest('POST', '/api/tcp', { port: 0 });
+  assert.equal(ok.status, 200);
+  assert.equal(ok.json.host, '127.0.0.1');
+  assert.match(ok.json.addresses[0], /^tcp:\/\/127\.0\.0\.1:\d+$/);
+  assert.equal((await a.rest('GET', '/api/state')).json.transport.kind, 'tcp');
+  const garbage = await a.rest('POST', '/api/contacts', { card: 'not a card' });
+  assert.deepEqual([garbage.status, garbage.json.code], [400, 'CARD_INVALID']);
+  await b.rest('POST', '/api/tcp', { port: 0 });
+  await b.rest('POST', '/api/identity', { name: 'bob' });
+  await b.rest('POST', '/api/announce', {});
+  const imported = await a.rest('POST', '/api/contacts', { card: (await b.rest('GET', '/api/state')).json.transport.card });
+  assert.equal(imported.status, 200);
+  assert.deepEqual(imported.json, { fp: b.fp, name: 'bob', shown: true });
 });
