@@ -29,6 +29,7 @@ One transport at a time: **File share** or **TCP (direct)**, picked with a radio
   - `TCP_INVALID`: the stored host, port or advertised host is invalid, a host does not resolve, or it resolves to every interface;
   - `TRANSPORT_INVALID`: the stored transport is of an unknown kind;
   - `TCP_LISTEN_FAILED`: the port is taken or not allowed.
+- While the share dir is missing (a mount not up), the panel says the share is unavailable; whenever writes wait in the outbox, it shows how many. Actions still succeed: their writes are retried until delivered.
 - A listen host that is not loopback shows a warning: it opens a port to the network, and records travel unencrypted.
 - After changing the host or port, **Announce** again: peers dial the addresses in the last announce, and the contact card is marked stale until then.
 

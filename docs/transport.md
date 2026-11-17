@@ -20,7 +20,7 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 ```
 
 - The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (directory records: every known identity).
-- Recipients in `pending` (or all of them, if `send` throws) go to the outbox and are re-sent on `peerOnline(fp)` and on every `engine.sync()`.
+- Recipients in `pending` (or all of them, if `send` throws) go to the outbox; a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
 - `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP.
 - `assertTransport` checks the shape of every transport the engine is given.
@@ -46,7 +46,7 @@ The engine builds its transport with `makeTransport(config, view)` (`server.js` 
 
 ### Selecting a transport
 
-A stored transport is checked at boot. A TCP config is checked as when it was saved (`resolveTcpConfig`, DNS included). A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, and its scans pick the directory up once it appears. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath). An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
+A stored transport is checked at boot. A TCP config is checked as when it was saved (`resolveTcpConfig`, DNS included). A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, its scans pick the directory up once it appears, and writes made meanwhile wait in the outbox (never written to the local disk under the mount point) until a retry finds it. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath). An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
 
 One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise}`.
 
@@ -60,7 +60,7 @@ One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). S
 |---|---|
 | `capabilities` | `{directory: true, push: false}` |
 | `addresses()` | `[]` |
-| `send` | Atomic write under the route's dir in this install's own fingerprint subdir; every `to` is `delivered` |
+| `send` | Atomic write under the route's dir in this install's own fingerprint subdir; every `to` is `delivered`. While the configured dir itself does not exist (its mount is not up), it creates nothing and throws the retryable `SHARE_UNAVAILABLE`: the engine keeps the write owed and re-sends it on its retry timer once the dir appears. Subdirectories under an existing dir are created as needed |
 | Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once |
 | `peerOnline` | Never fires |
 

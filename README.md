@@ -87,6 +87,7 @@ Module responsibilities, the data dir and the ingest pipeline: [docs/architectur
 | `TCP_HANDSHAKE_MS`, `TCP_FRAME_MS`, `TCP_IDLE_MS`, `TCP_PING_MS`, `TCP_REQUEST_MS`, `TCP_INBOUND_QUEUE`, `TCP_WRITE_BUFFER_MAX` | `src/transport/tcpSession.js` | TCP deadlines, keepalive and buffers |
 | `NOTIFY_DEBOUNCE_MS`, `NOTIFY_RETRY_MS` | `src/notifier.js` | Burst coalescing; retry while the target is busy or unreachable |
 | `READ_LIMIT_DEFAULT`, `READ_LIMIT_MAX` | `src/engine.js` | `read_messages` page size |
+| `OUTBOX_RETRY_MS` | `src/engine.js` | How often writes waiting in the outbox are re-sent |
 
 ### Known limitations
 
@@ -97,6 +98,7 @@ Module responsibilities, the data dir and the ingest pipeline: [docs/architectur
 - **Removal relies on the owner's view.** A removed member keeps exactly the messages on the `prev` chain below the last one the owner's install held valid when it removed them. Anything else it signed, earlier forks and messages still in transit to the owner included, becomes invalid for everyone.
 - **A party that signs conflicting records can make readers disagree about its own inbox.** Where the lowest record id picks among conflicting records (an owner's two `member` records with one `seq`, an invitee's accept and decline of one invite, two personal invites for one inbox), readers that saw them in different orders can hold different verdicts, and the difference is permanent: a message already refused stays refused. Only that party's own inbox relationship is affected; no third party can cause it or gain from it. Honest installs never sign conflicting records.
 - **Full scan per poll.** Every poll lists every directory of interest; large shares scan slower.
+- **A share that is not mounted holds writes back.** While the share directory does not exist, sends succeed but wait in the outbox (the Transport panel says so) and are retried every `OUTBOX_RETRY_MS` until it appears; nothing is written under the mount point meanwhile. Readers see those records only after the retry.
 - **One transport** per install: a file share or TCP, never both. Installs on different transports cannot reach each other.
 - **Over TCP, a member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time. More generally, TCP delivery needs both ends online at once; until then the sender keeps the record in its outbox.
 - **An identity this install is connected with can steer its TCP dials.** An inbox owner or member, or a card a human imported, chooses the address in its own announce; this install dials it (with backoff). Before the answerer proves the target key, what leaves the process is a `hello` and, once anything answers, a `prove`: the public key of every identity on the endpoint with signatures bound to that connection's nonces, the dial role and the target (not reusable elsewhere). See [docs/transport.md → TCP security](docs/transport.md#tcp-security).

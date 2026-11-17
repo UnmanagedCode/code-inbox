@@ -14,16 +14,29 @@ import { resolveTcpConfig } from './transport/tcp.js';
 export const RECENT_REJECTS = 20;
 export const READ_LIMIT_DEFAULT = 50;
 export const READ_LIMIT_MAX = 200;
+// How often the whole outbox is re-sent while it holds anything.
+export const OUTBOX_RETRY_MS = 30_000;
 // How many scan rounds one sync() runs while the interest keeps growing (an accepted invite adds an inbox).
 const SYNC_ROUNDS = 4;
 
 const refuse = (code, message) => { throw new CodedError(code, message); };
 
+// A send that throws one of these may succeed later (the share's mount is down, a filesystem or network error):
+// the write stays owed in the outbox even when no recipient is named. Any other throw keeps only its recipients.
+export const isRetryableSendError = (err) => err?.code === 'SHARE_UNAVAILABLE' || /^E[A-Z0-9]+$/.test(err?.code ?? '');
+
+const defaultSchedule = (fn, ms) => {
+  const t = setTimeout(fn, ms);
+  t.unref?.();
+  return () => clearTimeout(t);
+};
+
 // The install's protocol core: ingest (transport → verify → route binding → authorization → store) and every
 // action a human or agent can take. Surfaces (REST, MCP) call these and only map results onto their wire shapes.
 // `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir} or
 // {kind:'tcp', host, port, advertise}); `view` is the read-only engine view a transport may need (docs/transport.md).
-export function createEngine({ store, identity, makeTransport, now = Date.now, log = console }) {
+// `schedule(fn, ms)` → cancel drives the outbox retry timer (tests inject one).
+export function createEngine({ store, identity, makeTransport, now = Date.now, schedule = defaultSchedule, outboxRetryMs = OUTBOX_RETRY_MS, log = console }) {
   const self = identity.fp;
   const events = new EventEmitter();
   const locked = (fn) => withLock(`engine:${store.dataDir}`, fn);
@@ -35,6 +48,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
   const rejected = { count: 0, recent: [] };
   let transport = null;
   let transportError = null;
+  let shareUnavailable = false; // the last file-share send found the share root missing
+  let retryTimer = null; // cancel function of the armed outbox retry
+  let stopped = false;
   let interestKey = '';
   let imported = []; // fingerprints of identities whose contact card a human imported
   const ownLog = new Map(); // routeKey → [{seq, bytes}] of records signed by self, seq ascending
@@ -181,32 +197,58 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     return [...set];
   }
 
-  async function saveOutbox() { await store.saveOutbox(outbox); }
-
-  async function deliver(bytes, route, to) {
-    let left;
-    try {
-      ({ pending: left } = await transport.send(bytes, { route, to }));
-    } catch (err) {
-      // A share this install must not write to is permanent: the action is refused, nothing is admitted locally.
-      if (err.code === 'SHARE_UNSAFE') throw err;
-      log.warn(`code-inbox: sending on ${routeKey(route)} failed, kept in the outbox: ${err.message}`);
-      left = to;
-    }
-    if (left.length) { outbox.push({ route, to: left, bytes }); await saveOutbox(); }
+  // The outbox retry timer is armed exactly while the outbox holds anything (and the engine runs).
+  function armRetry() {
+    if (stopped || !outbox.length) { if (retryTimer) { retryTimer(); retryTimer = null; } return; }
+    if (retryTimer) return;
+    retryTimer = schedule(() => {
+      retryTimer = null;
+      locked(() => flushOutbox()).catch((err) => log.warn(`code-inbox: re-sending the outbox failed: ${err.message}`)).finally(armRetry);
+    }, outboxRetryMs);
   }
 
-  // Re-sends outbox entries (only those addressed to `fp`, when given).
+  async function saveOutbox() {
+    await store.saveOutbox(outbox);
+    armRetry();
+  }
+
+  // One send through the transport: resolves the recipients still pending and whether the write itself is still
+  // owed (a retryable throw). SHARE_UNSAFE is rethrown; any other throw keeps every recipient pending.
+  async function trySend(bytes, route, to) {
+    try {
+      const { pending } = await transport.send(bytes, { route, to });
+      shareUnavailable = false;
+      return { left: pending, owed: false };
+    } catch (err) {
+      if (err.code === 'SHARE_UNSAFE') throw err;
+      if (err.code === 'SHARE_UNAVAILABLE') shareUnavailable = true;
+      const owed = isRetryableSendError(err);
+      log.warn(`code-inbox: sending on ${routeKey(route)} failed, kept in the outbox${owed ? ' and retried' : ''}: ${err.message}`);
+      return { left: to, owed };
+    }
+  }
+
+  // An entry stays in the outbox while it has recipients left, or while its write is owed (`to` may then be []).
+  async function deliver(bytes, route, to) {
+    // A share this install must not write to is permanent: the action is refused, nothing is admitted locally.
+    const { left, owed } = await trySend(bytes, route, to);
+    if (left.length || owed) { outbox.push({ route, to: left, bytes }); await saveOutbox(); }
+  }
+
+  // Re-sends outbox entries: every one (a full flush), or only those addressed to `fp`. Only a full flush re-sends
+  // an entry with no recipients left, which is an owed write; it leaves once a send succeeds. Always under the engine
+  // lock, so two flushes never send one entry at once.
   async function flushOutbox(fp) {
     if (!transport || !outbox.length) return;
     const next = [];
     for (const e of outbox) {
       const targets = fp ? e.to.filter((t) => t === fp) : e.to;
-      if (!targets.length) { next.push(e); continue; }
-      let left;
-      try { ({ pending: left } = await transport.send(e.bytes, { route: e.route, to: targets })); } catch { left = targets; }
-      const remaining = e.to.filter((t) => !targets.includes(t) || left.includes(t));
-      if (remaining.length) next.push({ ...e, to: remaining });
+      if (fp && !targets.length) { next.push(e); continue; }
+      let sent;
+      // SHARE_UNSAFE here refuses nothing (the action succeeded long ago): the entry waits for a human to fix the share.
+      try { sent = await trySend(e.bytes, e.route, targets); } catch { sent = { left: targets, owed: true }; }
+      const remaining = e.to.filter((t) => !targets.includes(t) || sent.left.includes(t));
+      if (remaining.length || sent.owed) next.push({ ...e, to: remaining });
     }
     outbox = next;
     await saveOutbox();
@@ -330,6 +372,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       card: bytes ? encodeCard(bytes) : null,
       cardStale: !!bytes && JSON.stringify(own.addr) !== JSON.stringify(addresses),
       error: transportError,
+      // The share's root (its mount) was missing at the last write: writes wait in the outbox and are retried.
+      unavailable: shareUnavailable,
     };
   }
 
@@ -384,11 +428,13 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
           log.warn(`code-inbox: ${err.message}`);
           return;
         }
-        await locked(() => reconcileAdmissions());
+        await locked(async () => { await reconcileAdmissions(); await flushOutbox(); });
       }
     },
 
     async stop() {
+      stopped = true;
+      if (retryTimer) { retryTimer(); retryTimer = null; }
       if (transport) await transport.stop();
       transport = null;
     },
@@ -427,6 +473,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         await store.saveSettings(settings);
         await startTransport(settings.transport);
         await reconcileAdmissions();
+        await flushOutbox();
         return { shareDir };
       });
     },
@@ -439,8 +486,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         settings = { ...settings, transport: { kind: 'tcp', ...cfg } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
-        // Admissions owed since a boot that started no transport (e.g. the port was taken then).
+        // Admissions owed since a boot that started no transport (e.g. the port was taken then), and the outbox.
         await reconcileAdmissions();
+        await flushOutbox();
         return { ...cfg, addresses: transport.addresses() };
       });
     },
@@ -695,6 +743,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     const t = assertTransport(makeTransport(config, view));
     transport = t;
     transportError = null;
+    shareUnavailable = false;
     if (old) old.stop().catch((err) => log.warn(`code-inbox: stopping the previous transport failed: ${err.message}`));
     interestKey = '';
     refreshInterest();

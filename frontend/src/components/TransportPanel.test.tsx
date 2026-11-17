@@ -3,8 +3,8 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { TransportPanel, isLoopback, isWildcard } from './TransportPanel';
 import type { State, TransportView } from '../types';
 
-const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null };
-const stateWith = (transport: Partial<TransportView> = {}) => ({ transport: { ...NONE, ...transport } }) as unknown as State;
+const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null, unavailable: false };
+const stateWith = (transport: Partial<TransportView> = {}, outbox = 0) => ({ transport: { ...NONE, ...transport }, diagnostics: { outbox } }) as unknown as State;
 
 function stubFetch() {
   const calls: { url: string; body: unknown }[] = [];
@@ -76,6 +76,16 @@ describe('TransportPanel', () => {
     expect(screen.getByRole('textbox', { name: 'Advertised host (required)' })).toBeTruthy();
     type('Listen host', '192.168.1.20');
     expect(screen.getByRole('textbox', { name: 'Advertised host' })).toBeTruthy();
+  });
+
+  // Invariant: the human can see that writes are waiting, and why when the share is not mounted.
+  it('shows an unavailable share and the writes waiting', () => {
+    const { rerender } = render(<TransportPanel state={stateWith({ kind: 'file-share', configured: true, dir: '/srv/share' })} refresh={() => {}} />);
+    expect(screen.queryByRole('status', { name: 'Share unavailable' })).toBeNull();
+    expect(screen.queryByRole('status', { name: 'Writes waiting' })).toBeNull();
+    rerender(<TransportPanel state={stateWith({ kind: 'file-share', configured: true, dir: '/srv/share', unavailable: true }, 2)} refresh={() => {}} />);
+    expect(screen.getByRole('status', { name: 'Share unavailable' })).toBeTruthy();
+    expect(screen.getByRole('status', { name: 'Writes waiting' }).textContent).toContain('2');
   });
 
   // Invariant: a transport that failed to start says why, by code.

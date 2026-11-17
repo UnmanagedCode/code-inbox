@@ -121,10 +121,10 @@ export function stubSink() {
 export const memCursors = () => { let data = {}; return { load: async () => data, save: async (c) => { data = c; }, get: () => data }; };
 
 // A whole engine over TCP with its own data dir. `endpoint` attaches it to a shared endpoint instead of its own;
-// `wrapView(view)` lets a test spy on what the transport asks of the engine. Every record the transport offers is
+// `schedule` drives the engine's outbox retry timer; `wrapView(view)` lets a test spy on what the transport asks of the engine. Every record the transport offers is
 // kept in `node.offered`. With `name`, the name is set and announced. Booting a data dir whose settings already
 // configure TCP reuses them.
-export async function tcpNode(name, { dataDir = tmpDir('code-inbox-tcp-'), port = 0, endpoint, wrapView = (v) => v, configure = true } = {}) {
+export async function tcpNode(name, { dataDir = tmpDir('code-inbox-tcp-'), port = 0, endpoint, wrapView = (v) => v, configure = true, schedule } = {}) {
   const store = createStore(dataDir, { log: silentLog });
   await store.load();
   const identity = await loadIdentity(dataDir);
@@ -132,7 +132,7 @@ export async function tcpNode(name, { dataDir = tmpDir('code-inbox-tcp-'), port 
   const base = transportFactory({ identity, store, tcpSyncMs: 3_600_000, log: silentLog });
   const node = { name, dataDir, fp: identity.fp, identity, store, transport: null, view: null, offered: [] };
   node.engine = createEngine({
-    store, identity, log: silentLog,
+    store, identity, log: silentLog, ...(schedule ? { schedule } : {}),
     makeTransport: (config, view) => {
       node.view = wrapView(view);
       const t = endpoint ? endpoint.attach({ identity: proofSigner(identity), view: node.view, cursors }) : base(config, node.view);

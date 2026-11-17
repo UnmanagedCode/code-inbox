@@ -31,6 +31,7 @@ export interface TransportView {
   card: string | null;
   cardStale: boolean;
   error: { code: string; message: string } | null;
+  unavailable: boolean;
 }
 
 export interface State {

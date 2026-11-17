@@ -201,7 +201,12 @@ export function createFileShare({ shareDir, selfFp, pollMs = SHARE_POLL_MS, now 
     },
     setInterest(routes) { interest = [...routes]; },
     // The share stores everything, so every recipient counts as delivered.
+    // Refused SHARE_UNAVAILABLE (retryable, nothing created) while the configured dir itself does not exist: a
+    // share whose mount is not up must not be recreated on the local disk, where the mount would later hide it.
     async send(bytes, { route, to }) {
+      let rootOk = false;
+      try { rootOk = (await fs.stat(shareDir)).isDirectory(); } catch (err) { if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err; }
+      if (!rootOk) throw new CodedError('SHARE_UNAVAILABLE', `the share dir ${shareDir} is not available (not mounted?)`);
       const dir = await ownDir(route);
       const name = `${String(now()).padStart(13, '0')}-${crypto.randomBytes(16).toString('hex')}.rec`;
       await writeFileAtomic(path.join(dir, name), bytes, 0o644);

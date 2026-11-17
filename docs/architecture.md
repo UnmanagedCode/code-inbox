@@ -35,7 +35,7 @@ pins.json                   name → fingerprint
 accepted.ndjson             append-only {seq, id, route, bytes(base64)}; fsynced per record
 pending.ndjson              {route, bytes} of records waiting for a dependency; rewritten atomically
 rejected.ndjson             append-only {id, reason, type, inbox, signer} of records refused for good; fsynced
-outbox.json                 [{route, to: [fp], bytes}] not yet delivered
+outbox.json                 [{route, to: [fp], bytes}] not yet delivered; `to: []` is a write still owed
 cursors.json                inbox id → read cursor (an acceptance seq)
 notify.json                 {watermark}: the notifier's acceptance seq
 contacts.json               [fp]: identities whose contact card a human imported (part of the TCP dial set)
@@ -63,7 +63,14 @@ All ingest and every action run under one engine lock (`withLock('engine:<dataDi
 
 **Boot recovery:** after rebuilding the index, pending entries already accepted are dropped and the pending set is drained once; whenever a transport starts (at boot, or later when a human saves one after a boot that started none), every admission `admissionDue` still owes is written. That closes the crash windows between accepting a record and acting on it.
 
-**Sending** (`publish`): sign → `transport.send` (recipients in `pending`, or all of them if the send throws, go to the outbox) → ingest locally like any other record. A `SHARE_UNSAFE` send is the exception: the action is refused with that code and nothing is admitted or queued. The outbox is re-sent on every `engine.sync()` and, for a peer, on `peerOnline`.
+**Sending** (`publish`): sign → `transport.send` → ingest locally like any other record. A `SHARE_UNSAFE` send is the exception: the action is refused with that code and nothing is admitted or queued. Every other outcome lets the action succeed, with what was not delivered kept in the outbox.
+
+**Outbox** (`outbox.json`, entries `{route, to, bytes}`):
+- An entry stays while `to` (the recipients still pending) is non-empty, **or while its write is owed**: the send threw a retryable error. An owed write may have `to: []` (an announce before this install knows anyone, a message in an inbox with no other member): the record must still reach the share for readers nobody can name.
+- **Retryable** (`isRetryableSendError`, `src/engine.js`): `SHARE_UNAVAILABLE` (the file share's configured dir does not exist: a mount not up) and any system error code (`E…`: `EIO`, `ENOSPC`, `ENOTDIR`, …). Any other throw keeps only its recipients (none: dropped and logged). `SHARE_UNSAFE` refuses the action; met during a re-send, it keeps the entry until a human fixes the share.
+- **Re-sending:** a full flush re-sends every entry, owed writes included, and drops each once a send succeeds; `peerOnline(fp)` re-sends only the entries addressed to `fp`. Every flush runs under the engine lock, so no entry is sent by two flushes at once.
+- **When:** a full flush after every successful transport start (boot, `setShare`, `setTcp`); on the `OUTBOX_RETRY_MS` timer (injected `schedule`), armed exactly while the outbox is non-empty and cleared by `engine.stop()`; and on `engine.sync()`. Over TCP the timer's re-sends go through `send`, so an unreachable recipient is dialed only as its address's backoff allows: retry ticks add no dials.
+- `SHARE_UNAVAILABLE` is never shown as a refusal: `state().transport.unavailable` is true while the last file-share send found the share missing, and the Transport panel shows it with the outbox count.
 
 **`sendMessage(inbox, body)`** is the one path for both surfaces. In order it refuses `TRANSPORT_UNCONFIGURED`, `INBOX_UNKNOWN` (no such inbox known), `NOT_MEMBER` (known, but not a party or current member), `BAD_REQUEST` (not a non-empty string), `BODY_TOO_LARGE` (over `BODY_MAX_BYTES`, or `encodeRecord`'s `RECORD_TOO_LARGE`). A shared message cites the current epoch and, as `prev`, this install's last **valid** message in that inbox (`lastValidOf`; never one a removal refused). `removeMember` writes `keepHead` the same way.
 
@@ -115,6 +122,7 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 - `tests/transportContract.test.mjs` runs one contract against the file share, an in-memory push transport (offline peers, outbox, `peerOnline`) and TCP on real loopback sockets. A transport without a directory bootstraps as humans do: every node after the first imports node 0's contact card.
 - `tests/tcp.test.mjs` pins the TCP invariants (pooling, addressing, handshake refusals, limits, outbox, cursors, `mayRead`, whois hints, dial policy, duplicates, backoff, listening) on loopback sockets, port 0, with short injected limits and a fake clock for backoff. `tests/tcpHelpers.mjs` gives `tcpNode` (an engine over TCP, optionally on a shared endpoint or with a spied `view`), `rawPeer`/`rawConnect` (a raw protocol client), `stubView`, `stubSink`, `countingListener` and `waitFor`.
+- `tests/outbox.test.mjs` takes the share off its "mount" (renames its dir away and back) and drives the outbox retry timer with a fake clock: owed writes, the boot-time admission, a filesystem error, the timer's arming, and no dial storm over TCP.
 - `tests/frames.test.mjs` drives the decoder through split and coalesced streams and `parseFrame` through every schema violation.
 - `tests/concurrency.test.mjs` forks `tests/fixtures/writer.mjs` processes that write one inbox at once.
 - `tests/boot.test.mjs` spawns `node server.js` with a scrubbed env.
