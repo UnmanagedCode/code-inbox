@@ -66,7 +66,13 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 **A message to a personal inbox** is valid when its signer is the inviter or invitee (`NOT_PARTY`), it carries no `epoch` (`BAD_EPOCH`), and the invite's response accepts (`INVITE_DECLINED`). Pending while no response is seen.
 
-**A message to a shared inbox** is valid when it carries an `epoch` (`BAD_EPOCH`), the signer was a member at that epoch (`NOT_MEMBER`), and for every later `member remove` of the signer the message lies on that removal's kept chain (`REMOVED`; see [Removal](#removal)). Pending while the inbox or the epoch is unseen, or while a link of the kept chain is (`CHAIN_UNSEEN`).
+**A message to a shared inbox** is valid when, in this order:
+
+1. it carries an `epoch` (`BAD_EPOCH`) and the signer was a member at that epoch (`NOT_MEMBER`);
+2. its `prev` is `null`, or a currently valid message by the same signer in the same inbox. A `prev` that is another signer's or another inbox's record is `BAD_PREV`; one that is refused or invalid is `PREV_REJECTED`; one unseen, pending or not yet settled leaves the message pending (`PREV_UNSEEN`, `PREV_UNSETTLED`). Validity is therefore prefix-closed along `prev`;
+3. for every later `member remove` of the signer, the message is on that removal's kept chain (`REMOVED`; see [Removal](#removal)). Pending while a link of the chain is unseen (`CHAIN_UNSEEN`).
+
+Pending while the inbox or the epoch is unseen.
 
 ### Membership by epoch
 
@@ -77,16 +83,18 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 ### Removal
 
-- Every shared-inbox message names its sender's previous message there in `prev`, so each sender's messages form a hash chain.
-- On removal the owner's install writes `keepHead`: the id of the member's last message it accepted (acceptance order), or `null`. The record has a fixed size however much the member wrote.
-- **Kept chain:** `keepHead`, then each `prev` back, while each link is a message by the member in that inbox (`keptChain`, `src/state.js`).
+- Every shared-inbox message names its sender's previous **valid** message there in `prev` (`null` for its first), so each sender's messages form a hash chain: each id commits to its `prev`.
+- On removal the owner's install writes `keepHead`: the id of the member's last message **valid** on its install (acceptance order), or `null`. The record has a fixed size however much the member wrote.
+- **Kept chain** (`keptChain`, `src/state.js`): `keepHead`, then each `prev` back, walking through accepted **and pending** records, while each link is a message by the member in that inbox. The walk ends at `null`, at a refused id, or at a record that is not the member's.
+- **Why the chain is exactly what the owner held:** validity is prefix-closed, so when the owner wrote the removal every message on the chain below its `keepHead` was valid on its install; and since every id commits to its `prev`, no other record can sit on that chain.
 - A message cited at an epoch before the removal is valid only if it is on the kept chain. Every reader decides the same way, with no clock involved:
-  - a backdated `epoch` does not help;
-  - a later message (its `prev` is the head or anything on the chain) is off the chain;
-  - a fork, or a message pre-signed before the removal but not accepted by the owner by then, is off the chain.
-- While a link of the chain is not known yet, a message off the known part is **pending** (`CHAIN_UNSEEN`); the arriving link itself is on the chain.
-- After a re-add, messages citing the new epoch are valid again.
-- Validity is recomputed against everything known, so a message accepted before a removal that does not keep it becomes **hidden** everywhere.
+  - a later message (on top of `keepHead` or anything below it) is off the chain, whatever `epoch` it cites;
+  - a fork, or a message pre-signed before the removal but not held valid by the owner, is off the chain;
+  - a message whose `prev` points at a pre-signed one stays pending on the owner's install (its `prev` is unseen), so it is never on the chain; once the pre-signed one arrives and is refused, it is refused too (`PREV_REJECTED`).
+- While a link of the chain is unseen, a message not yet reached waits (`CHAIN_UNSEEN`); the link, when it arrives, is reached by the walk. Once the walk ends without reaching a message, that message is refused for good.
+- After a re-add, messages citing the new epoch are valid again; a re-added sender chains onto its last valid message, never onto one the removal refused.
+- Validity is recomputed against everything known, so a message accepted before a removal that does not reach it becomes **hidden** everywhere, together with everything built on it.
+- **Convergence:** pending records and refused ids take part in every verdict, refusals are terminal, and refused ids are kept across restarts (`rejected.ndjson`). The rule is built so readers that end with the same records reach the same verdicts whatever order they arrived in. The test "readers fed the same records in any order reach identical verdicts with nothing pending" checks this on one record set (two removals, a re-add, chains, a fork, a stale write, pre-signed links) in fixed and seeded shuffled orders, and across a reader restart. One exception is an equivocating owner: two member records with one `seq` resolve to the lowest id, which a later-arriving record can change.
 
 ### Admission after an accepted shared invite
 
@@ -120,7 +128,7 @@ inboxes/<inboxId>/<signerFp>/<ts13>-<rand32hex>.rec
 ```
 
 - A writer writes only below its own fingerprint subdir, by tmp + fsync + rename; tmp names start `.tmp-`. No file is ever rewritten.
-- Before writing, the writer subdir must be a real directory (not a symlink) resolving inside the share; otherwise the send is refused `SHARE_UNSAFE` and the record stays in the outbox.
+- Before writing, the writer subdir must be a real directory (not a symlink) resolving inside the share; otherwise the action is refused `SHARE_UNSAFE` on its surface (REST 409, a coded MCP refusal) and the record is neither admitted locally nor queued.
 - Readers skip writer subdirs and record files that are symlinks, and open files without following links.
 - Readers offer only names matching `FILE_RE` (`^\d{13}-[0-9a-f]{32}\.rec$`, `src/transport/fileShare.js`) in subdirs that are a fingerprint. That skips tmp files and sync-client conflict copies.
 
@@ -148,7 +156,7 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | `POST api/inboxes/:id/join` | `{}` | `{id}` |
 | `POST api/join-requests/:id/respond` | `{accept: boolean}` | `{id}` (a `member` record or a `join-response`) |
 | `POST api/inboxes/:id/members/:fp/remove` | `{}` | `{id}` |
-| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `SHARE_UNCONFIGURED` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
+| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `SHARE_UNCONFIGURED` 409, `SHARE_UNSAFE` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
 | `POST api/notify` | `{sessionId}` or `{sessionId: null}` | `{target, autoStart}`; `SESSION_UNKNOWN` unless a top-level conductor |
 | `POST api/mcp` | cc's tool call | below |
 

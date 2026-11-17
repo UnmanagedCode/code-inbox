@@ -1,7 +1,9 @@
 // The pure fold of accepted records (+ this install's name pins) into what the install knows: the directory,
 // invites, inboxes, membership and which messages are valid. No I/O; the engine owns persistence.
 //
-// A record is {seq, id, payload}: `seq` is the local acceptance seq, `id` the record id (records.js).
+// A record is {seq, id, payload}: `seq` is the local acceptance seq, `id` the record id (records.js). The index also
+// holds the records waiting for a dependency (`pending`) and the ids refused for good (`rejected`): message validity
+// walks through both, so a verdict never depends on the order records arrived in.
 // Validity rules: docs/protocol.md → Record types.
 
 const cmpTsId = (a, b) => (a.payload.ts - b.payload.ts) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
@@ -23,14 +25,27 @@ export function createIndex() {
     joinResponses: new Map(), // join-request record id → [rec]
     members: new Map(), // inbox id → [rec]
     msgs: new Map(), // inbox id → [rec], in acceptance order
-    chains: new Map(), // `${inbox}:${signer}:${keepHead}` → {size, ids, missing}: keptChain's memo, valid while byId.size is unchanged
+    pending: new Map(), // record id → {id, payload, …}: verified, route-bound, waiting for a dependency
+    rejected: new Map(), // record id → {reason, type, inbox, signer}: refused for good
+    version: 0, // bumped on every change; the memo below is valid for one version
+    memo: { version: -1, verdicts: new Map(), chains: new Map() },
   };
+}
+
+export function addPending(index, rec) { index.pending.set(rec.id, rec); index.version += 1; }
+export function removePending(index, id) { index.pending.delete(id); index.version += 1; }
+export function addRejected(index, id, info) { index.rejected.set(id, info); index.version += 1; }
+
+function memoOf(index) {
+  if (index.memo.version !== index.version) index.memo = { version: index.version, verdicts: new Map(), chains: new Map() };
+  return index.memo;
 }
 
 // Adds an accepted record to the index (mutates it). Idempotent by id.
 export function addRecord(index, rec) {
   if (index.byId.has(rec.id)) return;
   index.byId.set(rec.id, rec);
+  index.version += 1;
   index.maxSeq = Math.max(index.maxSeq, rec.seq);
   const p = rec.payload;
   switch (p.type) {
@@ -102,24 +117,27 @@ export const currentMembers = (index, inboxId) => membersAt(index, inboxId, curr
 
 // ---- authorization ----
 
-// The messages a removal keeps: `keepHead`, then each `prev` back, while each link is a known message by `signer` in
-// `inbox`. When a link is not known here yet, `missing` names it (null once the chain is complete).
-export function keptChain(index, inbox, signer, keepHead) {
-  const key = `${inbox}:${signer}:${keepHead}`;
-  const memo = index.chains.get(key);
-  if (memo && memo.size === index.byId.size) return memo;
+// The chain a removal keeps: walk `prev` from its owner-signed `keepHead`, through accepted and pending records.
+// Every id commits to its `prev`, and the owner holds a message valid only once its whole prev chain is valid, so the
+// ids reached are exactly messages the owner had accepted. Resolves {ids, missing}: `missing` is the first link not
+// seen here yet (null when the walk ended: at null, at a rejected link, or at a record that is not the member's).
+function keptChain(index, removal) {
+  const memo = memoOf(index);
+  const cached = memo.chains.get(removal.id);
+  if (cached) return cached;
+  const { inbox, member, keepHead } = removal.payload;
   const ids = new Set();
   let missing = null;
   for (let cur = keepHead; cur !== null && !ids.has(cur);) {
-    const r = index.byId.get(cur);
-    if (!r) { missing = cur; break; }
+    const r = index.byId.get(cur) ?? index.pending.get(cur);
+    if (!r) { if (!index.rejected.has(cur)) missing = cur; break; }
     const p = r.payload;
-    if (p.type !== 'msg' || p.signer !== signer || p.inbox !== inbox) break;
+    if (p.type !== 'msg' || p.signer !== member || p.inbox !== inbox) break;
     ids.add(cur);
-    cur = p.prev ?? null;
+    cur = p.prev;
   }
-  const result = { size: index.byId.size, ids, missing };
-  index.chains.set(key, result);
+  const result = { ids, missing };
+  memo.chains.set(removal.id, result);
   return result;
 }
 
@@ -142,16 +160,35 @@ function classifyMsg(index, rec) {
   const members = membersAt(index, p.inbox, p.epoch);
   if (!members) return pending('EPOCH_UNSEEN');
   if (!members.has(p.signer)) return reject('NOT_MEMBER');
-  // A later removal of the signer keeps only its messages on the prev chain back from the removal's keepHead: a
-  // backdated epoch, a fork or a message pre-signed before the removal is off that chain.
+  // Prefix-closed: valid only on top of the sender's own valid previous message.
+  if (p.prev !== null) {
+    if (index.rejected.has(p.prev)) return reject('PREV_REJECTED');
+    const prev = index.byId.get(p.prev);
+    if (!prev) return pending('PREV_UNSEEN');
+    const pp = prev.payload;
+    if (pp.type !== 'msg' || pp.signer !== p.signer || pp.inbox !== p.inbox) return reject('BAD_PREV');
+    const pv = verdictOf(index, prev);
+    if (pv.verdict === 'reject') return reject('PREV_REJECTED');
+    if (pv.verdict === 'pending') return pending('PREV_UNSETTLED');
+  }
+  // A later removal of the signer keeps only the messages on its kept chain: a backdated epoch, a fork or a message
+  // pre-signed before the removal (but not held by the owner) is off it.
   for (const [seq, m] of memberChain(index, p.inbox)) {
     const mp = m.payload;
     if (seq <= p.epoch || mp.op !== 'remove' || mp.member !== p.signer) continue;
-    const kept = keptChain(index, p.inbox, p.signer, mp.keepHead);
+    const kept = keptChain(index, m);
     if (kept.ids.has(rec.id) || kept.missing === rec.id) continue;
     return kept.missing === null ? reject('REMOVED') : pending('CHAIN_UNSEEN');
   }
   return accept;
+}
+
+// The verdict of an accepted message against everything known now, memoized per index version.
+function verdictOf(index, rec) {
+  const memo = memoOf(index);
+  let v = memo.verdicts.get(rec.id);
+  if (!v) { v = classifyMsg(index, rec); memo.verdicts.set(rec.id, v); }
+  return v;
 }
 
 // Whether a verified, route-bound record may be accepted given what is known now:
@@ -211,7 +248,7 @@ export function admissionDue(index, inv) {
 
 // A message is valid when it would still be accepted against everything known now (a later decline, removal or
 // same-seq member record can invalidate one accepted earlier).
-export const isValidMessage = (index, rec) => classifyMsg(index, rec).verdict === 'accept';
+export const isValidMessage = (index, rec) => verdictOf(index, rec).verdict === 'accept';
 
 // ---- directory and names ----
 
@@ -286,10 +323,21 @@ export function invalidMessages(index) {
   const out = [];
   for (const recs of index.msgs.values()) {
     for (const r of recs) {
-      const c = classifyMsg(index, r);
+      const c = verdictOf(index, r);
       if (c.verdict !== 'accept') out.push({ id: r.id, inbox: r.payload.inbox, signer: r.payload.signer, reason: c.reason });
     }
   }
+  return out;
+}
+
+// Every message of an inbox this install has seen, by verdict: valid and invalid (accepted, judged against
+// everything known now), pending (waiting for a dependency), rejected (refused for good). Sorted ids.
+export function inboxVerdicts(index, inboxId) {
+  const out = { valid: [], invalid: [], pending: [], rejected: [] };
+  for (const r of index.msgs.get(inboxId) ?? []) out[verdictOf(index, r).verdict === 'accept' ? 'valid' : 'invalid'].push(r.id);
+  for (const r of index.pending.values()) if (r.payload.type === 'msg' && r.payload.inbox === inboxId) out.pending.push(r.id);
+  for (const [id, info] of index.rejected) if (info.type === 'msg' && info.inbox === inboxId) out.rejected.push(id);
+  for (const k of Object.keys(out)) out[k].sort();
   return out;
 }
 

@@ -89,7 +89,8 @@ Module responsibilities, the data dir and the ingest pipeline: [docs/architectur
 - **No encryption.** Bodies are signed, not encrypted; whoever can read the share reads the mail.
 - **"Human-only" is not a security boundary.** It separates the tool surface only. Any local process, an agent's Bash included, can call the plugin's REST API or read its data dir. cc's own API carries the same trust model.
 - **A contested name shows nobody.** Two keys announcing the same unpinned name are both hidden (`NAME_CONFLICT`) until one renames. A name pinned to a key stays that key's on this install.
-- **Removal relies on the owner's view.** A removed member keeps only its messages up to the last one the owner's install had accepted when it removed them (and on that message's `prev` chain); any later or forked message becomes invalid for everyone.
+- **Removal relies on the owner's view.** A removed member keeps exactly the messages on the `prev` chain below the last one the owner's install held valid when it removed them. Anything else it signed, earlier forks and messages still in transit to the owner included, becomes invalid for everyone.
+- **An equivocating owner can flip verdicts.** Two member records with one `seq` resolve to the lowest record id, so a later-arriving one can change membership and the verdicts that follow from it. An honest owner never writes two.
 - **Full scan per poll.** Every poll lists every directory of interest; large shares scan slower.
 - **One share dir** per install.
 - **Notification needs the backend running** (Auto-start, turned on when a target is picked) **and an idle target**: mail for a busy, exited or missing conductor waits and is retried; a conductor is never resumed for it.

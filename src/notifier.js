@@ -45,7 +45,7 @@ export function createNotifier({ engine, cc, store, schedule = unrefTimeout, now
     if (cancel || !target()) return;
     cancel = schedule(() => {
       cancel = null;
-      if (flushing) { arm(debounceMs); return; }
+      if (flushing) { arm(ms); return; }
       flushing = flush().finally(() => { flushing = null; });
     }, ms);
   }

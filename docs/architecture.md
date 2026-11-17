@@ -29,13 +29,14 @@ settings.json               {name, shareDir, notifyTarget: {sessionId, label} | 
 pins.json                   name → fingerprint
 accepted.ndjson             append-only {seq, id, route, bytes(base64)}; fsynced per record
 pending.ndjson              {route, bytes} of records waiting for a dependency; rewritten atomically
+rejected.ndjson             append-only {id, reason, type, inbox, signer} of records refused for good; fsynced
 outbox.json                 [{route, to: [fp], bytes}] not yet delivered
 cursors.json                inbox id → read cursor (an acceptance seq)
 notify.json                 {watermark}: the notifier's acceptance seq
 ```
 
 - At boot the in-memory index is rebuilt from `accepted.ndjson` (each record re-decoded). A line that does not parse (a torn last write) is skipped and logged; a record that no longer decodes is skipped and logged.
-- Rejected-record counts and recent reasons are kept in memory only.
+- Refused ids are kept (`rejected.ndjson`) so what builds on them is refused too, across restarts; the diagnostics count and recent reasons are in memory only.
 - The share dir must not be inside the data dir, nor contain it (`validateShareDir`), so the key never reaches the share.
 
 ## Ingest pipeline
@@ -45,17 +46,17 @@ All ingest and every action run under one engine lock (`withLock('engine:<dataDi
 1. **Transport** offers `{route, writer, bytes}` to the sink (`engine.ingest`).
 2. **Decode** (`decodeRecord`). `BAD_JSON` answers `{retry: true}`: the file share re-offers the file once its size or mtime changes. Any other failure is a counted rejection.
 3. **Bind:** `payload.signer === writer` and the route is `routeFor(payload)`; else `ROUTE_MISMATCH`.
-4. **Dedup** by record id against accepted and pending records.
-5. **Classify** (`state.classify`): `reject` is counted; `pending` is stored in `pending.ndjson`; `accept` appends to `accepted.ndjson` (assigning the next acceptance seq), adds to the index and emits `message` for a `msg`.
-6. **Drain pending:** after an accept, every pending record is re-classified until no more progress.
+4. **Dedup** by record id against accepted, pending and refused records.
+5. **Classify** (`state.classify`): `reject` is counted and its id appended to `rejected.ndjson`; `pending` is stored in `pending.ndjson`; `accept` appends to `accepted.ndjson` (assigning the next acceptance seq), adds to the index and emits `message` for a `msg`.
+6. **Drain pending:** after every verdict, pending ones included, every pending record is re-classified until a round settles none. A pending record can settle others: a removal's kept chain is walked through pending records.
 7. **Pins and interest:** newly shown names are pinned; the routes of interest (`interestOf`) are pushed to the transport.
 8. **Reactions:** an accepted response to this install's own shared invite admits the invitee (a `member add`) while `admissionDue` holds ([protocol.md → Admission](protocol.md#admission-after-an-accepted-shared-invite)).
 
 **Boot recovery:** after rebuilding the index, pending entries already accepted are dropped and the pending set is drained once; after the transport starts, every admission `admissionDue` still owes is written. That closes the crash windows between accepting a record and acting on it.
 
-**Sending** (`publish`): sign → `transport.send` (recipients in `pending`, or all of them if the send throws, go to the outbox) → ingest locally like any other record. The outbox is re-sent on every `engine.sync()` and, for a peer, on `peerOnline`.
+**Sending** (`publish`): sign → `transport.send` (recipients in `pending`, or all of them if the send throws, go to the outbox) → ingest locally like any other record. A `SHARE_UNSAFE` send is the exception: the action is refused with that code and nothing is admitted or queued. The outbox is re-sent on every `engine.sync()` and, for a peer, on `peerOnline`.
 
-**`sendMessage(inbox, body)`** is the one path for both surfaces. In order it refuses `SHARE_UNCONFIGURED`, `INBOX_UNKNOWN` (no such inbox known), `NOT_MEMBER` (known, but not a party or current member), `BAD_REQUEST` (not a non-empty string), `BODY_TOO_LARGE` (over `BODY_MAX_BYTES`, or `encodeRecord`'s `RECORD_TOO_LARGE`). A shared message cites the current epoch and, as `prev`, this install's last accepted message in that inbox.
+**`sendMessage(inbox, body)`** is the one path for both surfaces. In order it refuses `SHARE_UNCONFIGURED`, `INBOX_UNKNOWN` (no such inbox known), `NOT_MEMBER` (known, but not a party or current member), `BAD_REQUEST` (not a non-empty string), `BODY_TOO_LARGE` (over `BODY_MAX_BYTES`, or `encodeRecord`'s `RECORD_TOO_LARGE`). A shared message cites the current epoch and, as `prev`, this install's last **valid** message in that inbox (`lastValidOf`; never one a removal refused). `removeMember` writes `keepHead` the same way.
 
 ### Acceptance seq, not `ts`
 
@@ -63,13 +64,13 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 ### Message validity is recomputed
 
-`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal whose kept chain does not reach a message, or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install.
+`messagesOf` filters an inbox's accepted messages through the same rule as ingest, against everything known now. A later decline, a removal whose kept chain does not reach a message (and so everything built on it), or a same-seq member record with a lower id can invalidate an earlier message; it is then hidden (listed in diagnostics) on every install. Verdicts are memoized per index version (`memoOf`), bumped on every change to the accepted, pending or refused sets.
 
 ## Notifier lifecycle
 
 - **Start:** loads the watermark; listens for `message` events; arms a flush if mail is already owed.
 - **Owed mail** is derived, never counted: `engine.unseenSince(watermark)`, valid messages from others in this install's inboxes. So a restart neither loses nor repeats a notification.
-- **Flushes never overlap:** a timer that fires while one is in flight re-arms instead, so no message is read as owed by two flushes.
+- **Flushes never overlap:** a timer that fires while one is in flight re-arms with its own interval instead, so no message is read as owed by two flushes.
 - **Flush** (after `NOTIFY_DEBOUNCE_MS`): GET instances → target row → `idle`? → `send_prompt` → on delivery persist the watermark (the highest seq included). Otherwise record why in `lastError` and re-arm after `NOTIFY_RETRY_MS`. Mail that arrived during a delivery arms the next flush.
 - **Assign** (`setTarget`): watermark = current max seq (existing mail is never announced) → store the target → `POST autostart {autoStart: true}`; the result is kept for the page.
 - The scheduler and clock are injected (`schedule(fn, ms)` → cancel, `now()`); tests drive them with a fake clock.
@@ -96,5 +97,6 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 - `tests/transportContract.test.mjs` runs one contract against the file share and an in-memory push transport (offline peers, outbox, `peerOnline`).
 - `tests/concurrency.test.mjs` forks `tests/fixtures/writer.mjs` processes that write one inbox at once.
 - `tests/boot.test.mjs` spawns `node server.js` with a scrubbed env.
+- `tests/convergence.test.mjs` builds one record set (two removals, a re-add, chains, a fork, a stale write, pre-signed links), then feeds it to fresh readers through `engine.ingest` in fixed and seeded shuffled orders and compares `engine.verdicts(inbox)` with the owner's.
 - `tests/recovery.test.mjs` writes a data dir as a crashed backend would leave it (a pending record whose dependency is accepted; an accepted acceptance with no admission) and boots a fresh install from it.
 - `frontend/src/test/setup.ts` makes `fetch` a tripwire; UI tests stub it per test.

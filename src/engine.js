@@ -4,7 +4,7 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeRecord, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addRecord, admissionDue, classify, createIndex, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
+  addPending, addRecord, addRejected, admissionDue, classify, createIndex, inboxVerdicts, removePending, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
   messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
@@ -30,7 +30,6 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
   let pins = {};
   let cursors = {};
   let outbox = [];
-  const pending = new Map(); // record id → {id, payload, route, bytes}
   const rejected = { count: 0, recent: [] };
   let transport = null;
   let interestKey = '';
@@ -94,40 +93,47 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     }
   }
 
-  // Classifies a verified, route-bound record; accepted ones may unblock pending ones, so pending is drained after.
+  // Refuses a record for good: counted, and its id remembered (persisted) so what builds on it is refused too.
+  async function rejectRecord(rec, reason) {
+    noteReject(reason, rec.payload.type, rec.id);
+    const p = rec.payload;
+    const info = { reason, type: p.type, inbox: p.inbox ?? null, signer: p.signer };
+    addRejected(index, rec.id, info);
+    await store.appendRejected({ id: rec.id, ...info });
+  }
+
+  // Classifies a verified, route-bound record; any verdict may settle pending ones, so pending is drained after.
   async function admit(rec) {
-    if (index.byId.has(rec.id) || pending.has(rec.id)) return;
+    if (index.byId.has(rec.id) || index.pending.has(rec.id) || index.rejected.has(rec.id)) return;
     const c = classify(index, rec);
-    if (c.verdict === 'reject') { noteReject(c.reason, rec.payload.type, rec.id); return; }
-    if (c.verdict === 'pending') {
-      pending.set(rec.id, rec);
-      await store.savePending([...pending.values()]);
-      return;
-    }
     const reactions = [];
-    await acceptRecord(rec, reactions);
+    if (c.verdict === 'reject') await rejectRecord(rec, c.reason);
+    else if (c.verdict === 'pending') {
+      addPending(index, rec);
+      await store.savePending([...index.pending.values()]);
+    } else await acceptRecord(rec, reactions);
+    // Even a pending record can settle others: a removal's kept chain is walked through pending records.
     await drainPending(reactions);
     await persistNewPins();
     refreshInterest();
     await react(reactions);
   }
 
-  // Re-classifies every pending record until no more progress; accepts and rejects leave the pending set.
+  // Re-classifies every pending record until a round settles none; settled ones leave the pending set.
   async function drainPending(reactions) {
     let changed = false;
     for (let progress = true; progress;) {
       progress = false;
-      for (const [id, p] of pending) {
+      for (const [id, p] of [...index.pending]) {
         const pc = classify(index, p);
         if (pc.verdict === 'pending') continue;
-        pending.delete(id);
+        removePending(index, id);
         changed = true;
-        if (pc.verdict === 'reject') { noteReject(pc.reason, p.payload.type, id); continue; }
-        await acceptRecord(p, reactions);
         progress = true;
+        if (pc.verdict === 'reject') await rejectRecord(p, pc.reason); else await acceptRecord(p, reactions);
       }
     }
-    if (changed) await store.savePending([...pending.values()]);
+    if (changed) await store.savePending([...index.pending.values()]);
   }
 
   // The transport's sink: `retry` only while the bytes may still be arriving.
@@ -167,6 +173,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     try {
       ({ pending: left } = await transport.send(bytes, { route, to }));
     } catch (err) {
+      // A share this install must not write to is permanent: the action is refused, nothing is admitted locally.
+      if (err.code === 'SHARE_UNSAFE') throw err;
       log.warn(`code-inbox: sending on ${routeKey(route)} failed, kept in the outbox: ${err.message}`);
       left = to;
     }
@@ -205,8 +213,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     return publish({ type: 'member', inbox, seq, op, member, ...extra });
   }
 
-  // The id of the last message by `signer` in `inbox` this install accepted (acceptance order), or null.
-  const lastMessageOf = (inbox, signer) => (index.msgs.get(inbox) ?? []).filter((m) => m.payload.signer === signer).at(-1)?.id ?? null;
+  // The id of the last valid message by `signer` in `inbox` (acceptance order), or null: a sender's `prev`, an
+  // owner's `keepHead`. Never an invalid one: validity is prefix-closed along prev.
+  const lastValidOf = (inbox, signer) => messagesOf(index, inbox).filter((m) => m.payload.signer === signer).at(-1)?.id ?? null;
 
   // ---- guards ----
 
@@ -275,14 +284,15 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         if (!d.ok) { log.warn(`code-inbox: accepted record seq ${e.seq} no longer decodes (${d.reason}): skipped`); continue; }
         addRecord(index, { seq: e.seq, id: d.id, payload: d.payload, route: e.route });
       }
+      for (const { id, ...info } of loaded.rejected) addRejected(index, id, info);
       for (const e of loaded.pending) {
         const d = decodeRecord(e.bytes);
-        if (d.ok && !index.byId.has(d.id)) pending.set(d.id, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
+        if (d.ok && !index.byId.has(d.id) && !index.rejected.has(d.id)) addPending(index, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
       }
-      // Close the crash windows: pending records whose dependency was accepted, and admissions not yet written.
+      // Close the crash windows: pending records whose dependency was settled, and admissions not yet written.
       const reactions = [];
       await drainPending(reactions);
-      if (pending.size !== loaded.pending.length) await store.savePending([...pending.values()]);
+      if (index.pending.size !== loaded.pending.length) await store.savePending([...index.pending.values()]);
       await persistNewPins();
       if (settings.shareDir) {
         await startTransport(settings.shareDir);
@@ -429,9 +439,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         requireFp(member, 'member');
         if (member === self) refuse('BAD_REQUEST', 'the owner cannot remove itself');
         if (!currentMembers(index, inbox)?.has(member)) refuse('NOT_MEMBER', 'that identity is not a member');
-        // Every reader keeps the member's messages on the prev chain back from the last one the owner accepted
+        // Every reader keeps the member's messages on the prev chain back from the last one valid here
         // (docs/protocol.md → Removal): a fixed-size record however busy the member was.
-        return { id: await writeMember(inbox, 'remove', member, { keepHead: lastMessageOf(inbox, member) }) };
+        return { id: await writeMember(inbox, 'remove', member, { keepHead: lastValidOf(inbox, member) }) };
       });
     },
 
@@ -444,7 +454,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         if (typeof body !== 'string' || body.length === 0) refuse('BAD_REQUEST', 'body must be a non-empty string');
         const size = Buffer.byteLength(body, 'utf8');
         if (size > BODY_MAX_BYTES) refuse('BODY_TOO_LARGE', `the body is ${size} bytes; the limit is ${BODY_MAX_BYTES}`);
-        const shared = b.kind === 'shared' ? { epoch: currentEpoch(index, inbox), prev: lastMessageOf(inbox, self) } : {};
+        const shared = b.kind === 'shared' ? { epoch: currentEpoch(index, inbox), prev: lastValidOf(inbox, self) } : {};
         try {
           return { id: await publish({ type: 'msg', inbox, body, ...shared }), inbox };
         } catch (err) {
@@ -493,6 +503,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     },
 
     maxSeq: () => index.maxSeq,
+    // Every message of an inbox this install has seen, by verdict (diagnostics; the convergence tests compare them).
+    verdicts: (inbox) => inboxVerdicts(index, inbox),
     person: (fp) => person(fp),
     inboxName(inbox) {
       const b = inboxesOf(index, self).find((x) => x.id === inbox);
@@ -532,7 +544,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         invites: { incoming: acts.incomingInvites.map(inviteView), outgoing: acts.outgoingInvites.map(inviteView) },
         joinRequests: { incoming: acts.incomingJoins.map(joinView), outgoing: acts.outgoingJoins.map(joinView) },
         inboxes: listInboxes(),
-        diagnostics: { rejected: rejected.count, recent: rejected.recent, hidden: invalidMessages(index), pending: pending.size, outbox: outbox.length },
+        diagnostics: { rejected: rejected.count, recent: rejected.recent, hidden: invalidMessages(index), pending: index.pending.size, outbox: outbox.length },
       };
     },
   };

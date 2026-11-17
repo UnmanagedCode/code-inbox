@@ -10,6 +10,7 @@ export const FILES = {
   pins: 'pins.json',
   accepted: 'accepted.ndjson',
   pending: 'pending.ndjson',
+  rejected: 'rejected.ndjson',
   outbox: 'outbox.json',
   cursors: 'cursors.json',
   notify: 'notify.json',
@@ -21,6 +22,11 @@ const toLine = (e) => `${JSON.stringify({ seq: e.seq, id: e.id, route: e.route, 
 
 // Parses an ndjson file of {route, bytes(b64), …}; a line that does not parse (a torn last write) is skipped and logged.
 async function readNdjson(file, log) {
+  return (await readLines(file, log)).map((e) => ({ ...e, bytes: Buffer.from(e.bytes, 'base64') }));
+}
+
+// Parses an ndjson file; a line that does not parse (a torn last write) is skipped and logged.
+async function readLines(file, log) {
   let text;
   try { text = await fs.readFile(file, 'utf8'); } catch (err) {
     if (err.code === 'ENOENT') return [];
@@ -31,8 +37,7 @@ async function readNdjson(file, log) {
   lines.forEach((line, i) => {
     if (!line) return;
     try {
-      const e = JSON.parse(line);
-      out.push({ ...e, bytes: Buffer.from(e.bytes, 'base64') });
+      out.push(JSON.parse(line));
     } catch {
       log.warn(`code-inbox: ${path.basename(file)} line ${i + 1} does not parse (a torn write?): skipped`);
     }
@@ -57,6 +62,7 @@ export function createStore(dataDir, { log = console } = {}) {
         pins: await readJson(file('pins'), {}),
         accepted,
         pending: await readNdjson(file('pending'), log),
+        rejected: await readLines(file('rejected'), log),
         outbox: (await readJson(file('outbox'), [])).map((e) => ({ ...e, bytes: Buffer.from(e.bytes, 'base64') })),
         cursors: await readJson(file('cursors'), {}),
         notify: await readJson(file('notify'), { watermark: 0 }),
@@ -76,6 +82,18 @@ export function createStore(dataDir, { log = console } = {}) {
         }
         lastSeq = seq;
         return seq;
+      });
+    },
+    // Appends the id (and what it was) of a record refused for good.
+    appendRejected(entry) {
+      return locked(async () => {
+        const handle = await fs.open(file('rejected'), 'a', 0o600);
+        try {
+          await handle.appendFile(`${JSON.stringify(entry)}\n`);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
       });
     },
     savePending: (list) => locked(() => writeFileLines(file('pending'), list)),

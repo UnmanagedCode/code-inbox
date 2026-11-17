@@ -40,7 +40,7 @@ The panel shows the install's fingerprint (first 32 hex, in groups of 4), its an
 
 - **Who can write:** a party of a personal inbox once the invite is accepted; a current member of a shared inbox (the owner included).
 - **Where it goes:** `POST api/inboxes/:id/messages`, the same engine path as the agents' `send_message` (`engine.sendMessage`). The message is signed with the install key, appears in the inbox for every party or member, and comes back in the same list agents read.
-- **On a refusal** (`NOT_MEMBER`, `INBOX_UNKNOWN`, `SHARE_UNCONFIGURED`, `BODY_TOO_LARGE`, `BAD_REQUEST` for an empty body) the box keeps the typed text and shows the code and reason. On success it clears and the list reloads.
+- **On a refusal** (`NOT_MEMBER`, `INBOX_UNKNOWN`, `SHARE_UNCONFIGURED`, `SHARE_UNSAFE`, `BODY_TOO_LARGE`, `BAD_REQUEST` for an empty body) the box keeps the typed text and shows the code and reason. On success it clears and the list reloads.
 - **Ctrl/⌘+Enter** sends.
 
 Every body and name renders as React text, whoever wrote it: the local human, an agent or a peer.

@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
-  admissionDue, buildIndex, addRecord, classify, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
+  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
 } from '../src/state.js';
 
 // Pure fold tests: synthetic records (the fold trusts records.js for signatures and id recomputation).
@@ -116,9 +116,9 @@ test('shared membership follows the member records by epoch', () => {
   assert.deepEqual([...membersAt(index, INBOX, 1)].sort(), [A, B].sort());
   assert.deepEqual([...currentMembers(index, INBOX)].sort(), [A, B, C].sort());
   assert.equal(membersAt(index, INBOX, 3), null, 'an unseen epoch has no member set');
-  assert.equal(verdict(index, msg(B, { epoch: 1 })), 'accept');
-  assert.deepEqual(classify(index, msg(C, { epoch: 1 })), { verdict: 'reject', reason: 'NOT_MEMBER' }, 'C joined at 2');
-  assert.deepEqual(classify(index, msg(B, { epoch: 3 })), { verdict: 'pending', reason: 'EPOCH_UNSEEN' });
+  assert.equal(verdict(index, msg(B, { epoch: 1, prev: null })), 'accept');
+  assert.deepEqual(classify(index, msg(C, { epoch: 1, prev: null })), { verdict: 'reject', reason: 'NOT_MEMBER' }, 'C joined at 2');
+  assert.deepEqual(classify(index, msg(B, { epoch: 3, prev: null })), { verdict: 'pending', reason: 'EPOCH_UNSEEN' });
   assert.deepEqual(classify(index, msg(B)), { verdict: 'reject', reason: 'BAD_EPOCH' }, 'a shared message cites an epoch');
 });
 
@@ -129,7 +129,27 @@ test('a member record by anyone but the owner is rejected: NOT_OWNER', () => {
   assert.deepEqual(classify(index, forged), { verdict: 'reject', reason: 'NOT_OWNER' });
 });
 
-// Invariant: after a removal, the member's messages are valid only on the prev chain back from keepHead; a later
+// ---- prev chains and removal ----
+
+// Invariant: validity is prefix-closed along prev: a message waits for its prev, and is refused for good once its
+// prev is refused, invalid, or not the sender's own message in that inbox.
+test('a shared message is valid only on top of its sender\'s valid prev', () => {
+  const index = buildIndex([create(), member(1, 'add', B), member(2, 'add', C)]);
+  const m1 = msg(B, { epoch: 1, prev: null });
+  const m2 = msg(B, { epoch: 1, prev: m1.id });
+  assert.deepEqual(classify(index, m2), { verdict: 'pending', reason: 'PREV_UNSEEN' });
+  addPending(index, m1);
+  assert.deepEqual(classify(index, m2), { verdict: 'pending', reason: 'PREV_UNSEEN' }, 'a pending prev is not yet valid');
+  addRecord(index, m1);
+  assert.equal(verdict(index, m2), 'accept');
+  const byOther = msg(C, { epoch: 2, prev: m1.id });
+  assert.deepEqual(classify(index, byOther), { verdict: 'reject', reason: 'BAD_PREV' });
+  const refused = msg(B, { epoch: 1, prev: null });
+  addRejected(index, refused.id, { reason: 'X', type: 'msg', inbox: INBOX, signer: B });
+  assert.deepEqual(classify(index, msg(B, { epoch: 1, prev: refused.id })), { verdict: 'reject', reason: 'PREV_REJECTED' });
+});
+
+// Invariant: after a removal, the member's messages are valid only on the chain back from keepHead; a later
 // message (even citing a backdated epoch) and a fork are off it.
 test("a removed member's later or forked message is rejected even with a backdated epoch: REMOVED", () => {
   const index = buildIndex([create(), member(1, 'add', B)]);
@@ -145,35 +165,57 @@ test("a removed member's later or forked message is rejected even with a backdat
   assert.deepEqual(classify(index, msg(B, { epoch: 2, prev: head.id })), { verdict: 'reject', reason: 'NOT_MEMBER' });
 });
 
-// Invariant: a message the owner had not accepted when it removed the member (pre-signed, held back, or simply
-// late) is invalid everywhere, even if it was accepted here first.
-test('a message past the removal keepHead is invalidated everywhere, even if accepted earlier', () => {
+// Invariant: a message the owner did not hold when it removed the member is invalid everywhere, even if a reader
+// accepted it before the removal arrived; so is everything built on it.
+test('a message past the removal keepHead, and its descendants, are invalidated even if accepted earlier', () => {
   const index = buildIndex([create(), member(1, 'add', B)]);
   const m1 = msg(B, { epoch: 1, prev: null });
   const m2 = msg(B, { epoch: 1, prev: m1.id });
-  const reserved = msg(B, { epoch: 1, prev: m2.id });
-  for (const m of [m1, m2, reserved]) addRecord(index, m);
-  assert.equal(messagesOf(index, INBOX).length, 3);
+  const late = msg(B, { epoch: 1, prev: m2.id });
+  const later = msg(B, { epoch: 1, prev: late.id });
+  for (const m of [m1, m2, late, later]) addRecord(index, m);
+  assert.equal(messagesOf(index, INBOX).length, 4);
   addRecord(index, member(2, 'remove', B, { keepHead: m2.id }));
   assert.deepEqual(messagesOf(index, INBOX).map((m) => m.id), [m1.id, m2.id]);
-  assert.deepEqual(invalidMessages(index).map((x) => [x.id, x.reason]), [[reserved.id, 'REMOVED']]);
+  assert.deepEqual(invalidMessages(index).map((x) => x.id).sort(), [late.id, later.id].sort());
 });
 
-// Invariant: a removal of a member that never wrote keeps nothing.
+// Invariant: a member that never wrote keeps nothing.
 test('a removal with keepHead null keeps none of the member\'s messages', () => {
   const index = buildIndex([create(), member(1, 'add', B), member(2, 'remove', B, { keepHead: null })]);
   assert.deepEqual(classify(index, msg(B, { epoch: 1, prev: null })), { verdict: 'reject', reason: 'REMOVED' });
 });
 
-// Invariant: until every link back from keepHead is known, an off-chain message waits instead of being judged.
-test('an incomplete chain holds messages pending until the head arrives', () => {
+// Invariant: the kept chain is walked from the owner's keepHead through pending records too, so an ancestor of
+// keepHead is accepted whenever it arrives, and an off-chain message waits only while a link is unseen, then is
+// refused for good.
+test('the kept chain is walked through pending records; off-chain messages end REMOVED once the walk completes', () => {
   const index = buildIndex([create(), member(1, 'add', B)]);
   const m1 = msg(B, { epoch: 1, prev: null });
   const head = msg(B, { epoch: 1, prev: m1.id });
+  const fork = msg(B, { epoch: 1, prev: null });
   addRecord(index, member(2, 'remove', B, { keepHead: head.id }));
-  assert.deepEqual(classify(index, m1), { verdict: 'pending', reason: 'CHAIN_UNSEEN' });
-  addRecord(index, head);
-  assert.equal(classify(index, m1).verdict, 'accept');
+  assert.deepEqual(classify(index, fork), { verdict: 'pending', reason: 'CHAIN_UNSEEN' }, 'keepHead unseen: undecided');
+  addPending(index, head); // the head waits for m1, its prev
+  assert.equal(classify(index, m1).verdict, 'accept', 'reached from keepHead through the pending head');
+  addRecord(index, m1);
+  assert.deepEqual(classify(index, fork), { verdict: 'reject', reason: 'REMOVED' }, 'the walk reached null without it');
+});
+
+// Invariant: a removed member cannot get a pre-signed message accepted by having an earlier message point at it:
+// that message stays pending at the owner (its prev is unseen), so it is never the owner's, nor on its kept chain.
+test('a pre-signed link and what builds on it are refused after the removal', () => {
+  const index = buildIndex([create(), member(1, 'add', B)]);
+  const m1 = msg(B, { epoch: 1, prev: null });
+  addRecord(index, m1);
+  const presigned = msg(B, { epoch: 1, prev: m1.id });
+  const pointer = msg(B, { epoch: 1, prev: presigned.id });
+  assert.deepEqual(classify(index, pointer), { verdict: 'pending', reason: 'PREV_UNSEEN' }, 'the owner cannot accept it');
+  addPending(index, pointer);
+  addRecord(index, member(2, 'remove', B, { keepHead: m1.id }));
+  assert.deepEqual(classify(index, presigned), { verdict: 'reject', reason: 'REMOVED' });
+  addRejected(index, presigned.id, { reason: 'REMOVED', type: 'msg', inbox: INBOX, signer: B });
+  assert.deepEqual(classify(index, pointer), { verdict: 'reject', reason: 'PREV_REJECTED' });
 });
 
 // Invariant: a removal's record size does not grow with the member's message count.
@@ -188,11 +230,15 @@ test('a removal after hundreds of messages keeps them all through one keepHead',
   assert.deepEqual(messagesOf(index, INBOX).map((m) => m.id), all);
 });
 
-// Invariant: a re-added member writes again by citing the new epoch.
+// Invariant: a re-added member writes again by citing the new epoch, on top of its last valid message.
 test('a re-added member is valid again at the new epoch', () => {
-  const index = buildIndex([create(), member(1, 'add', B), member(2, 'remove', B, { keepHead: null }), member(3, 'add', B)]);
-  assert.equal(verdict(index, msg(B, { epoch: 3, prev: null })), 'accept');
-  assert.deepEqual(classify(index, msg(B, { epoch: 1, prev: null })), { verdict: 'reject', reason: 'REMOVED' });
+  const index = buildIndex([create(), member(1, 'add', B)]);
+  const a1 = msg(B, { epoch: 1, prev: null });
+  addRecord(index, a1);
+  addRecord(index, member(2, 'remove', B, { keepHead: a1.id }));
+  addRecord(index, member(3, 'add', B));
+  assert.equal(verdict(index, msg(B, { epoch: 3, prev: a1.id })), 'accept');
+  assert.deepEqual(classify(index, msg(B, { epoch: 1, prev: a1.id })), { verdict: 'reject', reason: 'REMOVED' });
 });
 
 // Invariant: the owner admits after an accepted shared invite only on the invite's effective response, and only
@@ -239,7 +285,7 @@ test('a duplicate member seq resolves to the lowest record id, in any arrival or
 // Invariant: records arriving before what they depend on wait instead of being lost or rejected.
 test('records that depend on an unseen record are pending', () => {
   const empty = buildIndex([]);
-  assert.equal(verdict(empty, msg(B, { epoch: 0 })), 'pending');
+  assert.equal(verdict(empty, msg(B, { epoch: 0, prev: null })), 'pending');
   assert.equal(verdict(empty, member(1, 'add', B)), 'pending');
   assert.equal(verdict(empty, rec({ type: 'join-request', signer: B, to: A, inbox: INBOX })), 'pending');
   assert.equal(verdict(empty, rec({ type: 'invite-response', signer: B, to: A, invite: 'f'.repeat(32), inbox: INBOX, accept: true })), 'pending');

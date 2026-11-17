@@ -212,3 +212,25 @@ test('a malformed percent-escape in a route parameter answers 400', async () => 
   }
   await x.close();
 });
+
+// Invariant: a share this install must not write to refuses the action on both surfaces (SHARE_UNSAFE), and the
+// refused message is neither shown locally nor queued for a retry.
+test('a symlinked writer subdir refuses the send with SHARE_UNSAFE on REST and MCP, admitting nothing', async () => {
+  const { shareDir, installs } = await makeNetwork(['alice']);
+  const [a] = installs;
+  const { id: inbox } = await a.engine.createSharedInbox('team');
+  const outside = tmpDir('code-inbox-outside-');
+  const parent = path.join(shareDir, 'code-inbox', 'v1', 'inboxes', inbox);
+  fs.rmSync(path.join(parent, a.fp), { recursive: true, force: true });
+  fs.mkdirSync(parent, { recursive: true });
+  fs.symlinkSync(outside, path.join(parent, a.fp));
+  const viaRest = await a.rest('POST', `/api/inboxes/${inbox}/messages`, { body: 'hi' });
+  assert.equal(viaRest.status, 409);
+  assert.equal(viaRest.json.code, 'SHARE_UNSAFE');
+  const viaTool = await mcpCall(assert, a.mcp, 'send_message', { inbox, body: 'hi' }, 'json');
+  assert.equal(viaTool.code, 'SHARE_UNSAFE');
+  assert.deepEqual(a.engine.messages(inbox), []);
+  assert.equal(a.engine.state().diagnostics.outbox, 0);
+  assert.deepEqual(fs.readdirSync(outside), []);
+  await a.close();
+});
