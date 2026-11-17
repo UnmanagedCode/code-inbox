@@ -32,6 +32,7 @@ export const api = {
   setName: (name: string) => call('POST', 'api/identity', { name }),
   setShare: (dir: string) => call('POST', 'api/share', { dir }),
   setTcp: (cfg: { host?: string; port?: number | string; advertise?: string }) => call('POST', 'api/tcp', cfg),
+  setHub: (url: string) => call('POST', 'api/hub', { url }),
   importCard: (card: string) => call<{ fp: string; name: string; shown: boolean }>('POST', 'api/contacts', { card }),
   announce: () => call('POST', 'api/announce'),
   invite: (to: string) => call('POST', 'api/invites', { to }),

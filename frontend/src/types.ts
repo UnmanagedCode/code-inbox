@@ -21,12 +21,15 @@ export interface NotifyView {
 }
 
 export interface TransportView {
-  kind: 'file-share' | 'tcp' | null;
+  kind: 'file-share' | 'tcp' | 'hub' | null;
   configured: boolean;
   dir: string | null;
   host: string | null;
   port: number | null;
   advertise: string | null;
+  url: string | null;
+  // The hub link's state (kind 'hub' with a transport running), else null.
+  hub: { connected: boolean; error: { code: string; message: string } | null } | null;
   addresses: string[];
   card: string | null;
   cardStale: boolean;

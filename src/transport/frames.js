@@ -150,3 +150,65 @@ export function parseFrame(obj, phase) {
   if (!exact(obj, keys)) bad(`a ${obj.t} frame must have exactly ${keys.join(', ')}`);
   return check(obj);
 }
+
+// ---- the hub link (docs/protocol.md → Hub link wire format) ----
+
+export const HUB_CHUNK_BYTES = 64 * 1024; // raw tunneled bytes a client puts in one `data` frame
+export const HUB_DATA_MAX = Math.ceil((HUB_CHUNK_BYTES * 4) / 3); // base64url chars of one chunk
+export const HUB_WATCH_MAX = 1024; // fps in one `watch` or `present`
+export const HUB_FRAME_MAX = 128 * 1024; // every hub-link frame after `ok`: one `data` or a full `watch`
+export const HUB_CLOSE_REASONS = ['ABSENT', 'GONE', 'CLOSED', 'LIMIT'];
+
+const isStreamId = (v) => Number.isSafeInteger(v) && v > 0;
+const streamId = (f, parity) => {
+  if (!isStreamId(f.s) || (parity !== undefined && f.s % 2 !== parity)) bad(`s must be ${parity === 1 ? 'an odd' : parity === 0 ? 'an even' : 'a'} positive integer`);
+};
+const fpList = (v) => { if (!list(v, 0, HUB_WATCH_MAX, 'fps').every(isFp)) bad('fps must be fingerprints'); return v; };
+const closeOf = (reasons) => [['t', 's', 'reason'], (f) => { streamId(f); return reasons.includes(f.reason) ? f : bad('unknown close reason'); }];
+
+const HUB_SCHEMAS = {
+  hello: SCHEMAS.hello,
+  register: [['t', 'ids'], (f) => ({ t: f.t, ids: ids(f.ids) })],
+  ok: SCHEMAS.ok,
+  open: [['t', 's', 'to'], (f) => { streamId(f, 1); return isFp(f.to) ? f : bad('to must be a fingerprint'); }],
+  incoming: [['t', 's'], (f) => { streamId(f, 0); return f; }],
+  data: [['t', 's', 'b'], (f) => {
+    streamId(f);
+    if (typeof f.b !== 'string' || f.b.length < 1 || f.b.length > HUB_DATA_MAX || !B64URL_RE.test(f.b)) bad(`b must be 1–${HUB_DATA_MAX} base64url characters`);
+    return f;
+  }],
+  watch: [['t', 'id', 'fps'], (f) => { if (!isUint(f.id)) bad('id must be a non-negative integer'); fpList(f.fps); return f; }],
+  present: [['t', 'id', 'fps'], (f) => { if (!isUint(f.id)) bad('id must be a non-negative integer'); fpList(f.fps); return f; }],
+  presence: [['t', 'fp', 'online'], (f) => (isFp(f.fp) && typeof f.online === 'boolean' ? f : bad('presence needs a fingerprint and a boolean online'))],
+  ping: SCHEMAS.ping,
+  pong: SCHEMAS.pong,
+  bye: SCHEMAS.bye,
+};
+
+// role → phase → the frame types that side accepts. The hub waits for `register` after `hello`, the client for
+// `ok`; a frame meant for the other direction is refused like an unknown one.
+export const HUB_PHASES = {
+  hub: {
+    hello: ['hello', 'bye'],
+    register: ['register', 'bye'],
+    ready: ['open', 'data', 'close', 'watch', 'ping', 'pong', 'bye'],
+  },
+  client: {
+    hello: ['hello', 'bye'],
+    ok: ['ok', 'bye'],
+    ready: ['incoming', 'data', 'close', 'present', 'presence', 'ping', 'pong', 'bye'],
+  },
+};
+
+// A client closes a stream it is done with (CLOSED) or cannot buffer (LIMIT); ABSENT and GONE are the hub's word.
+const CLOSE_BY = { hub: closeOf(['CLOSED', 'LIMIT']), client: closeOf(HUB_CLOSE_REASONS) };
+
+// Validates a decoded hub-link frame received by `role` ('hub' | 'client') in `phase`, against its exact schema.
+// Resolves the frame (`register` ids decoded to bytes); throws FrameError PROTOCOL otherwise.
+export function parseHubFrame(obj, role, phase) {
+  if (!isObj(obj) || typeof obj.t !== 'string') bad('a frame is not an object with a string t');
+  if (!HUB_PHASES[role]?.[phase]?.includes(obj.t)) bad(`a ${obj.t.slice(0, 20)} frame is not allowed for the ${role} in phase ${phase}`);
+  const [keys, check] = obj.t === 'close' ? CLOSE_BY[role] : HUB_SCHEMAS[obj.t];
+  if (!exact(obj, keys)) bad(`a ${obj.t} frame must have exactly ${keys.join(', ')}`);
+  return check(obj);
+}
