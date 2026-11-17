@@ -24,14 +24,15 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
 - `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP.
 - `assertTransport` checks the shape of every transport the engine is given.
+- Outside the interface, the network transports (TCP, hub) also expose `stats()`: a diagnostic the tests read, and the engine reads for display only (`state().transport.hub`).
 - `tests/transportContract.test.mjs` runs one contract against every implementation.
 
 ### The factory and the engine view
 
 The engine builds its transport with `makeTransport(config, view)` (`server.js` → `transportFactory`):
 
-- `config` is `settings.transport`: `{kind:'file-share', dir}` or `{kind:'tcp', host, port, advertise}`.
-- `view` is a read-only engine object. Its functions are synchronous, read in-memory state and never take the engine lock. The file share ignores it; over TCP the peer is the store, so the transport needs it to serve pulls and to choose whom to dial.
+- `config` is `settings.transport`: `{kind:'file-share', dir}`, `{kind:'tcp', host, port, advertise}` or `{kind:'hub', url}`.
+- `view` is a read-only engine object. Its functions are synchronous, read in-memory state and never take the engine lock. The file share ignores it; over TCP and through a hub the peer is the store, so the transport needs it to serve pulls and to choose whom to dial.
 
 | `view.` | Returns | Source |
 |---|---|---|
@@ -46,15 +47,16 @@ The engine builds its transport with `makeTransport(config, view)` (`server.js` 
 
 ### Selecting a transport
 
-A stored transport is checked at boot. A TCP config is checked as when it was saved (`resolveTcpConfig`, DNS included). A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, its scans pick the directory up once it appears, and writes made meanwhile wait in the outbox until a retry finds its root. A stored share whose root exists but is a link (`code-inbox` or `v1`) is refused `SHARE_UNSAFE`. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath) and creates the share's root (`ensureShareRoot`).
+A stored transport is checked at boot. A TCP config is checked as when it was saved (`resolveTcpConfig`, DNS included). A hub url is checked as when it was saved (`resolveHubConfig`), except that a host that does not resolve, or not within `TCP_LOOKUP_MS`, still starts: the client keeps reconnecting, like a share whose mount is not up yet; a malformed url, or a host resolving to a wildcard, is refused `HUB_INVALID`. Saving a hub (`setHub`) requires the host to resolve, outside the engine lock. A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, its scans pick the directory up once it appears, and writes made meanwhile wait in the outbox until a retry finds its root. A stored share whose root exists but is a link (`code-inbox` or `v1`) is refused `SHARE_UNSAFE`. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath) and creates the share's root (`ensureShareRoot`).
 
-**The root marker.** A write needs `<share>/code-inbox/v1` (`SHARE_ROOT`) to exist already, and only saving the share creates it. So a mount point that is missing, or an empty directory, takes no write, without comparing devices (a local share dir legitimately shares its parent's device). What the marker proves is only that the root exists, not that the mount is up. A share whose root already exists is unaffected. Not detected: an unmounted mount point that itself holds a `code-inbox/v1` tree on the local disk, whether copied there, written before this rule, or **created by saving the share while its mount was down** (the save cannot tell either; the page says to save with the share mounted). A share saved but never written to by an older version has no root: saving it again creates one. An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
+**The root marker.** A write needs `<share>/code-inbox/v1` (`SHARE_ROOT`) to exist already, and only saving the share creates it. So a mount point that is missing, or an empty directory, takes no write, without comparing devices (a local share dir legitimately shares its parent's device). What the marker proves is only that the root exists, not that the mount is up. A share whose root already exists is unaffected. Not detected: an unmounted mount point that itself holds a `code-inbox/v1` tree on the local disk, whether copied there, written before this rule, or **created by saving the share while its mount was down** (the save cannot tell either; the page says to save with the share mounted). A share saved but never written to by an older version has no root: saving it again creates one. An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `HUB_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
 
-One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise}`.
+One transport at a time, set on the page (`POST api/share`, `POST api/tcp` or `POST api/hub`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise} | {kind:'hub', url}`.
 
-- The file share reports every recipient delivered (the share stores everything), so a composite with TCP would drop a TCP-only peer's outbox entry.
-- Route binding requires writer = signer on the share and writer = the proven `from` over TCP, so an install could not relay between the two groups anyway.
-- Consequence: installs on the file share and installs on TCP cannot reach each other. A group picks one medium.
+- The file share reports every recipient delivered (the share stores everything), so a composite with TCP or a hub would drop a network-only peer's outbox entry.
+- Route binding requires writer = signer on the share and writer = the proven `from` over TCP and through a hub, so an install could not relay between groups anyway.
+- TCP and the hub are not composed either: that would need per-recipient routing, and nothing requires it.
+- Consequence: installs on different transports (or on different hubs) cannot reach each other. A group picks one medium.
 
 ## File share (v1, `src/transport/fileShare.js`)
 
@@ -70,7 +72,7 @@ Layout and filename rules: [protocol.md → Routes and the share layout](protoco
 
 ## Direct TCP (`src/transport/tcp.js`)
 
-Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md#tcp-wire-format).
+Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md#tcp-wire-format). Everything below except the listener, dial policy and whois hints is the endpoint core (`src/transport/endpoint.js`), which the hub client shares ([hub.md](hub.md)).
 
 | Concern | Answer |
 |---|---|
@@ -84,7 +86,20 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 
 ### Endpoint and bindings
 
-- `createTcpEndpoint({host, port, advertise, limits, now, schedule, syncMs, log})` → `{attach(binding), stats(), close()}`. One listener and one pool of sessions serve every identity attached to it. `createTcp(opts)` = one endpoint with one binding: what `server.js` uses.
+- **Core and link.** `createEndpoint({makeLink, limits, now, schedule, syncMs, log})` (`endpoint.js`) holds the bindings, sessions, the pool and duplicate rule, `peerOnline`, frame serving (`rec`, `pull`, gated `whois`), pulls and cursors, the maintain loop and the Transport object. `makeLink(core)` supplies how a session's byte pipe is obtained:
+
+  | Link hook | TCP link (`tcp.js`) | Hub link (`hubClient.js`) |
+  |---|---|---|
+  | `addresses()` | `[tcp://advertise:boundPort]` once listening | `[url]` always |
+  | `open()` (every binding start; a rejection fails `start`) | listen | connect unless up or connecting with the same identities; resolves at once |
+  | `identitiesChanged()` (a detach leaving bindings) | nothing | reconnect and re-register |
+  | `shutdown()` (last detach, `close()`; synchronous) | close the listener | `bye STOP` on the link, cancel the reconnect timer |
+  | `discover(b, missing)` (maintain step 1) | whois for contacts with no address | await a connect in progress, refresh the watch, await `present` |
+  | `dial(b, fp)` | per-address dials of `fp`'s `tcp://` addresses | one stream to `fp` |
+  | `stats()` | `{listening}` | `{hub: {url, connected, error}}` |
+
+  The core hands the link `lim`, `now`, `schedule`, `log`, `signers()`, `fps()`, `isLocal(fp)`, `contacts()` (every binding's dial set), `hasSession(fp)`, `readySessions()`, `canDial()`, `accept(socket)` (destroys it beyond the caps), `dial(socket, target)` and `syncAll()`.
+- `createTcpEndpoint({host, port, advertise, limits, now, schedule, syncMs, createServer, log})` → `{attach(binding), stats(), close()}`. One listener and one pool of sessions serve every identity attached to it. `createTcp(opts)` = one endpoint with one binding: what `server.js` uses.
 - `binding = {identity: proofSigner(identity), view, cursors: {load(), save(obj)}}`. The transport only ever holds `signProof` (handshake proofs), never a general `sign`.
 - The listener starts on the first `start()`. Starting or stopping a binding on a live endpoint closes its sessions: they re-handshake with the new identity set when next needed.
 - `stop()` closes the listener **synchronously, before anything is awaited**, then every socket, and never awaits a pending sink call. Re-saving TCP settings on the same port therefore rebinds at once, under the engine lock.
@@ -175,19 +190,6 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 - Right before the record is written, the writer subdir's real path is checked once more against the root's.
 - **Remaining race:** a check and the next `mkdir` or write are separate system calls, so a component swapped for a link in between can still get one empty directory created, or one record file written, through the link. Only someone who already controls the share's contents can do it, and the write is a no-overwrite (exclusive tmp + rename to a fresh random name) of this install's own signed record, which is published anyway.
 
-## Sketched follow-up (not built): hub client (`hubClient.js`)
+## Hub client (`src/transport/hubClient.js`)
 
-| Interface concern | Hub client |
-|---|---|
-| Addressing | Registers the fingerprints it serves with the hub, proving each with a challenge signature. The hub forwards by recipient fingerprint only |
-| `addresses()` / `announce.addr` | `hub+wss://host/` (rendezvous) |
-| `send(..., {to})` | Recipients the hub reports offline are `pending`. The hub stores nothing |
-| Offline peers | Engine outbox + `peerOnline` from the hub's presence notices |
-| Push vs poll | `push: true` |
-| No global listing | `directory: false`, same contact cards as TCP |
-| `sync()` | Same pulls as TCP, through the hub to online peers |
-| Trust | The hub is never trusted for authenticity. Replays are deduplicated by record id; drops are recovered by the outbox and `sync` |
-
-**What it reuses from TCP:** `frames.js`, `handshake.js` and `tcpSession.js` unchanged. Every session frame carries `from`/`to` fingerprints, so a routing-only hub forwards `rec`/`pull`/`recs`/`whois`/`cards` by `to` without parsing records. A client proves its identities to the hub with the same `prove` (role `dial`, target = the hub's fingerprint). Per-peer cursors, `view.serve`, `mayRead`, the dial policy and the outbox/`peerOnline` contract carry over.
-
-**What it must decide:** through a hub, `from` is attested only by the hub, so writer binding degrades to "the hub says"; signatures are unaffected. The fix is to tunnel the endpoint-to-endpoint `hello`/`prove`/`ok` as frames addressed through the hub; the frame format already allows it.
+Every install dials out to one hub; sessions run as streams through it, with the endpoint handshake unchanged inside each, so the writer is still the `from` the remote endpoint proved. The hub routes by fingerprint, stores nothing and is never trusted for authenticity. Behaviour, the hub server, and its security: [hub.md](hub.md). Wire format: [protocol.md → Hub link wire format](protocol.md#hub-link-wire-format).

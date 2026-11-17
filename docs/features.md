@@ -17,26 +17,30 @@ The panel shows the install's fingerprint (first 32 hex, in groups of 4), its an
 
 ### Transport
 
-One transport at a time: **File share** or **TCP (direct)**, picked with a radio. Installs on different transports cannot reach each other; the panel says so.
+One transport at a time: **File share**, **TCP (direct)** or **Hub**, picked with a radio. Installs on different transports cannot reach each other; the panel says so.
 
 | Control | Does | Refused with |
 |---|---|---|
 | **Save share** | Makes the file share the transport: stores the dir, creates its `code-inbox/v1` root and starts scanning it. The page says to save with the share mounted: a root created on the local disk under an unmounted mount point would take writes | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath); `SHARE_UNSAFE`: its `code-inbox` or `v1` is a link, or resolves outside the share or into the data dir |
 | **Save TCP** | Makes direct TCP the transport: listens on **Listen host** (empty: `127.0.0.1`) and **Port** (empty: `TCP_DEFAULT_PORT`, `src/transport/tcp.js`). **Advertised host** (shown once the host is not loopback; required when the host is every interface: `0.0.0.0` or any spelling of `::`) is what peers dial | `TCP_INVALID` (a bad host, port or advertised host; a host that does not resolve; a host or advertised host that is, or resolves to, every interface such as `0.0.0.0`, `::`, `0`), `TCP_LISTEN_FAILED` (the port is taken or not allowed; no transport is configured until a save succeeds) |
+| **Save hub** | Makes a hub the transport: **Hub address** `hub://host:port` (the hub every peer of this install uses, [hub.md](hub.md)). Starts even while the hub is unreachable, and keeps reconnecting | `HUB_INVALID` (not `hub://host:port` with a port 1–65535, too long, a wildcard host such as `0.0.0.0`, or a host that does not resolve or resolves to every interface) |
 
 - The panel shows the transport in use, the share dir or the addresses this install is reachable at, and, when no transport could start at boot, why as `CODE: message`:
   - `SHARE_INVALID`: the stored share dir is relative, or overlaps the data dir (also through a link). A share dir that is merely missing (a mount not up yet) is not an error: it is scanned once it appears;
   - `SHARE_UNSAFE`: the stored share's `code-inbox` or `v1` is a link;
   - `TCP_INVALID`: the stored host, port or advertised host is invalid, a host does not resolve, or it resolves to every interface;
+  - `HUB_INVALID`: the stored hub address is malformed, or its host resolves to every interface. A hub host that does not resolve yet is not an error: the client keeps trying;
   - `TRANSPORT_INVALID`: the stored transport is of an unknown kind;
   - `TCP_LISTEN_FAILED`: the port is taken or not allowed.
 - Whenever writes wait in the outbox, the panel shows how many and the last attempt's `CODE: message` (`SHARE_UNAVAILABLE`: the share's `code-inbox/v1` root is missing, the mount looks down; `SHARE_UNSAFE`: the share or a writer subdir now points somewhere unsafe; a filesystem error). Actions still succeed: their writes are retried until delivered.
 - A listen host that is not loopback shows a warning: it opens a port to the network, and records travel unencrypted.
-- After changing the host or port, **Announce** again: peers dial the addresses in the last announce, and the contact card is marked stale until then.
+- On a hub, the panel shows the **Hub** address and the **Connection**: connected or not connected, with the last error as `CODE: message` (a socket error such as `ECONNREFUSED`; `HUB_REFUSED`: the hub refused the registration; `HUB_DUPLICATE`: another install registered this identity on the hub, and this one stopped reconnecting until the transport is saved again).
+- Choosing **Hub** shows a note: the hub routes by fingerprint and cannot forge senders, but sees who talks to whom and reads every record; peers must use the same hub.
+- After changing the host, port or hub, **Announce** again: peers read the addresses in the last announce, and the contact card is marked stale until then.
 
-### Contacts (TCP only)
+### Contacts (TCP and hub)
 
-TCP has no shared directory: installs find each other through contact cards and the announces exchanged when they connect.
+TCP and the hub have no shared directory: installs find each other through contact cards and the announces exchanged when they connect.
 
 | Control | Does | Refused with |
 |---|---|---|
@@ -44,7 +48,8 @@ TCP has no shared directory: installs find each other through contact cards and 
 | **Import** | Takes a pasted card: the identity appears in the directory, becomes a contact, and is dialed at once. Shows "Imported name (fingerprint)" | `CARD_INVALID` (not a card, not a valid announce, or this install's own) |
 
 - Importing the owner's card is enough to join a shared inbox: members then find each other through the connections they already have.
-- An identity that connects on its own appears in the directory too, but this install never dials an address it learned only from such a stranger.
+- An identity that connects on its own appears in the directory too, but this install never dials it (nor, on TCP, an address it learned only from such a stranger).
+- On a hub, an imported contact is dialed by fingerprint once the hub reports it registered.
 
 ### Directory
 

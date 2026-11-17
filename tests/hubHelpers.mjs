@@ -4,7 +4,7 @@ import { createEngine } from '../src/engine.js';
 import { createHub } from '../src/hub/hub.js';
 import { loadIdentity } from '../src/identity.js';
 import { createStore } from '../src/store.js';
-import { HUB_FRAME_MAX, TCP_FRAME_MAX, createDecoder, encodeFrame } from '../src/transport/frames.js';
+import { TCP_FRAME_MAX, createDecoder, encodeFrame } from '../src/transport/frames.js';
 import { makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
 import { createHubConn } from '../src/transport/hubConn.js';
 import { createHubEndpoint } from '../src/transport/hubClient.js';

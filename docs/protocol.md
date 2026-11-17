@@ -55,7 +55,7 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 | Type | Fields | Route | Accepted when | Pending while |
 |---|---|---|---|---|
-| `announce` | `name`, `addr: string[]` (`[]` on the file share; `["tcp://host:port"]` over TCP) | directory | always (it certifies its own key) | — |
+| `announce` | `name`, `addr: string[]` (`[]` on the file share; `["tcp://host:port"]` over TCP; `["hub://host:port"]` through a hub) | directory | always (it certifies its own key) | — |
 | `inbox-create` | `inbox`, `nonce`, `name` | directory | the id recomputes | — |
 | `invite` | `to`, `kind: personal\|shared`, `inbox`, `nonce` | mailbox(`to`) | personal: the id recomputes. Shared: the id recomputes from signer + nonce and the `inbox-create` is known (`NOT_OWNER` otherwise) | shared: the `inbox-create` is unseen |
 | `invite-response` | `to`, `invite` (record id), `inbox`, `accept: boolean` | mailbox(`to` = inviter) | the invite's `to` is the signer, its signer is `to`, same inbox (`RESPONSE_MISMATCH`) | the invite is unseen |
@@ -129,6 +129,7 @@ A route says where a record travels: `{kind:'directory'}`, `{kind:'mailbox', fp}
 |---|---|
 | File share | the fingerprint subdir the file sits in |
 | TCP | the frame's `from`: an identity the remote proved on that session (any other `from` closes the session) |
+| Hub | the same: the frame's `from`, proven by the remote **endpoint** in the handshake tunneled through the hub stream. The hub attests nothing |
 | Contact-card import | the announce's own signer. Only an `announce` is accepted this way (`CARD_INVALID` otherwise) |
 
 ### File share (`<shareDir>/code-inbox/v1/`, `SHARE_ROOT`)
@@ -204,11 +205,45 @@ proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON
 
 ### Addresses
 
-`tcp://<host>:<port>` with host a DNS name, an IPv4 address, or `[IPv6]`, port 1–65535 (`parseTcpAddr` / `formatTcpAddr`, `src/transport/tcp.js`). Entries of `announce.addr` in any other form are ignored.
+`tcp://<host>:<port>` with host a DNS name, an IPv4 address, or `[IPv6]`, port 1–65535 (`parseTcpAddr` / `formatTcpAddr`, `src/transport/tcp.js`; both are `parseAddr` / `formatAddr` in `src/transport/addr.js`). A TCP install dials only these; entries of `announce.addr` in any other form are ignored.
+
+`hub://<host>:<port>`, the same syntax (`parseHubAddr` / `formatHubAddr`, `src/transport/hubClient.js`), is the hub a hub-client install uses. It is informational: a hub client dials peers by fingerprint through its own hub and never reads others' `addr`.
 
 ### Contact card
 
 `CARD_PREFIX` (`"code-inbox-card:v1:"`, `src/records.js`) followed by the base64url of an announce record's bytes. `decodeCard` trims the text, requires the prefix and canonical base64url of at most `RECORD_MAX_BYTES` bytes; the record then goes through `decodeRecord` and must be an `announce` signed by another identity (`CARD_INVALID` otherwise).
+
+## Hub link wire format
+
+Owned by `src/transport/frames.js` (`parseHubFrame`, `HUB_PHASES`, the `HUB_*` frame limits) and `src/transport/hubConn.js` (phases, deadlines, keepalive). Behaviour on top of it: [hub.md](hub.md).
+
+- **Framing:** as TCP ([Framing](#framing)): a 4-byte length, then one UTF-8 JSON object with a string `t`; the length is checked against the phase's limit from the header. Before `ok` the limit is `TCP_HELLO_FRAME_MAX`, after it `HUB_FRAME_MAX`.
+- **Exact schemas per receiving role:** the hub and the client each parse with their own table (`HUB_PHASES[role][phase]`), so a frame sent in the wrong direction, out of phase, with an unknown `t`, a missing or extra key, or any field failure is `bye PROTOCOL`.
+- **Registration proof:** `sig` over `proofBytes('hub', clientNonce, hubNonce, '')` ([Handshake](#handshake)); the hub runs `verifyProofs` and answers a failure with `bye PROOF`. The hub signs nothing. A `hub` proof is never a `dial` or `accept` proof, and the reverse.
+
+| Phase | Hub accepts | Client accepts |
+|---|---|---|
+| `hello` | `hello`, `bye` | `hello`, `bye` |
+| `register` (hub) / `ok` (client) | `register`, `bye` | `ok`, `bye` |
+| `ready` | `open`, `data`, `close`, `watch`, `ping`, `pong`, `bye` | `incoming`, `data`, `close`, `present`, `presence`, `ping`, `pong`, `bye` |
+
+| `t` | Fields | Meaning |
+|---|---|---|
+| `hello` | `v:1, nonce` | Both sides at once; the TCP schema |
+| `register` | `ids:[{key, sig}]` (1..`TCP_MAX_IDENTITIES`) | Client → hub: proves every identity it serves |
+| `ok` | — | Hub → client: registered, ready |
+| `open` | `s` (odd), `to` (fp) | Client → hub: open stream `s` to the link that registered `to` |
+| `incoming` | `s` (even) | Hub → client: a stream was opened to one of this link's fps. Names nobody |
+| `data` | `s`, `b` | Either way: `b` is 1..`HUB_DATA_MAX` base64url characters (`HUB_CHUNK_BYTES` raw bytes at most), forwarded unchanged; tunneled endpoint frames reassemble from the decoded chunks |
+| `close` | `s`, `reason` | Either way. Hub → client: `ABSENT` (no such registration), `GONE` (the peer's link went), `CLOSED` (the peer closed), `LIMIT` (a cap). Client → hub: `CLOSED` or `LIMIT` only |
+| `watch` | `id` (uint), `fps` (0..`HUB_WATCH_MAX`) | Client → hub: replaces this link's watch set |
+| `present` | `id`, `fps` | Hub → client: answers `watch id` with the watched fps registered now on other links |
+| `presence` | `fp`, `online` (boolean) | Hub → client: a watched fp registered (`true`) or left (`false`) |
+| `ping` / `pong` / `bye` | as TCP | `bye` reasons as TCP: `PROOF`, `PROTOCOL`, `DUPLICATE` (a newer link registered one of these fps), `LIMIT`, `STOP` |
+
+- **Stream ids** are per link: odd ids are chosen by the client for streams it opens, even ids by the hub for streams it delivers. Reopening an id still open is `bye PROTOCOL`.
+- Inside a stream run the endpoint handshake and session frames exactly as over a TCP socket ([Handshake](#handshake), [Session frames](#session-frames-after-ready)), with their own phase limits and deadlines.
+- Deadlines and keepalive on the link: `TCP_HANDSHAKE_MS` for the registration, `TCP_FRAME_MS` for a partial frame, `TCP_IDLE_MS` of silence, `TCP_PING_MS` pings. Hub-side caps: [hub.md → Limits](hub.md#limits-srchubhubjs-srctransportframesjs).
 
 ## REST routes
 
@@ -221,12 +256,13 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | Route | Body | Answer |
 |---|---|---|
 | `GET api/health` | — | `{ok: true}` |
-| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, addresses, card, cardStale, error, outboxError}`: `outboxError` is `{code, message}` of the latest send failure still holding writes in the outbox (`diagnostics.outbox`), else null; `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the stored transport was invalid at boot (`TCP_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID`) or the TCP listener could not start (`TCP_LISTEN_FAILED`) |
+| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, url, hub, addresses, card, cardStale, error, outboxError}`: `kind` is `file-share`, `tcp`, `hub` or null; `url` is the saved hub address (else null); `hub` is `{connected, error}` of the hub link while a hub transport runs (else null; `error` is `{code, message}`: a socket error code, `HUB_REFUSED` or `HUB_DUPLICATE`, [hub.md → The link](hub.md#the-link)); `outboxError` is `{code, message}` of the latest send failure still holding writes in the outbox (`diagnostics.outbox`), else null; `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the stored transport was invalid at boot (`TCP_INVALID`, `HUB_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID`) or the TCP listener could not start (`TCP_LISTEN_FAILED`) |
 | `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, in acceptance order |
 | `GET api/sessions` | — | `{sessions: [{sessionId, label, status, live}], target, autoStart}`: cc's top-level conductors; 503 `CONDUCTOR_UNAVAILABLE` without cc |
 | `POST api/identity` | `{name}` | `{name}` |
 | `POST api/share` | `{dir}` | `{shareDir}`; makes the file share the transport. `SHARE_INVALID` 400 |
 | `POST api/tcp` | `{host?, port?, advertise?}` | `{host, port, advertise, addresses}`; makes TCP the transport (`validateTcpConfig`). `TCP_INVALID` 400, `TCP_LISTEN_FAILED` 409 (no transport is configured after it) |
+| `POST api/hub` | `{url}` | `{url, addresses}`; makes the hub client the transport (`resolveHubConfig`: `hub://host:port`, not a wildcard, the host must resolve). `HUB_INVALID` 400. Starting never fails because the hub is unreachable: the client keeps reconnecting |
 | `POST api/contacts` | `{card}` | `{fp, name, shown}`: the imported identity. `CARD_INVALID` 400 |
 | `POST api/announce` | `{}` | `{id}` |
 | `POST api/invites` | `{to}` (fingerprint) | `{id, inbox}` |

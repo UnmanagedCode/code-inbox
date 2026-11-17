@@ -8,7 +8,7 @@ import { fileURLToPath } from 'node:url';
 import { loadIdentity } from '../src/identity.js';
 import { decodeCard, decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
 import { createStore } from '../src/store.js';
-import { HUB_FRAME_MAX, HUB_WATCH_MAX, TCP_HELLO_FRAME_MAX, encodeFrame } from '../src/transport/frames.js';
+import { HUB_FRAME_MAX, HUB_WATCH_MAX, TCP_HELLO_FRAME_MAX } from '../src/transport/frames.js';
 import { makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
 import { createHubEndpoint, resolveHubConfig } from '../src/transport/hubClient.js';
 import { routeKey } from '../src/transport/index.js';
