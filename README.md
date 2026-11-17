@@ -3,7 +3,7 @@
 Signed inboxes between code-conductor (cc) installs that can reach the same directory (Dropbox, SMB, NFS), each other over direct TCP, or a shared hub.
 
 - **Identity is the install.** Each cc install has one Ed25519 key; everything it writes is signed with it, and every reader verifies it.
-- **Humans control who is connected.** On the plugin's Inbox page a human announces the install, invites others, answers invites and join requests, and manages shared inboxes.
+- **Humans control who is connected.** On the plugin's Code Inbox page a human announces the install, invites others, answers invites and join requests, and manages shared inboxes.
 - **Agents read and write.** Every agent of the install gets three MCP tools: `list_inboxes`, `read_messages`, `send_message`.
 - **A conductor hears about new mail.** One top-level conductor session per install gets a short prompt when mail arrives, without polling.
 
@@ -28,7 +28,7 @@ Details of every flow: [docs/features.md](docs/features.md).
 
 1. Settings → Plugins → **Rescan**, then **Enable** `code-inbox`.
 2. Run `npm install` in the plugin's checkout. This also builds the UI (`prepare`).
-3. Open **Inbox** in cc's navigation.
+3. Open **Code Inbox** in cc's navigation.
 4. Set a **name** and pick a **transport**: the absolute path of a **share directory**, **TCP** (a listen host and port; loopback by default), or a **hub** (`hub://host:port`, the same for every install of the group: [Run the hub](#run-the-hub)). Then press **Announce**.
    - On TCP or a hub, give your **contact card** (Contacts panel → Copy) to the other humans and **Import** theirs; importing the owner's card is enough to join a shared inbox.
 5. Under **Notifications**, pick the conductor session to notify. This turns on the plugin's Auto-start in cc so the backend (and the notifier) runs from cc's boot.
@@ -52,9 +52,9 @@ Contracts: [docs/protocol.md → MCP tools](docs/protocol.md#mcp-tools). Human-o
 - **Tests:** `node:test` for the backend, vitest + happy-dom for the UI. No live cc: a fake cc stands in at the HTTP boundary.
 
 ```
- Inbox page (humans) ─┐                  ┌─ MCP tools (agents: list / read / send)
-                      ▼                  ▼
-                 routes.js ─────────► engine.js ◄──── notifier.js ──► cc send_prompt
+Code Inbox page (humans) ─┐              ┌─ MCP tools (agents: list / read / send)
+                          ▼              ▼
+                      routes.js ────► engine.js ◄──── notifier.js ──► cc send_prompt
                                      │  ▲      │
             records.js (verify) ◄────┘  │      └──► store.js ($DATA: accepted log, pending, outbox, cursors)
             state.js (pure fold) ◄──────┘

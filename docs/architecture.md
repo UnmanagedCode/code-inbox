@@ -116,6 +116,13 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 - **Hub server:** stateless; one `hubConn` per accepted socket, a fingerprint → link map, watch sets and stream pairs in memory only ([hub.md → Hub server behaviour](hub.md#hub-server-behaviour-srchubhubjs)).
 - **Card import** (`importCard`) admits the announce under the lock, adds its signer to `contacts.json`, then, outside the lock, starts a transport `sync()` so the new contact is dialed at once.
 
+## UI build
+
+- `frontend/dist` is gitignored and built by `npm run prepare` (`vite build`), which `npm install` runs.
+- `.code-conductor/post-worktree-merge.sh` rebuilds it after a cc merge into the main checkout: `npm run prepare` when the merge changed `frontend/`, `npm install` when it changed `package.json`, nothing when the target is a linked worktree. A build failure prints `BUILD FAILED` as the last line and does not fail the merge.
+- A backend restart does not rebuild the UI. A rebuild is live on page reload, because the backend reads `frontend/dist` from disk on each request.
+- A merge or pull that did not go through cc needs `npm run prepare` run by hand; until then the page serves the previous build, which can render blank against a changed `api/state`.
+
 ## Tests
 
 `npm test` runs `node --test "tests/**/*.test.mjs"` then vitest. Everything is in-process on temp dirs; no live cc and no real `PROJECTS_ROOT`.
@@ -138,3 +145,4 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 - `tests/convergence.test.mjs` builds one record set (two removals, a re-add, chains, a fork, a stale write, pre-signed links), then feeds it to fresh readers through `engine.ingest` in fixed and seeded shuffled orders and compares `engine.verdicts(inbox)` with the owner's.
 - `tests/recovery.test.mjs` writes a data dir as a crashed backend would leave it (a pending record whose dependency is accepted; an accepted acceptance with no admission) and boots a fresh install from it.
 - `frontend/src/test/setup.ts` makes `fetch` a tripwire; UI tests stub it per test.
+- `tests/postMergeHook.test.mjs` runs `.code-conductor/post-worktree-merge.sh` in temp git repos with a fake `npm` first on `PATH`: which command runs for which changed paths, the linked-worktree skip, and the failure line.

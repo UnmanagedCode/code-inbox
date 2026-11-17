@@ -9,7 +9,7 @@
   },
   "frontend": {
     "path": "/",
-    "navLabel": "Inbox",
+    "navLabel": "Code Inbox",
     "icon": "message-square-code"
   },
   "mcp": {
