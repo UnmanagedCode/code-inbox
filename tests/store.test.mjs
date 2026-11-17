@@ -39,3 +39,23 @@ test('load creates the data dir 0700', async () => {
   await createStore(dataDir).load();
   assert.equal(fs.statSync(dataDir).mode & 0o777, 0o700);
 });
+
+// Invariant: a data dir written before the transport setting existed boots into the current settings shape, once.
+test('settings with shareDir migrate to transport once and the migration is idempotent', async () => {
+  const file = (d) => path.join(d, FILES.settings);
+  const dataDir = tmpDir();
+  fs.writeFileSync(file(dataDir), JSON.stringify({ name: 'alice', shareDir: '/srv/share', notifyTarget: null }));
+  const loaded = await createStore(dataDir).load();
+  assert.deepEqual(loaded.settings, { name: 'alice', transport: { kind: 'file-share', dir: '/srv/share' }, notifyTarget: null });
+  const onDisk = fs.readFileSync(file(dataDir), 'utf8');
+  assert.deepEqual(JSON.parse(onDisk), loaded.settings);
+  const mtime = fs.statSync(file(dataDir)).mtimeMs;
+  assert.deepEqual((await createStore(dataDir).load()).settings, loaded.settings);
+  assert.equal(fs.readFileSync(file(dataDir), 'utf8'), onDisk);
+  assert.equal(fs.statSync(file(dataDir)).mtimeMs, mtime);
+
+  const none = tmpDir();
+  fs.writeFileSync(file(none), JSON.stringify({ name: null, shareDir: null, notifyTarget: null }));
+  assert.deepEqual((await createStore(none).load()).settings, { name: null, transport: null, notifyTarget: null });
+  assert.equal('shareDir' in JSON.parse(fs.readFileSync(file(none), 'utf8')), false);
+});

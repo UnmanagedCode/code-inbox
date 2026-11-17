@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIdentity } from '../src/identity.js';
 import {
-  BODY_MAX_BYTES, RECORD_MAX_BYTES, TS_MAX, decodeRecord, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
+  BODY_MAX_BYTES, CARD_PREFIX, RECORD_MAX_BYTES, TS_MAX, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
 } from '../src/records.js';
 import { tmpDir } from './helpers.mjs';
 
@@ -157,4 +157,21 @@ test('encodeRecord refuses a record over RECORD_MAX_BYTES: RECORD_TOO_LARGE', ()
   const inbox = 'a'.repeat(32);
   const body = '\u0001'.repeat(BODY_MAX_BYTES); // within BODY_MAX_BYTES, but six bytes each once escaped
   assert.throws(() => encodeRecord(alice, { type: 'msg', signer: alice.fp, ts: TS, inbox, body }), { code: 'RECORD_TOO_LARGE' });
+});
+
+// Invariant: a contact card carries exactly a record's bytes, and nothing else parses as one.
+test('a contact card round-trips and refuses a wrong prefix, non-canonical base64url, or oversize text', () => {
+  const { bytes } = encodeRecord(alice, announce());
+  const card = encodeCard(bytes);
+  assert.ok(card.startsWith(CARD_PREFIX));
+  assert.deepEqual(decodeCard(`  ${card}\n`), bytes);
+  const body = card.slice(CARD_PREFIX.length);
+  assert.equal(decodeCard(`code-inbox-card:v2:${body}`), null);
+  assert.equal(decodeCard(body), null);
+  assert.equal(decodeCard(`${CARD_PREFIX}${body}=`), null);
+  assert.equal(decodeCard(`${CARD_PREFIX}AB`), null); // decodes, but re-encodes as AA: not canonical
+  assert.equal(decodeCard(`${CARD_PREFIX}${body.replace(/^./, '+')}`), null);
+  assert.equal(decodeCard(`${CARD_PREFIX}${Buffer.alloc(RECORD_MAX_BYTES + 1, 1).toString('base64url')}`), null);
+  assert.equal(decodeCard(CARD_PREFIX), null);
+  assert.equal(decodeCard(42), null);
 });

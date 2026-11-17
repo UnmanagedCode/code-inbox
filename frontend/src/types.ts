@@ -20,9 +20,22 @@ export interface NotifyView {
   autoStart: { ok: boolean; autoStart?: boolean; code?: string; error?: string } | null;
 }
 
+export interface TransportView {
+  kind: 'file-share' | 'tcp' | null;
+  configured: boolean;
+  dir: string | null;
+  host: string | null;
+  port: number | null;
+  advertise: string | null;
+  addresses: string[];
+  card: string | null;
+  cardStale: boolean;
+  error: { code: string; message: string } | null;
+}
+
 export interface State {
   identity: { fp: string; fingerprint: string; name: string | null; announcedName: string | null; nameStatus: string };
-  share: { dir: string | null; configured: boolean };
+  transport: TransportView;
   directory: { fp: string; fingerprint: string; name: string }[];
   sharedInboxes: SharedInbox[];
   invites: { incoming: Invite[]; outgoing: Invite[] };

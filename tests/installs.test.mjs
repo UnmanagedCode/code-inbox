@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { encodeRecord } from '../src/records.js';
+import { encodeCard, encodeRecord } from '../src/records.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
 import { connectPersonal, makeInstall, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
@@ -312,4 +312,42 @@ test('a replayed acceptance re-admits nobody; a fresh invite does', async () => 
   await syncAll(installs);
   assert.deepEqual(a.engine.listInboxes()[0].members.map((m) => m.name).sort(), ['alice', 'bob']);
   await closeAll(installs);
+});
+
+// Invariant: a card import admits only another identity's genuine announce; anything else is refused CARD_INVALID
+// and admits nothing.
+test('importCard accepts only another identity\'s announce', async (t) => {
+  const a = await makeInstall(null);
+  const b = await makeInstall(null);
+  t.after(async () => { for (const x of [a, b]) await x.close(); });
+  await a.engine.setTcp({ port: 0 });
+  await b.engine.setTcp({ port: 0 });
+  await b.engine.setName('bob');
+  await b.engine.announce();
+  const bobId = await loadIdentity(b.dataDir);
+  const notAnnounce = encodeCard(encodeRecord(bobId, { type: 'join-request', signer: b.fp, ts: Date.now(), to: a.fp, inbox: 'd'.repeat(32) }).bytes);
+  const own = await a.engine.setName('alice').then(() => a.engine.announce()).then(() => a.engine.state().transport.card);
+  const tampered = b.engine.state().transport.card.replace(/.{4}$/, 'AAAA');
+  for (const card of [notAnnounce, own, tampered, 'hello', '']) await assert.rejects(a.engine.importCard(card), { code: 'CARD_INVALID' }, card.slice(0, 30));
+  assert.deepEqual(a.engine.state().directory, []);
+  assert.deepEqual(await a.engine.importCard(b.engine.state().transport.card), { fp: b.fp, name: 'bob', shown: true });
+  assert.deepEqual(a.engine.state().directory.map((d) => d.name), ['bob']);
+});
+
+// Invariant: the card on the page is stale exactly while the announced addresses differ from where the install listens.
+test('cardStale turns true when the address changes and false after announcing', async (t) => {
+  const a = await makeInstall(null);
+  t.after(() => a.close());
+  await a.engine.setTcp({ port: 0 });
+  await a.engine.setName('alice');
+  assert.equal(a.engine.state().transport.card, null);
+  await a.engine.announce();
+  const first = a.engine.state().transport;
+  assert.equal(first.cardStale, false);
+  await a.engine.setTcp({ port: 0 }); // a new ephemeral port
+  assert.notDeepEqual(a.engine.state().transport.addresses, first.addresses);
+  assert.equal(a.engine.state().transport.cardStale, true);
+  await a.engine.announce();
+  assert.equal(a.engine.state().transport.cardStale, false);
+  assert.notEqual(a.engine.state().transport.card, first.card);
 });

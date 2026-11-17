@@ -11,7 +11,7 @@ export function DirectoryPanel({ state, refresh }: { state: State; refresh: () =
   return (
     <Panel title="Directory">
       <h3>Identities</h3>
-      {state.directory.length === 0 ? <p className="muted">No other identity has announced on this share yet.</p> : (
+      {state.directory.length === 0 ? <p className="muted">No other identity is known yet.</p> : (
         <ul className="list">
           {state.directory.map((d) => (
             <li key={d.fp} className="row">

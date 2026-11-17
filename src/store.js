@@ -14,9 +14,22 @@ export const FILES = {
   outbox: 'outbox.json',
   cursors: 'cursors.json',
   notify: 'notify.json',
+  peerCursors: 'peer-cursors.json',
+  contacts: 'contacts.json',
 };
 
-export const DEFAULT_SETTINGS = { name: null, shareDir: null, notifyTarget: null };
+export const DEFAULT_SETTINGS = { name: null, transport: null, notifyTarget: null };
+
+// One-shot settings migration: {shareDir} becomes transport {kind:'file-share', dir} (null: none), and the
+// shareDir key is dropped. Resolves the settings as stored; writes only when something changed.
+async function migrateSettings(file) {
+  const raw = await readJson(file, {});
+  if (!Object.hasOwn(raw, 'shareDir')) return raw;
+  const { shareDir, ...rest } = raw;
+  const next = { ...rest, transport: rest.transport ?? (shareDir ? { kind: 'file-share', dir: shareDir } : null) };
+  await writeJson(file, next);
+  return next;
+}
 
 const toLine = (e) => `${JSON.stringify({ seq: e.seq, id: e.id, route: e.route, bytes: Buffer.from(e.bytes).toString('base64') })}\n`;
 
@@ -57,8 +70,9 @@ export function createStore(dataDir, { log = console } = {}) {
       await ensurePrivateDir(dataDir);
       const accepted = await readNdjson(file('accepted'), log);
       lastSeq = accepted.reduce((m, e) => Math.max(m, e.seq), 0);
+      const settings = await locked(() => migrateSettings(file('settings')));
       return {
-        settings: { ...DEFAULT_SETTINGS, ...(await readJson(file('settings'), {})) },
+        settings: { ...DEFAULT_SETTINGS, ...settings },
         pins: await readJson(file('pins'), {}),
         accepted,
         pending: await readNdjson(file('pending'), log),
@@ -66,6 +80,7 @@ export function createStore(dataDir, { log = console } = {}) {
         outbox: (await readJson(file('outbox'), [])).map((e) => ({ ...e, bytes: Buffer.from(e.bytes, 'base64') })),
         cursors: await readJson(file('cursors'), {}),
         notify: await readJson(file('notify'), { watermark: 0 }),
+        contacts: await readJson(file('contacts'), []),
       };
     },
     loadNotify: () => readJson(file('notify'), { watermark: 0 }),
@@ -102,6 +117,10 @@ export function createStore(dataDir, { log = console } = {}) {
     savePins: (p) => locked(() => writeJson(file('pins'), p)),
     saveCursors: (c) => locked(() => writeJson(file('cursors'), c)),
     saveNotify: (n) => locked(() => writeJson(file('notify'), n)),
+    saveContacts: (list) => locked(() => writeJson(file('contacts'), list)),
+    // {peerFp: {routeKey: seq}}: the TCP transport's pull cursors.
+    loadPeerCursors: () => readJson(file('peerCursors'), {}),
+    savePeerCursors: (c) => locked(() => writeJson(file('peerCursors'), c)),
   };
 }
 

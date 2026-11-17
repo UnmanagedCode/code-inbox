@@ -6,7 +6,7 @@ Every wire format code-inbox owns, and the cc routes it uses. The record codec l
 
 ### Envelope
 
-The bytes of a record (a file on the share) are exactly:
+The bytes of a record (a file on the share, a TCP frame's `rec`, a contact card's payload) are exactly:
 
 ```
 {"v":1,"key":"<b64url raw public key>","payload":"<b64url payload JSON>","sig":"<b64url signature>"}
@@ -55,7 +55,7 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 | Type | Fields | Route | Accepted when | Pending while |
 |---|---|---|---|---|
-| `announce` | `name`, `addr: string[]` (`[]` on the file share) | directory | always (it certifies its own key) | — |
+| `announce` | `name`, `addr: string[]` (`[]` on the file share; `["tcp://host:port"]` over TCP) | directory | always (it certifies its own key) | — |
 | `inbox-create` | `inbox`, `nonce`, `name` | directory | the id recomputes | — |
 | `invite` | `to`, `kind: personal\|shared`, `inbox`, `nonce` | mailbox(`to`) | personal: the id recomputes. Shared: the id recomputes from signer + nonce and the `inbox-create` is known (`NOT_OWNER` otherwise) | shared: the `inbox-create` is unseen |
 | `invite-response` | `to`, `invite` (record id), `inbox`, `accept: boolean` | mailbox(`to` = inviter) | the invite's `to` is the signer, its signer is `to`, same inbox (`RESPONSE_MISMATCH`) | the invite is unseen |
@@ -123,7 +123,13 @@ The owner's install writes the `member add` itself when it accepts the invitee's
 
 A route says where a record travels: `{kind:'directory'}`, `{kind:'mailbox', fp}`, `{kind:'inbox', id}`. `routeFor(payload)` (`src/records.js`) gives each type's route (table above).
 
-**Route binding** (the engine, for every transport): the record arrived on `routeFor(payload)`, and from writer `payload.signer`. With the signature covering `inbox` and `to`, this is what rejects a record replayed into another inbox, mailbox or writer subdir.
+**Route binding** (the engine, for every transport): the record arrived on `routeFor(payload)`, and from writer `payload.signer`. With the signature covering `inbox` and `to`, this is what rejects a record replayed into another inbox, mailbox, writer subdir or session.
+
+| Transport | `writer` is |
+|---|---|
+| File share | the fingerprint subdir the file sits in |
+| TCP | the frame's `from`: an identity the remote proved on that session (any other `from` closes the session) |
+| Contact-card import | the announce's own signer. Only an `announce` is accepted this way (`CARD_INVALID` otherwise) |
 
 ### File share (`<shareDir>/code-inbox/v1/`, `SHARE_ROOT`)
 
@@ -138,6 +144,72 @@ inboxes/<inboxId>/<signerFp>/<ts13>-<rand32hex>.rec
 - Readers skip writer subdirs and record files that are symlinks, and open files without following links.
 - Readers offer only names matching `FILE_RE` (`^\d{13}-[0-9a-f]{32}\.rec$`, `src/transport/fileShare.js`) in subdirs that are a fingerprint. That skips tmp files and sync-client conflict copies.
 
+## TCP wire format
+
+Owned by `src/transport/frames.js` (framing, schemas, limits), `src/transport/handshake.js` (proofs) and `src/transport/tcpSession.js` (phases, timeouts). Behaviour on top of it: [transport.md → Direct TCP](transport.md#direct-tcp-srctransporttcpjs).
+
+### Framing
+
+- Every frame: a 4-byte unsigned big-endian length, then that many bytes of UTF-8 JSON: one object with a string `t`.
+- A length above the current phase's limit closes the connection as soon as the 4 header bytes arrive, before any body is buffered. A zero length, invalid JSON, an unknown `t`, a frame the phase does not allow, or any schema failure closes the session, after `bye {reason}` where possible.
+- Every frame is checked against an exact schema: exactly the keys listed, fingerprints matching `FP_RE`, routes passing `isRoute`, ids and seqs safe integers, bounded arrays, record bytes as canonical base64url decoding to 1..`RECORD_MAX_BYTES` bytes.
+
+| Constant | Where | Bounds |
+|---|---|---|
+| `TCP_HELLO_FRAME_MAX` | `frames.js` | every frame before the session is ready |
+| `TCP_FRAME_MAX` | `frames.js` | every frame after |
+| `TCP_BATCH_BYTES` | `frames.js` | record bytes a server packs into one `recs` |
+| `TCP_MAX_IDENTITIES` | `frames.js` | ids in one `prove`; identities on one endpoint |
+| `TCP_PULL_ROUTES_MAX` | `frames.js` | routes in one `pull` / `recs` |
+| `TCP_WHOIS_MAX` | `frames.js` | fingerprints in one `whois`, records in one `cards` |
+| `TCP_HANDSHAKE_MS` | `tcpSession.js` | the whole handshake; then the connection is destroyed |
+| `TCP_FRAME_MS` | `tcpSession.js` | a post-ready frame, from its first byte to its last |
+| `TCP_PING_MS`, `TCP_IDLE_MS` | `tcpSession.js` | keepalive interval; nothing received for this long closes |
+| `TCP_REQUEST_MS` | `tcpSession.js` | a `pull` or `whois` without its answer fails |
+| `TCP_INBOUND_QUEUE`, `TCP_WRITE_BUFFER_MAX` | `tcpSession.js` | frames queued before the socket pauses; unflushed bytes before it is destroyed |
+
+### Handshake
+
+`PROOF_DOMAIN` = `"code-inbox/tcp-proof/v1\0"` (distinct from the record domain `"code-inbox/v1\0"`).
+
+```
+proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON.stringify([role, proverNonce, verifierNonce, bound]))
+  role  = "dial" | "accept"
+  bound = dial:   the target fingerprint the dialer means to reach
+          accept: the dialer's proven fingerprints, sorted, joined with ","
+```
+
+| Step | Dialer (D) | Acceptor (A) |
+|---|---|---|
+| 1 | on connect: `{t:'hello', v:1, nonce:nD}` (32 random bytes, 64 hex) | on accept: `{t:'hello', v:1, nonce:nA}` |
+| 2 | on A's hello: `{t:'prove', target, ids:[{key, sig}]}`, one per local identity, `sig` over `proofBytes('dial', nD, nA, target)` | — |
+| 3 | — | checks `target` is attached here, 1..`TCP_MAX_IDENTITIES` ids, each `key` 32 bytes whose `sig` verifies, no repeated key, none of A's own fingerprints. Failure: `bye PROOF`, close; **A has signed nothing**. Success: `{t:'prove', ids:[…]}` over `proofBytes('accept', nA, nD, sortedDialerFps)` |
+| 4 | checks A's ids the same way (role `accept`, bound = D's own sorted fingerprints) and that `target` is among them. Failure: `bye PROOF`. Success: `{t:'ok'}` → **ready** | on `ok` → **ready** |
+
+`key` is the raw Ed25519 public key and `sig` the signature, both base64url; a proven fingerprint is sha256 of `key`, as for records.
+
+### Session frames (after ready)
+
+`from` must be an identity the remote proved on the session (else `bye PROTOCOL`); `to` must be attached locally (else the frame is dropped and counted).
+
+| `t` | Fields | Meaning |
+|---|---|---|
+| `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise |
+| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since` |
+| `recs` | `id, from, to, routes:[{route, status:'ok'\|'denied', recs:[{seq, rec}], more, head}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route has `recs:[]`, `more:false`. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq |
+| `whois` | `id, from, to, fps` | Ask for the current announces of `fps` |
+| `cards` | `id, from, to, recs:[rec]` | Answer to `whois`: dial hints only, never ingested |
+| `ping` / `pong` | — | Keepalive every `TCP_PING_MS` |
+| `bye` | `reason`: `PROOF`, `PROTOCOL`, `DUPLICATE`, `LIMIT`, `STOP` | Sent before a deliberate close |
+
+### Addresses
+
+`tcp://<host>:<port>` with host a DNS name, an IPv4 address, or `[IPv6]`, port 1–65535 (`parseTcpAddr` / `formatTcpAddr`, `src/transport/tcp.js`). Entries of `announce.addr` in any other form are ignored.
+
+### Contact card
+
+`CARD_PREFIX` (`"code-inbox-card:v1:"`, `src/records.js`) followed by the base64url of an announce record's bytes. `decodeCard` trims the text, requires the prefix and canonical base64url of at most `RECORD_MAX_BYTES` bytes; the record then goes through `decodeRecord` and must be an `announce` signed by another identity (`CARD_INVALID` otherwise).
+
 ## REST routes
 
 All under the backend root; the page calls them relative (`api/...`). Every HTTP answer carries the CSP (`CSP`, `src/http.js`), `nosniff`, `no-referrer` and `no-store`; the bare 400 for a request Node cannot parse (`clientError`) carries only the CSP and `nosniff`. A malformed percent-escape in a path segment is 400 `BAD_REQUEST`.
@@ -149,11 +221,13 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | Route | Body | Answer |
 |---|---|---|
 | `GET api/health` | — | `{ok: true}` |
-| `GET api/state` | — | `{identity, share, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`) |
+| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, addresses, card, cardStale, error}`: `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the configured TCP listener could not start |
 | `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, in acceptance order |
 | `GET api/sessions` | — | `{sessions: [{sessionId, label, status, live}], target, autoStart}`: cc's top-level conductors; 503 `CONDUCTOR_UNAVAILABLE` without cc |
 | `POST api/identity` | `{name}` | `{name}` |
-| `POST api/share` | `{dir}` | `{shareDir}` |
+| `POST api/share` | `{dir}` | `{shareDir}`; makes the file share the transport. `SHARE_INVALID` 400 |
+| `POST api/tcp` | `{host?, port?, advertise?}` | `{host, port, advertise, addresses}`; makes TCP the transport (`validateTcpConfig`). `TCP_INVALID` 400, `TCP_LISTEN_FAILED` 409 (no transport is configured after it) |
+| `POST api/contacts` | `{card}` | `{fp, name, shown}`: the imported identity. `CARD_INVALID` 400 |
 | `POST api/announce` | `{}` | `{id}` |
 | `POST api/invites` | `{to}` (fingerprint) | `{id, inbox}` |
 | `POST api/invites/:id/respond` | `{accept: boolean}` | `{id}` |
@@ -162,7 +236,7 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | `POST api/inboxes/:id/join` | `{}` | `{id}` |
 | `POST api/join-requests/:id/respond` | `{accept: boolean}` | `{id}` (a `member` record or a `join-response`) |
 | `POST api/inboxes/:id/members/:fp/remove` | `{}` | `{id}` |
-| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `SHARE_UNCONFIGURED` 409, `SHARE_UNSAFE` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
+| `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `TRANSPORT_UNCONFIGURED` 409, `SHARE_UNSAFE` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
 | `POST api/notify` | `{sessionId}` or `{sessionId: null}` | `{target, autoStart}`; `SESSION_UNKNOWN` unless a top-level conductor |
 | `POST api/mcp` | cc's tool call | below |
 

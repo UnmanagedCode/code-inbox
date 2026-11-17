@@ -6,20 +6,44 @@ One page, opened from cc's navigation (**Inbox**). The overview stacks the panel
 
 Every refusal shows as `CODE: message` next to the control that caused it.
 
-### Identity and share
+### Identity
 
 | Control | Does | Refused with |
 |---|---|---|
 | **Save name** | Stores the name this install will announce | `NAME_INVALID` (outside `NAME_RE`), `NAME_TAKEN` (pinned here to another key), `NAME_CONFLICT` (another key announces it) |
-| **Save share** | Stores the share dir and starts scanning it | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath) |
-| **Announce** | Publishes the name and this install's key to the directory | `SHARE_UNCONFIGURED`, `NAME_MISSING`, `NAME_TAKEN`, `NAME_CONFLICT` |
+| **Announce** | Publishes the name, this install's key and its transport addresses (`announce.addr`) to the directory, and refreshes its contact card | `TRANSPORT_UNCONFIGURED`, `NAME_MISSING`, `NAME_TAKEN`, `NAME_CONFLICT` |
 
-The panel shows the install's fingerprint (first 32 hex, in groups of 4), its announced name and whether others can see it (`shown`, `NAME_TAKEN`, `NAME_CONFLICT`, or not announced yet), and the share dir.
+The panel shows the install's fingerprint (first 32 hex, in groups of 4), its announced name and whether others can see it (`shown`, `NAME_TAKEN`, `NAME_CONFLICT`, or not announced yet).
+
+### Transport
+
+One transport at a time: **File share** or **TCP (direct)**, picked with a radio. Installs on different transports cannot reach each other; the panel says so.
+
+| Control | Does | Refused with |
+|---|---|---|
+| **Save share** | Makes the file share the transport: stores the dir and starts scanning it | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath) |
+| **Save TCP** | Makes direct TCP the transport: listens on **Listen host** (empty: `127.0.0.1`) and **Port** (empty: `TCP_DEFAULT_PORT`, `src/transport/tcp.js`). **Advertised host** (shown once the host is not loopback; required for `0.0.0.0` / `::`) is what peers dial | `TCP_INVALID` (a bad host, port or advertised host), `TCP_LISTEN_FAILED` (the port is taken or not allowed; no transport is configured until a save succeeds) |
+
+- The panel shows the transport in use, the share dir or the addresses this install is reachable at, and a failed listener's `CODE: message`.
+- A listen host that is not loopback shows a warning: it opens a port to the network, and records travel unencrypted.
+- After changing the host or port, **Announce** again: peers dial the addresses in the last announce, and the contact card is marked stale until then.
+
+### Contacts (TCP only)
+
+TCP has no shared directory: installs find each other through contact cards and the announces exchanged when they connect.
+
+| Control | Does | Refused with |
+|---|---|---|
+| **Your contact card** + **Copy** | This install's current announce as a card (`code-inbox-card:v1:…`), copied to the clipboard to give to another human. "Announce to refresh your card" shows when there is none yet or its addresses are stale | — |
+| **Import** | Takes a pasted card: the identity appears in the directory, becomes a contact, and is dialed at once. Shows "Imported name (fingerprint)" | `CARD_INVALID` (not a card, not a valid announce, or this install's own) |
+
+- Importing the owner's card is enough to join a shared inbox: members then find each other through the connections they already have.
+- An identity that connects on its own appears in the directory too, but this install never dials an address it learned only from such a stranger.
 
 ### Directory
 
 - **Identities:** every other install whose name is shown, with its fingerprint. **Invite to personal inbox** sends a personal invite (refused `INVITE_EXISTS` while one between the two is open or accepted).
-- **Shared inboxes:** every shared inbox on the share, its owner and member count. **Request to join** sends a join request to the owner (refused `ALREADY_MEMBER`, `REQUEST_EXISTS`).
+- **Shared inboxes:** every shared inbox this install knows of (on the share, or announced by a connected peer), its owner and member count. **Request to join** sends a join request to the owner (refused `ALREADY_MEMBER`, `REQUEST_EXISTS`).
 - **New shared inbox:** creates one owned by this install; its name follows `NAME_RE`.
 
 ### Invites and requests
@@ -40,7 +64,7 @@ The panel shows the install's fingerprint (first 32 hex, in groups of 4), its an
 
 - **Who can write:** a party of a personal inbox once the invite is accepted; a current member of a shared inbox (the owner included).
 - **Where it goes:** `POST api/inboxes/:id/messages`, the same engine path as the agents' `send_message` (`engine.sendMessage`). The message is signed with the install key, appears in the inbox for every party or member, and comes back in the same list agents read.
-- **On a refusal** (`NOT_MEMBER`, `INBOX_UNKNOWN`, `SHARE_UNCONFIGURED`, `SHARE_UNSAFE`, `BODY_TOO_LARGE`, `BAD_REQUEST` for an empty body) the box keeps the typed text and shows the code and reason. On success it clears and the list reloads.
+- **On a refusal** (`NOT_MEMBER`, `INBOX_UNKNOWN`, `TRANSPORT_UNCONFIGURED`, `SHARE_UNSAFE`, `BODY_TOO_LARGE`, `BAD_REQUEST` for an empty body) the box keeps the typed text and shows the code and reason. On success it clears and the list reloads.
 - **Ctrl/⌘+Enter** sends.
 
 Every body and name renders as React text, whoever wrote it: the local human, an agent or a peer.

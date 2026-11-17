@@ -168,3 +168,22 @@ function decodeUnsafe(bytes) {
   if (!check.ok) return check;
   return { ok: true, id: recordId(payloadBytes), payload };
 }
+
+// ---- contact cards ----
+
+// A contact card is a signed announce, pasted between humans: CARD_PREFIX + base64url(record bytes).
+export const CARD_PREFIX = 'code-inbox-card:v1:';
+
+export const encodeCard = (bytes) => `${CARD_PREFIX}${Buffer.from(bytes).toString('base64url')}`;
+
+// The record bytes a card carries, or null: the trimmed text must be CARD_PREFIX + canonical base64url of at most
+// RECORD_MAX_BYTES. The bytes still go through decodeRecord.
+export function decodeCard(text) {
+  if (typeof text !== 'string') return null;
+  const t = text.trim();
+  if (!t.startsWith(CARD_PREFIX)) return null;
+  const body = t.slice(CARD_PREFIX.length);
+  if (!body || body.length > Math.ceil((RECORD_MAX_BYTES * 4) / 3)) return null;
+  const bytes = b64urlBytes(body);
+  return bytes && bytes.length <= RECORD_MAX_BYTES ? bytes : null;
+}

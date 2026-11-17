@@ -22,9 +22,33 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 - The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (directory records: every known identity).
 - Recipients in `pending` (or all of them, if `send` throws) go to the outbox and are re-sent on `peerOnline(fp)` and on every `engine.sync()`.
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
-- `writer` is what route binding compares with `payload.signer`.
+- `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP.
 - `assertTransport` checks the shape of every transport the engine is given.
 - `tests/transportContract.test.mjs` runs one contract against every implementation.
+
+### The factory and the engine view
+
+The engine builds its transport with `makeTransport(config, view)` (`server.js` → `transportFactory`):
+
+- `config` is `settings.transport`: `{kind:'file-share', dir}` or `{kind:'tcp', host, port, advertise}`.
+- `view` is a read-only engine object. Its functions are synchronous, read in-memory state and never take the engine lock. The file share ignores it; over TCP the peer is the store, so the transport needs it to serve pulls and to choose whom to dial.
+
+| `view.` | Returns | Source |
+|---|---|---|
+| `addrsOf(fp)` | `string[]`: the `addr` of `fp`'s current announce (shown or not), else `[]` | `directory()` |
+| `announceOf(fp)` | the bytes of `fp`'s current announce, or `null` | `directory()` identity `id` → the engine's announce bytes |
+| `contacts()` | the dial set: card-imported identities (`contacts.json`), counterparties of records this install signed (`to`, `member`), parties and members of every inbox it belongs to | `contactsOf` (`src/state.js`) |
+| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied', head}` | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq |
+
+`mayRead(index, reader, route)`: the directory to any proven identity; a mailbox to its owner; a personal inbox to its inviter and invitee; a shared inbox to its current members; nothing else.
+
+### Selecting a transport
+
+One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise}`.
+
+- The file share reports every recipient delivered (the share stores everything), so a composite with TCP would drop a TCP-only peer's outbox entry.
+- Route binding requires writer = signer on the share and writer = the proven `from` over TCP, so an install could not relay between the two groups anyway.
+- Consequence: installs on the file share and installs on TCP cannot reach each other. A group picks one medium.
 
 ## File share (v1, `src/transport/fileShare.js`)
 
@@ -38,17 +62,110 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 
 Layout and filename rules: [protocol.md → Routes and the share layout](protocol.md#routes-and-the-share-layout).
 
-## Sketched follow-ups (not built)
+## Direct TCP (`src/transport/tcp.js`)
 
-Both fit the interface unchanged. The only engine additions they need are a contact-card import action and a per-peer `sync` cursor.
+Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md#tcp-wire-format).
 
-| Interface concern | Direct TCP (`tcp.js`) | Hub client (`hubClient.js`) |
-|---|---|---|
-| Addressing | Always by fingerprint. One endpoint can carry several identities: the handshake proves possession of each served key by signing a challenge, then frames are `{from, to, route, bytes}`. One pooled connection per endpoint multiplexes every identity behind it; `from` becomes `writer` | Registers the fingerprints it serves with the hub, proving each with a challenge signature. The hub forwards by recipient fingerprint only |
-| `addresses()` / `announce.addr` | `tcp://host:port` | `hub+wss://host/` (rendezvous) |
-| `send(..., {to})` | Looks up each recipient's announced `addr`; reachable ones are `delivered`, unreachable ones `pending` | Recipients the hub reports offline are `pending`. The hub stores nothing |
-| Offline peers | Engine outbox + `peerOnline` when a connection comes up | Engine outbox + `peerOnline` from the hub's presence notices |
-| Push vs poll | `push: true`: inbound frames call `sink.record` | `push: true` |
-| No global listing | `directory: false`. Announces travel as contact cards (a signed announce pasted in the page), plus announces exchanged at the handshake | `directory: false`, same contact cards |
-| `sync()` | Asks connected peers for records on the routes of interest since a cursor | Same, through the hub to online peers |
-| Trust | Every record still goes through `decodeRecord` + route binding + `classify`. The transport is never trusted | The hub is never trusted for authenticity. Replays are deduplicated by record id; drops are recovered by the outbox and `sync` |
+| Concern | Answer |
+|---|---|
+| `capabilities` | `{directory: false, push: true}` |
+| `addresses()` | `[tcp://<advertise>:<bound port>]` once listening, else `[]` |
+| `send` | A `rec` frame to each recipient with a ready session whose write buffer is under `TCP_WRITE_BUFFER_MAX`: `delivered`. Everyone else is `pending`; pending recipients in the dial set are dialed in the background |
+| Push | Inbound `rec` frames call `sink.record` when the route is in the addressed identity's interest; otherwise they are dropped and counted |
+| `sync()` | Runs `maintain` and awaits it |
+| `peerOnline` | Fires for every remote fingerprint when a session becomes ready |
+| No directory | Identities find each other through contact cards (a signed announce pasted on the page) and the announces pulled at every handshake |
+
+### Endpoint and bindings
+
+- `createTcpEndpoint({host, port, advertise, limits, now, schedule, syncMs, log})` → `{attach(binding), stats(), close()}`. One listener and one pool of sessions serve every identity attached to it. `createTcp(opts)` = one endpoint with one binding: what `server.js` uses.
+- `binding = {identity: proofSigner(identity), view, cursors: {load(), save(obj)}}`. The transport only ever holds `signProof` (handshake proofs), never a general `sign`.
+- The listener starts on the first `start()`. Starting or stopping a binding on a live endpoint closes its sessions: they re-handshake with the new identity set when next needed.
+- `stop()` closes the listener **synchronously, before anything is awaited**, then every socket, and never awaits a pending sink call. Re-saving TCP settings on the same port therefore rebinds at once, under the engine lock.
+- `stats()` → `{listening, connections, handshaking, sessions: [{role, remote: [fp]}], handshakeFailures, dropped}`. The Transport object exposes it too (tests and the multi-identity checks use it).
+- `validateTcpConfig({host, port, advertise})`: host an IP literal or hostname (default `127.0.0.1`); port an integer 0–65535 (default `TCP_DEFAULT_PORT`; 0 = ephemeral); `advertise` defaults to host and is required (and must not be a wildcard) when host is `0.0.0.0` or `::`. Otherwise `TCP_INVALID`.
+
+### Pooling and duplicates
+
+- The pool maps each remote fingerprint to one ready session. Two endpoints share one session for all of their identities.
+- **Duplicate rule:** when a session becomes ready for a fingerprint that already has one, the session kept is the one whose dialer's smallest proven fingerprint sorts lowest; on a tie, the older. Only the losing session's dialer closes it (`bye DUPLICATE`), so both sides agree without a further message.
+- When a pooled session closes, another ready session proving that fingerprint takes its place.
+
+### Dial policy
+
+- The transport dials only `view.contacts()` and the `fp` of a `mailbox` route it is sending on. It never dials a stranger whose announce arrived on an inbound session; that stranger still gets records over its live session, and through the outbox when it reconnects.
+- Addresses: the `tcp://` entries of `view.addrsOf(fp)`, plus whois hints (below). Other schemes are ignored.
+- Dials are deduplicated per address. A failed dial (refused, or a handshake that does not complete) backs that address off from `TCP_REDIAL_MIN_MS`, doubling up to `TCP_REDIAL_MAX_MS`; a successful handshake resets it. Backoff is clock-based: nothing redials until a send or `maintain` asks.
+- Caps: `TCP_MAX_CONNECTIONS` total, `TCP_MAX_HANDSHAKING` handshaking. An inbound socket beyond either is destroyed at accept; no dial starts beyond the total.
+
+### Maintain, pulls and cursors
+
+`maintain` runs at `start`, every `syncMs` (`TCP_SYNC_MS`) and on `sync()`. Per binding, maintain runs and pulls queue behind each other and never overlap.
+
+1. **Whois:** for every contact without a session and without any address, ask every connected session for its announce.
+2. **Dial** contacts without a session (backoff permitting), awaiting each handshake.
+3. **Pull** every route of interest from every remote fingerprint on every session.
+
+- **On session ready:** `peerOnline(fp)` for every remote fingerprint and local binding, then a pull of that binding's interest from it. The directory route is always in the interest, so this is the announce exchange at the handshake.
+- **New routes:** `setInterest` schedules (never awaits; it runs under the engine lock) a pull of each newly added route from every session.
+- **A pull** asks for records signed by the remote identity on each route with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress.
+- **Cursors** are per (peer fp, route key), persisted in `peer-cursors.json`. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
+- **Delivered** means written to a ready session under the write-buffer cap; `send` never waits for the flush because it runs under the engine lock. A frame lost on a dying socket is recovered by the pull on reconnect and by the periodic pull.
+
+### Route binding over TCP
+
+- **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine still checks `payload.signer === writer` and `routeFor(payload) === route`. A peer therefore pushes and serves only records it signed itself; a relayed third-party record is refused `ROUTE_MISMATCH`, like a file in the wrong share subdir.
+- **Contact-card import** is the one path where the writer is not a transport identity: `engine.importCard` accepts only an `announce` and ingests it with route `directory` and writer = its signer. Every other check still runs.
+- **Whois hints are never ingested.** A `cards` reply is used only for the `tcp://` addresses of announces that decode, are `announce`s, and are signed by a fingerprint that was asked for. The engine receives that identity's announce from the identity itself, by the pull after the handshake. A forged or mismatched hint is dropped; a hint pointing at the wrong place fails the handshake proof.
+
+### Known limitations
+
+- **A member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time; another member or the owner cannot pass it on.
+- **Both ends must be online at once** (or the sender keeps the record in its outbox until the recipient reconnects).
+- **Plaintext, loopback by default** (below).
+
+### TCP security
+
+1. **Open port, default binding.**
+   - The listener binds `127.0.0.1` unless a human saves a non-loopback host; the page warns when the host is not loopback. A wildcard host needs an explicit advertised host.
+   - `POST api/tcp` sits behind the mutating-request guard (`Sec-Fetch-Site`/`Origin`, JSON only). Like every REST route, any local process can call it.
+2. **Plaintext, by design.** An on-path observer reads every record (bodies, names, membership, proven fingerprints), sees which identities share an endpoint and when installs pull. The advertised host is in the signed, public announce. With no session keys there is **no per-frame authentication after the handshake**: an on-path attacker can drop or inject frames. An injected frame cannot forge a record (every record still passes `decodeRecord`, route binding and `classify`); an injected `pull` only makes the server send records into a stream the attacker already reads. Drops are recovered by the outbox and by pulls.
+3. **Framing limits.**
+   - The frame size limit depends on the phase (`TCP_HELLO_FRAME_MAX` before ready, `TCP_FRAME_MAX` after) and is enforced from the 4-byte header, before the body is buffered.
+   - Every frame has an exact schema; anything else closes the session.
+   - Deadlines: the whole handshake within `TCP_HANDSHAKE_MS`; a started post-ready frame within `TCP_FRAME_MS`; nothing received for `TCP_IDLE_MS` closes. Together they bound slowloris and partial frames.
+   - The inbound queue pauses the socket at `TCP_INBOUND_QUEUE` frames; more than `TCP_WRITE_BUFFER_MAX` unflushed bytes destroys it.
+   - Connection caps (`TCP_MAX_CONNECTIONS`, `TCP_MAX_HANDSHAKING`) bound memory. There is no per-IP fairness: availability against a hostile flooder is out of scope.
+4. **Handshake replay and binding.**
+   - Each side contributes a fresh 32-byte random nonce per connection and both are signed, so a proof recorded on one connection fails on any other. No clock is involved.
+   - A role label stops a dial proof being presented as an accept proof, and the reverse.
+   - The dialer's proof names the **target fingerprint**; the acceptor's names the **dialer's fingerprints**. If M gets A to dial M and replays A's proof to B, the proof names M as its target and M is not attached at B, so B refuses. M cannot reuse B's accept proof either: it is bound to M's own fingerprints. The dialer also refuses an acceptor that does not prove the target it dialed.
+   - `PROOF_DOMAIN` differs from the record domain: no handshake signature is ever a record signature.
+   - The transport holds only `signProof`. A remote proving one of this endpoint's own fingerprints is refused.
+5. **What an unauthenticated connection can make the process do:** take one connection slot and one handshake slot; generate one 32-byte nonce and write one `hello` (about 100 bytes); buffer at most `TCP_HELLO_FRAME_MAX`; parse at most three small JSON frames; run up to `TCP_MAX_IDENTITIES` Ed25519 verifies. It cannot cause any signing, any sink or engine call, any disk write, any dial, or a log line (failures are counted in `stats().handshakeFailures`). It learns nothing about the identities served, because the acceptor proves second.
+6. **Authority after the proof.**
+   - The writer is the proven `from`: pushes and pulls carry only the sender's own records.
+   - A `pull` is gated by `mayRead`: inbox records go only to its parties or current members, a mailbox only to its owner. This is least privilege, not confidentiality (see 2).
+   - Pushes on routes outside the addressed identity's interest are dropped, as the share reads only routes of interest.
+   - `whois` replies never reach the engine; card import accepts only announces.
+7. **Dial-hint residue.** A dial address comes from an announce: one a contact signed (pulled from it or imported from its card), or one fetched by `whois` and signed by the contact asked about. Such an address can name any host and port. So **an identity in the dial set (an inbox owner or member, a card a human imported, a counterparty) can steer this process into a TCP connect plus one `hello` frame to an address of its choosing.** What bounds it:
+   - only identities in the dial set can do it; a stranger's announce never causes a dial (dial policy);
+   - each address is dialed at most once per backoff period, so a failing target is retried at most at the backoff schedule;
+   - before the remote proves the target identity, only the `hello` frame (a version and a random nonce) is sent: no proof, record, or identity leaves the process.
+
+## Sketched follow-up (not built): hub client (`hubClient.js`)
+
+| Interface concern | Hub client |
+|---|---|
+| Addressing | Registers the fingerprints it serves with the hub, proving each with a challenge signature. The hub forwards by recipient fingerprint only |
+| `addresses()` / `announce.addr` | `hub+wss://host/` (rendezvous) |
+| `send(..., {to})` | Recipients the hub reports offline are `pending`. The hub stores nothing |
+| Offline peers | Engine outbox + `peerOnline` from the hub's presence notices |
+| Push vs poll | `push: true` |
+| No global listing | `directory: false`, same contact cards as TCP |
+| `sync()` | Same pulls as TCP, through the hub to online peers |
+| Trust | The hub is never trusted for authenticity. Replays are deduplicated by record id; drops are recovered by the outbox and `sync` |
+
+**What it reuses from TCP:** `frames.js`, `handshake.js` and `tcpSession.js` unchanged. Every session frame carries `from`/`to` fingerprints, so a routing-only hub forwards `rec`/`pull`/`recs`/`whois`/`cards` by `to` without parsing records. A client proves its identities to the hub with the same `prove` (role `dial`, target = the hub's fingerprint). Per-peer cursors, `view.serve`, `mayRead`, the dial policy and the outbox/`peerOnline` contract carry over.
+
+**What it must decide:** through a hub, `from` is attested only by the hub, so writer binding degrades to "the hub says"; signatures are unaffected. The fix is to tunnel the endpoint-to-endpoint `hello`/`prove`/`ok` as frames addressed through the hub; the frame format already allows it.

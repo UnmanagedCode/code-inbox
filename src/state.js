@@ -273,12 +273,13 @@ export const isValidMessage = (index, rec) => verdictOf(index, rec).verdict === 
 // The identities this install knows, with the name rules applied (docs/protocol.md → Names):
 // a name pinned to another key → hidden NAME_TAKEN; an unpinned name with several claimants → all hidden
 // NAME_CONFLICT; an unpinned name with one claimant → shown, and returned in `newPins` for the engine to persist.
-// Resolves {identities: Map fp → {fp, name, ts, shown, reason}, newPins: {name: fp}}.
+// Resolves {identities: Map fp → {fp, id, name, ts, addr, shown, reason}, newPins: {name: fp}}: `id` is the current
+// announce's record id.
 export function directory(index, pins) {
   const identities = new Map();
   for (const [fp, recs] of index.announces) {
     const cur = [...recs].sort(cmpTsId).at(-1);
-    identities.set(fp, { fp, name: cur.payload.name, ts: cur.payload.ts, addr: cur.payload.addr, shown: false, reason: null });
+    identities.set(fp, { fp, id: cur.id, name: cur.payload.name, ts: cur.payload.ts, addr: cur.payload.addr, shown: false, reason: null });
   }
   const byName = new Map();
   for (const ident of identities.values()) push(byName, ident.name, ident);
@@ -389,4 +390,32 @@ export function interestOf(index, self) {
   for (const inv of index.invites.values()) if (inv.payload.kind === 'shared' && inv.payload.to === self) ids.add(inv.payload.inbox);
   for (const req of index.joinRequests.values()) if (req.payload.signer === self) ids.add(req.payload.inbox);
   return [{ kind: 'directory' }, { kind: 'mailbox', fp: self }, ...[...ids].sort().map((id) => ({ kind: 'inbox', id }))];
+}
+
+// ---- what a peer may read, whom to dial (the TCP transport) ----
+
+// Whether `reader` (a proven fingerprint) may pull this install's records on `route`: the directory is public; a
+// mailbox only its owner; a personal inbox its two parties; a shared inbox its current members.
+export function mayRead(index, reader, route) {
+  if (route.kind === 'directory') return true;
+  if (route.kind === 'mailbox') return reader === route.fp;
+  if (route.kind !== 'inbox') return false;
+  const inv = personalInvite(index, route.id);
+  if (inv) return reader === inv.payload.signer || reader === inv.payload.to;
+  return !!currentMembers(index, route.id)?.has(reader);
+}
+
+// The identities `self` has a relationship with, so may dial: `imported` (card imports), the counterparties of
+// records it signed (`to`, `member`), and the parties and members of every inbox it belongs to. Never `self`.
+export function contactsOf(index, self, imported) {
+  const set = new Set(imported);
+  for (const r of index.byId.values()) {
+    const p = r.payload;
+    if (p.signer !== self) continue;
+    if (typeof p.to === 'string') set.add(p.to);
+    if (p.type === 'member') set.add(p.member);
+  }
+  for (const b of inboxesOf(index, self)) for (const fp of b.members) set.add(fp);
+  set.delete(self);
+  return [...set];
 }

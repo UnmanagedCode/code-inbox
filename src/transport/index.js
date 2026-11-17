@@ -5,7 +5,8 @@ import { FP_RE, ID_RE } from '../records.js';
 //
 /** @typedef {{kind:'directory'} | {kind:'mailbox', fp:string} | {kind:'inbox', id:string}} Route */
 /** @typedef {{route: Route, writer: string, bytes: Uint8Array}} Incoming
- *  `writer` is the fingerprint the transport attributes the record to (the file share: the writer subdir). */
+ *  `writer` is the fingerprint the transport attributes the record to: on the file share the writer subdir, over
+ *  TCP the frame's `from`, an identity the remote proved on that session. */
 /** @typedef {{record(i: Incoming): Promise<{retry: boolean}>, peerOnline(fp: string): void}} Sink
  *  `record` resolves {retry:true} when the bytes may still be incomplete and should be offered again. */
 /**

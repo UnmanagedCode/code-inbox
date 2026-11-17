@@ -2,13 +2,14 @@ import { EventEmitter } from 'node:events';
 import { CodedError } from './errors.js';
 import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
-import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeRecord, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
+import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addPending, addRecord, addRejected, admissionDue, classify, createIndex, inboxVerdicts, isValidMessage, removePending, currentEpoch, currentMembers, directory, inboxesOf, interestOf, invalidMessages,
-  messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
+  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayRead, removePending, currentEpoch, currentMembers, directory, inboxesOf,
+  interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { validateShareDir } from './transport/fileShare.js';
+import { validateTcpConfig } from './transport/tcp.js';
 
 export const RECENT_REJECTS = 20;
 export const READ_LIMIT_DEFAULT = 50;
@@ -20,7 +21,8 @@ const refuse = (code, message) => { throw new CodedError(code, message); };
 
 // The install's protocol core: ingest (transport → verify → route binding → authorization → store) and every
 // action a human or agent can take. Surfaces (REST, MCP) call these and only map results onto their wire shapes.
-// `makeTransport(shareDir)` builds the transport for a configured share dir.
+// `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir} or
+// {kind:'tcp', host, port, advertise}); `view` is the read-only engine view a transport may need (docs/transport.md).
 export function createEngine({ store, identity, makeTransport, now = Date.now, log = console }) {
   const self = identity.fp;
   const events = new EventEmitter();
@@ -32,7 +34,11 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
   let outbox = [];
   const rejected = { count: 0, recent: [] };
   let transport = null;
+  let transportError = null;
   let interestKey = '';
+  let imported = []; // fingerprints of identities whose contact card a human imported
+  const ownLog = new Map(); // routeKey → [{seq, bytes}] of records signed by self, seq ascending
+  const announceBytes = new Map(); // announce record id → bytes
 
   function noteReject(reason, detail, id) {
     rejected.count += 1;
@@ -67,10 +73,19 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
   // ---- ingest ----
 
+  function remember(seq, id, payload, route, bytes) {
+    if (payload.type === 'announce') announceBytes.set(id, bytes);
+    if (payload.signer !== self) return;
+    const key = routeKey(route);
+    const list = ownLog.get(key);
+    if (list) list.push({ seq, bytes }); else ownLog.set(key, [{ seq, bytes }]);
+  }
+
   async function acceptRecord(rec, reactions) {
     const seq = await store.appendAccepted({ id: rec.id, route: rec.route, bytes: rec.bytes });
     const entry = { seq, id: rec.id, payload: rec.payload, route: rec.route };
     addRecord(index, entry);
+    remember(seq, rec.id, rec.payload, rec.route, rec.bytes);
     const p = rec.payload;
     if (p.type === 'msg') events.emit('message', { seq, id: rec.id, inbox: p.inbox, signer: p.signer });
     if (p.type === 'invite-response' && p.accept && p.to === self) reactions.push(rec);
@@ -223,7 +238,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
   // ---- guards ----
 
-  const requireShare = () => { if (!transport) refuse('SHARE_UNCONFIGURED', 'no share dir is configured: a human sets it in the code-inbox page'); };
+  const requireTransport = () => { if (!transport) refuse('TRANSPORT_UNCONFIGURED', 'no transport is configured: a human sets one in the code-inbox page'); };
   const requireFp = (fp, what = 'to') => { if (typeof fp !== 'string' || !FP_RE.test(fp)) refuse('BAD_REQUEST', `${what} must be a 64-hex fingerprint`); };
   function requireKnownIdentity(fp) {
     requireFp(fp);
@@ -267,6 +282,55 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     };
   }
 
+  // ---- what a transport may read (docs/transport.md → The engine view). Synchronous, in memory, lock-free. ----
+
+  // This install's own records on `route` with an acceptance seq past `since`, as many as fit in `budget` bytes,
+  // if `reader` may read the route.
+  function serve(reader, route, since, budget) {
+    const head = index.maxSeq;
+    if (!isRoute(route) || !mayRead(index, reader, route)) return { status: 'denied', head };
+    const list = ownLog.get(routeKey(route)) ?? [];
+    let lo = 0;
+    let hi = list.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid].seq <= since) lo = mid + 1; else hi = mid; }
+    const recs = [];
+    let used = 0;
+    for (; lo < list.length && used + list[lo].bytes.length <= budget; lo += 1) { recs.push(list[lo]); used += list[lo].bytes.length; }
+    return { status: 'ok', recs, more: lo < list.length, head };
+  }
+
+  const announceOf = (fp) => {
+    const id = dir().identities.get(fp)?.id;
+    return id ? announceBytes.get(id) ?? null : null;
+  };
+
+  const view = {
+    addrsOf: (fp) => dir().identities.get(fp)?.addr ?? [],
+    announceOf,
+    contacts: () => contactsOf(index, self, imported),
+    serve,
+  };
+
+  function transportView() {
+    const cfg = settings.transport;
+    const tcp = cfg?.kind === 'tcp' ? cfg : null;
+    const addresses = transport ? transport.addresses() : [];
+    const own = dir().identities.get(self);
+    const bytes = announceOf(self);
+    return {
+      kind: cfg?.kind ?? null,
+      configured: !!transport,
+      dir: cfg?.kind === 'file-share' ? cfg.dir : null,
+      host: tcp?.host ?? null,
+      port: tcp?.port ?? null,
+      advertise: tcp?.advertise ?? null,
+      addresses,
+      card: bytes ? encodeCard(bytes) : null,
+      cardStale: !!bytes && JSON.stringify(own.addr) !== JSON.stringify(addresses),
+      error: transportError,
+    };
+  }
+
   const listInboxes = () => {
     const ids = dir().identities;
     return inboxesOf(index, self).map((b) => inboxView(b, ids));
@@ -280,6 +344,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       const loaded = await store.load();
       settings = loaded.settings;
       pins = loaded.pins;
+      imported = loaded.contacts;
       cursors = loaded.cursors;
       outbox = loaded.outbox;
       index = createIndex();
@@ -287,6 +352,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
         const d = decodeRecord(e.bytes);
         if (!d.ok) { log.warn(`code-inbox: accepted record seq ${e.seq} no longer decodes (${d.reason}): skipped`); continue; }
         addRecord(index, { seq: e.seq, id: d.id, payload: d.payload, route: e.route });
+        remember(e.seq, d.id, d.payload, e.route, e.bytes);
       }
       for (const { id, ...info } of loaded.rejected) addRejected(index, id, info);
       for (const e of loaded.pending) {
@@ -298,8 +364,14 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
       await drainPending(reactions);
       if (index.pending.size !== loaded.pending.length) await store.savePending([...index.pending.values()]);
       await persistNewPins();
-      if (settings.shareDir) {
-        await startTransport(settings.shareDir);
+      if (settings.transport) {
+        try {
+          await startTransport(settings.transport);
+        } catch (err) {
+          if (err.code !== 'TCP_LISTEN_FAILED') throw err;
+          log.warn(`code-inbox: ${err.message}`);
+          return;
+        }
         await locked(() => reconcileAdmissions());
       }
     },
@@ -323,7 +395,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     ingest,
 
-    // ---- identity and share ----
+    // ---- identity, transport and contacts ----
 
     setName(name) {
       return locked(async () => {
@@ -339,16 +411,51 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     setShare(shareDir) {
       return locked(async () => {
         await validateShareDir(shareDir, store.dataDir);
-        settings = { ...settings, shareDir };
+        settings = { ...settings, transport: { kind: 'file-share', dir: shareDir } };
         await store.saveSettings(settings);
-        await startTransport(shareDir);
+        await startTransport(settings.transport);
         return { shareDir };
       });
     },
 
+    // Refused TCP_INVALID (validateTcpConfig) or TCP_LISTEN_FAILED (the port is taken or not allowed): then no
+    // transport is configured until a human saves settings that listen.
+    setTcp(input) {
+      return locked(async () => {
+        const cfg = validateTcpConfig(input);
+        settings = { ...settings, transport: { kind: 'tcp', ...cfg } };
+        await store.saveSettings(settings);
+        await startTransport(settings.transport);
+        return { ...cfg, addresses: transport.addresses() };
+      });
+    },
+
+    // Imports another identity's contact card: its announce is ingested as if its signer wrote it (route
+    // directory, writer = signer; every other check still runs), and the identity becomes a contact to dial.
+    async importCard(text) {
+      const result = await locked(async () => {
+        const bytes = decodeCard(text);
+        const d = bytes ? decodeRecord(bytes) : null;
+        if (!d?.ok) refuse('CARD_INVALID', `not a contact card${d ? ` (${d.reason})` : ''}`);
+        const p = d.payload;
+        if (p.type !== 'announce') refuse('CARD_INVALID', `a contact card carries an announce, not ${p.type}`);
+        if (p.signer === self) refuse('CARD_INVALID', 'that is this install\'s own card');
+        await admit({ id: d.id, payload: p, route: routeFor(p), bytes });
+        if (!imported.includes(p.signer)) {
+          imported = [...imported, p.signer];
+          await store.saveContacts(imported);
+        }
+        const ident = dir().identities.get(p.signer);
+        return { fp: p.signer, name: ident?.name ?? p.name, shown: !!ident?.shown };
+      });
+      // Outside the lock: dialing pulls, and a pull waits for the lock.
+      transport?.sync().catch((err) => log.warn(`code-inbox: syncing after a card import failed: ${err.message}`));
+      return result;
+    },
+
     announce() {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         const { name } = settings;
         if (!name) refuse('NAME_MISSING', 'set a name before announcing');
         const r = nameRefusal(index, pins, self, name);
@@ -361,7 +468,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     invite(to) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         requireKnownIdentity(to);
         for (const inv of index.invites.values()) {
           const p = inv.payload;
@@ -376,7 +483,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     respondInvite(inviteId, acceptIt) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         if (typeof acceptIt !== 'boolean') refuse('BAD_REQUEST', 'accept must be a boolean');
         const inv = typeof inviteId === 'string' ? index.invites.get(inviteId) : null;
         if (!inv || inv.payload.to !== self) refuse('INVITE_UNKNOWN', 'no invite to this install with that id');
@@ -390,7 +497,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     createSharedInbox(name) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         if (typeof name !== 'string' || !NAME_RE.test(name)) refuse('NAME_INVALID', 'an inbox name is 1–32 of A–Z a–z 0–9 . _ -, starting with a letter or digit');
         const nonce = newNonce();
         const inbox = sharedInboxId(self, nonce);
@@ -401,7 +508,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     inviteMember(inbox, to) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         const c = requireOwnedShared(inbox);
         requireKnownIdentity(to);
         if (currentMembers(index, inbox)?.has(to)) refuse('ALREADY_MEMBER', 'that identity is already a member');
@@ -414,7 +521,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     requestJoin(inbox) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         const c = typeof inbox === 'string' && ID_RE.test(inbox) ? sharedCreate(index, inbox) : null;
         if (!c) refuse('INBOX_UNKNOWN', `no shared inbox ${String(inbox).slice(0, 40)}`);
         if (currentMembers(index, inbox)?.has(self)) refuse('ALREADY_MEMBER', 'this install is already a member');
@@ -425,7 +532,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     respondJoin(requestId, acceptIt) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         if (typeof acceptIt !== 'boolean') refuse('BAD_REQUEST', 'accept must be a boolean');
         const req = typeof requestId === 'string' ? index.joinRequests.get(requestId) : null;
         if (!req || req.payload.to !== self) refuse('REQUEST_UNKNOWN', 'no join request to this install with that id');
@@ -438,7 +545,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     removeMember(inbox, member) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         requireOwnedShared(inbox);
         requireFp(member, 'member');
         if (member === self) refuse('BAD_REQUEST', 'the owner cannot remove itself');
@@ -453,7 +560,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
 
     sendMessage(inbox, body) {
       return locked(async () => {
-        requireShare();
+        requireTransport();
         const b = myInbox(inbox);
         if (typeof body !== 'string' || body.length === 0) refuse('BAD_REQUEST', 'body must be a non-empty string');
         const size = Buffer.byteLength(body, 'utf8');
@@ -539,7 +646,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
           announcedName: own?.name ?? null,
           nameStatus: own ? (own.shown ? 'shown' : own.reason) : 'unannounced',
         },
-        share: { dir: settings.shareDir, configured: !!transport },
+        transport: transportView(),
         directory: [...ids.values()].filter((i) => i.shown && i.fp !== self).map((i) => ({ fp: i.fp, fingerprint: formatFingerprint(i.fp), name: i.name })),
         sharedInboxes: sharedInboxes(index).map((s) => ({
           id: s.id, name: s.name, owner: person(s.owner, ids), memberCount: s.members?.length ?? null,
@@ -553,18 +660,30 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     },
   };
 
-  // Swaps in the transport for `shareDir`. The old one is stopped without waiting: its scan may be queued behind the
-  // engine lock the caller holds. Its sink ignores whatever it still offers.
-  async function startTransport(shareDir) {
+  // Swaps in the transport for `config`. The old one is stopped without waiting: its scan or pull may be queued
+  // behind the engine lock the caller holds. Its sink ignores whatever it still offers. A TCP listener that cannot
+  // bind leaves no transport configured and refuses TCP_LISTEN_FAILED.
+  async function startTransport(config) {
     const old = transport;
-    const t = assertTransport(makeTransport(shareDir));
+    const t = assertTransport(makeTransport(config, view));
     transport = t;
+    transportError = null;
     if (old) old.stop().catch((err) => log.warn(`code-inbox: stopping the previous transport failed: ${err.message}`));
     interestKey = '';
     refreshInterest();
-    await t.start({
-      record: (incoming) => (transport === t ? ingest(incoming) : Promise.resolve({ retry: false })),
-      peerOnline: (fp) => (transport === t ? locked(() => flushOutbox(fp)) : undefined),
-    });
+    try {
+      await t.start({
+        record: (incoming) => (transport === t ? ingest(incoming) : Promise.resolve({ retry: false })),
+        peerOnline: (fp) => {
+          if (transport === t) locked(() => flushOutbox(fp)).catch((err) => log.warn(`code-inbox: flushing the outbox failed: ${err.message}`));
+        },
+      });
+    } catch (err) {
+      if (transport === t) transport = null;
+      t.stop().catch(() => {});
+      if (config.kind !== 'tcp') throw err;
+      transportError = { code: 'TCP_LISTEN_FAILED', message: `cannot listen on ${config.host}:${config.port}: ${err.code ?? err.message}` };
+      throw new CodedError(transportError.code, transportError.message);
+    }
   }
 }

@@ -1,4 +1,4 @@
-// Entry: config → store → identity → engine (+ file-share transport) → notifier → MCP → HTTP app → listen on
+// Entry: config → store → identity → engine (+ the configured transport) → notifier → MCP → HTTP app → listen on
 // loopback. Behind a direct-run guard, so tests import `wire` to build whole installs in-process.
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -11,17 +11,27 @@ import { createNotifier } from './src/notifier.js';
 import { createApp } from './src/routes.js';
 import { createStore } from './src/store.js';
 import { createFileShare } from './src/transport/fileShare.js';
+import { proofSigner } from './src/transport/handshake.js';
+import { createTcp } from './src/transport/tcp.js';
 
-// Builds one install; the caller listens. `pollMs` and `schedule` override the defaults (tests).
+// The engine's transport factory: (settings.transport, engine view) → a Transport. `pollMs` and `tcpSyncMs`
+// override the file share's poll and the TCP maintain interval (tests).
+export function transportFactory({ identity, store, pollMs, tcpSyncMs, log }) {
+  return (config, view) => (config.kind === 'tcp'
+    ? createTcp({
+      host: config.host, port: config.port, advertise: config.advertise,
+      identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: tcpSyncMs, log,
+    })
+    : createFileShare({ shareDir: config.dir, selfFp: identity.fp, pollMs, log }));
+}
+
+// Builds one install; the caller listens. `pollMs`, `tcpSyncMs` and `schedule` override the defaults (tests).
 // Resolves {server, engine, notifier, mcp, identity, close}.
-export async function wire({ dataDir, distDir, env = process.env, pollMs, schedule, log = console }) {
+export async function wire({ dataDir, distDir, env = process.env, pollMs, tcpSyncMs, schedule, log = console }) {
   const store = createStore(dataDir, { log });
   await store.load(); // creates the data dir (0700) before the identity goes into it
   const identity = await loadIdentity(dataDir);
-  const engine = createEngine({
-    store, identity, log,
-    makeTransport: (shareDir) => createFileShare({ shareDir, selfFp: identity.fp, pollMs, log }),
-  });
+  const engine = createEngine({ store, identity, log, makeTransport: transportFactory({ identity, store, pollMs, tcpSyncMs, log }) });
   await engine.boot();
   const cc = createCc({ env, log });
   const notifier = createNotifier({ engine, cc, store, log, ...(schedule ? { schedule } : {}) });
