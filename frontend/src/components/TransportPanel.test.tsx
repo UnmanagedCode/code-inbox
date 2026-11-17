@@ -3,7 +3,7 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { TransportPanel, isLoopback, isWildcard } from './TransportPanel';
 import type { State, TransportView } from '../types';
 
-const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null };
+const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, url: null, hub: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null };
 const stateWith = (transport: Partial<TransportView> = {}, outbox = 0) => ({ transport: { ...NONE, ...transport }, diagnostics: { outbox } }) as unknown as State;
 
 function stubFetch() {
@@ -92,5 +92,36 @@ describe('TransportPanel', () => {
   it('shows the transport error code', () => {
     render(<TransportPanel state={stateWith({ kind: 'tcp', host: '127.0.0.1', port: 1, advertise: '127.0.0.1', error: { code: 'TCP_LISTEN_FAILED', message: 'cannot listen' } })} refresh={() => {}} />);
     expect(screen.getByRole('alert').textContent).toContain('TCP_LISTEN_FAILED');
+  });
+
+  // Invariant: the hub form posts exactly the address the human entered to the relative api/hub.
+  it('choosing Hub posts api/hub with the entered address', async () => {
+    const calls = stubFetch();
+    const refresh = vi.fn();
+    render(<TransportPanel state={stateWith()} refresh={refresh} />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Hub' }));
+    type('Hub address', ' hub://hub.example:47822 ');
+    fireEvent.click(screen.getByRole('button', { name: 'Save hub' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalled());
+    expect(calls).toEqual([{ url: 'api/hub', body: { url: 'hub://hub.example:47822' } }]);
+  });
+
+  // Invariant: the human sees whether the hub link is up, and the code of what keeps it down.
+  it('shows the hub connection state and its error', () => {
+    const hub = { kind: 'hub' as const, configured: true, url: 'hub://hub.example:47822' };
+    const { rerender } = render(<TransportPanel state={stateWith({ ...hub, hub: { connected: true, error: null } })} refresh={() => {}} />);
+    expect(screen.getByRole('status', { name: 'Hub connection' }).textContent).not.toContain('not');
+    rerender(<TransportPanel state={stateWith({ ...hub, hub: { connected: false, error: { code: 'HUB_DUPLICATE', message: 'another endpoint registered this identity' } } })} refresh={() => {}} />);
+    const status = screen.getByRole('status', { name: 'Hub connection' });
+    expect(status.textContent).toContain('not connected');
+    expect(status.textContent).toContain('HUB_DUPLICATE');
+  });
+
+  // Invariant: choosing the hub tells the human what the hub can see.
+  it('shows the hub plaintext note', () => {
+    render(<TransportPanel state={stateWith()} refresh={() => {}} />);
+    expect(screen.queryByRole('note', { name: 'Hub plaintext note' })).toBeNull();
+    fireEvent.click(screen.getByRole('radio', { name: 'Hub' }));
+    expect(screen.getByRole('note', { name: 'Hub plaintext note' })).toBeTruthy();
   });
 });

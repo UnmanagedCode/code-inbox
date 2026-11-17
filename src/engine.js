@@ -9,6 +9,7 @@ import {
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { checkStoredShareDir, ensureShareRoot, validateShareDir } from './transport/fileShare.js';
+import { resolveHubConfig } from './transport/hubClient.js';
 import { resolveTcpConfig } from './transport/tcp.js';
 
 export const RECENT_REJECTS = 20;
@@ -33,10 +34,11 @@ const defaultSchedule = (fn, ms) => {
 
 // The install's protocol core: ingest (transport → verify → route binding → authorization → store) and every
 // action a human or agent can take. Surfaces (REST, MCP) call these and only map results onto their wire shapes.
-// `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir} or
-// {kind:'tcp', host, port, advertise}); `view` is the read-only engine view a transport may need (docs/transport.md).
+// `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir},
+// {kind:'tcp', host, port, advertise} or {kind:'hub', url}); `view` is the read-only engine view a transport may need
+// (docs/transport.md).
 // `schedule(fn, ms)` → cancel drives the outbox retry timer (tests inject one).
-// `lookup` replaces the DNS lookup TCP settings are checked with (tests).
+// `lookup` replaces the DNS lookup TCP and hub settings are checked with (tests).
 export function createEngine({ store, identity, makeTransport, now = Date.now, schedule = defaultSchedule, outboxRetryMs = OUTBOX_RETRY_MS, lookup, log = console }) {
   const self = identity.fp;
   const events = new EventEmitter();
@@ -368,16 +370,21 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   function transportView() {
     const cfg = settings.transport;
     const tcp = cfg?.kind === 'tcp' ? cfg : null;
+    const hub = cfg?.kind === 'hub' ? cfg : null;
+    const link = hub && transport?.stats ? transport.stats().hub : null;
     const addresses = transport ? transport.addresses() : [];
     const own = dir().identities.get(self);
     const bytes = announceOf(self);
     return {
-      kind: cfg?.kind === 'tcp' || cfg?.kind === 'file-share' ? cfg.kind : null,
+      kind: ['file-share', 'tcp', 'hub'].includes(cfg?.kind) ? cfg.kind : null,
       configured: !!transport,
       dir: cfg?.kind === 'file-share' ? cfg.dir : null,
       host: tcp?.host ?? null,
       port: tcp?.port ?? null,
       advertise: tcp?.advertise ?? null,
+      url: hub?.url ?? null,
+      // The hub link's state, for display only.
+      hub: link ? { connected: link.connected, error: link.error } : null,
       addresses,
       card: bytes ? encodeCard(bytes) : null,
       cardStale: !!bytes && JSON.stringify(own.addr) !== JSON.stringify(addresses),
@@ -499,6 +506,20 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         await store.saveSettings(settings);
         await startTransport(settings.transport);
         // Admissions owed since a boot that started no transport (e.g. the port was taken then), and the outbox.
+        await reconcileAdmissions();
+        await flushOutbox();
+        return { ...cfg, addresses: transport.addresses() };
+      });
+    },
+
+    // Refused HUB_INVALID (resolveHubConfig, which must resolve the host on a save). Starting never fails because
+    // the hub is unreachable: the client keeps reconnecting. Resolved before the engine lock is taken.
+    async setHub(input) {
+      const cfg = await resolveHubConfig(input, { lookup, mustResolve: true });
+      return locked(async () => {
+        settings = { ...settings, transport: { kind: 'hub', ...cfg } };
+        await store.saveSettings(settings);
+        await startTransport(settings.transport);
         await reconcileAdmissions();
         await flushOutbox();
         return { ...cfg, addresses: transport.addresses() };
@@ -735,14 +756,16 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     },
   };
 
-  // The stored transport config, checked at boot: a TCP config as when it was saved (resolveTcpConfig); a share dir
+  // The stored transport config, checked at boot: a TCP config as when it was saved (resolveTcpConfig); a hub url as
+  // when it was saved, except that a host that does not resolve yet still starts (resolveHubConfig); a share dir
   // by checkStoredShareDir, which does not require it to exist, so a share whose mount is not up yet still starts and
-  // is scanned once it appears. Refused SHARE_INVALID, TCP_INVALID or TRANSPORT_INVALID (an unknown kind).
+  // is scanned once it appears. Refused SHARE_INVALID, TCP_INVALID, HUB_INVALID or TRANSPORT_INVALID (an unknown kind).
   async function validStoredTransport(cfg) {
     if (cfg?.kind === 'tcp') {
       const { host, port, advertise } = cfg;
       return { kind: 'tcp', ...(await resolveTcpConfig({ host, port, advertise }, { lookup })) };
     }
+    if (cfg?.kind === 'hub') return { kind: 'hub', ...(await resolveHubConfig({ url: cfg.url }, { lookup, mustResolve: false })) };
     if (cfg?.kind === 'file-share') return { kind: 'file-share', dir: await checkStoredShareDir(cfg.dir, store.dataDir) };
     throw new CodedError('TRANSPORT_INVALID', `unknown transport kind ${JSON.stringify(cfg?.kind)?.slice(0, 40)}`);
   }

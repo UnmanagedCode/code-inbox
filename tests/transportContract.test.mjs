@@ -5,14 +5,17 @@ import { loadIdentity } from '../src/identity.js';
 import { createStore } from '../src/store.js';
 import { assertTransport, routeKey } from '../src/transport/index.js';
 import { createFileShare } from '../src/transport/fileShare.js';
+import { createHub } from '../src/hub/hub.js';
 import { proofSigner } from '../src/transport/handshake.js';
+import { createHubClient } from '../src/transport/hubClient.js';
 import { createTcp } from '../src/transport/tcp.js';
 import { silentLog, tmpDir } from './helpers.mjs';
 
 // One contract, run against every Transport implementation: it proves the engine works through the interface
 // alone. Each implementation provides makeTransport(identity, shareDir, view, store, config) and configure(engine,
-// shareDir). A transport without a directory (`directory: false`) bootstraps the way humans do: every node after
-// the first imports node 0's contact card, so node 0 learns the others only from the handshake.
+// shareDir), and optionally setup() / teardown() around a network (the hub: a loopback hub). A transport without a
+// directory (`directory: false`) bootstraps the way humans do: every node after the first imports node 0's contact
+// card, so node 0 learns the others only from the handshake.
 
 // An in-memory push transport: records reach online peers' sinks immediately; a send to an offline peer comes back
 // `pending`, and when the peer comes online every other transport's sink hears peerOnline(fp). Directory records
@@ -61,10 +64,26 @@ const IMPLEMENTATIONS = {
     }),
     configure: (engine) => engine.setTcp({ port: 0 }),
   }),
+  hub: () => {
+    const at = { hub: null, url: null };
+    return {
+      async setup() {
+        at.hub = createHub({ port: 0 });
+        at.url = `hub://127.0.0.1:${(await at.hub.listen()).port}`;
+      },
+      teardown: () => at.hub.close(),
+      // The shape test builds one with no hub: the url is never dialed.
+      makeTransport: (identity, _shareDir, view, store, config) => createHubClient({
+        url: config.url ?? 'hub://127.0.0.1:1', identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: 3_600_000, log: silentLog,
+      }),
+      configure: (engine) => engine.setHub({ url: at.url }),
+    };
+  },
 };
 
 async function network(impl, names) {
   const net = IMPLEMENTATIONS[impl]();
+  await net.setup?.();
   const shareDir = tmpDir('code-inbox-share-');
   const nodes = [];
   for (const name of names) {
@@ -89,7 +108,7 @@ async function network(impl, names) {
     for (const n of nodes.slice(1)) await n.engine.importCard(card);
   }
   await settle();
-  return { ...net, nodes, settle, close: async () => { for (const n of nodes) await n.engine.stop(); } };
+  return { ...net, nodes, settle, close: async () => { for (const n of nodes) await n.engine.stop(); net.teardown?.(); } };
 }
 
 for (const impl of Object.keys(IMPLEMENTATIONS)) {

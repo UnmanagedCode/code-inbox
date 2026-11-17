@@ -208,6 +208,7 @@ export function createEndpoint({ makeLink, limits = {}, now = Date.now, schedule
     signers: () => [...bindings.values()].map((b) => b.signer),
     fps: () => [...bindings.keys()],
     isLocal: (fp) => bindings.has(fp),
+    contacts: () => [...new Set([...bindings.values()].flatMap((b) => b.view.contacts()))],
     hasSession: (fp) => pool.has(fp),
     readySessions,
     canDial: () => bindings.size > 0 && sessions.size < lim.maxConnections,

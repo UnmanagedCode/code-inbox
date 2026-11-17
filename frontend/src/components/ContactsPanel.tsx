@@ -5,7 +5,7 @@ import type { State } from '../types';
 import { useAction } from '../useAction';
 import { Panel } from './Panel';
 
-// TCP has no shared directory: humans exchange contact cards (a signed announce) to find each other.
+// TCP and the hub have no shared directory: humans exchange contact cards (a signed announce) to find each other.
 export function ContactsPanel({ state, refresh }: { state: State; refresh: () => void }) {
   const { card, cardStale } = state.transport;
   const [text, setText] = useState('');
