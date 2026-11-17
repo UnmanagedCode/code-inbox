@@ -46,7 +46,7 @@ The engine builds its transport with `makeTransport(config, view)` (`server.js` 
 
 ### Selecting a transport
 
-A stored transport is validated at boot as when it was saved (`validateTcpConfig`, `validateShareDir`). An invalid one starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
+A stored transport is checked at boot. A TCP config is validated as when it was saved (`validateTcpConfig`). A share dir is checked only against its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), not for existence or writability: a share whose mount is not up yet still starts, and its scans pick the directory up once it appears. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath). An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `SHARE_INVALID`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
 
 One transport at a time, set on the page (`POST api/share` or `POST api/tcp`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise}`.
 

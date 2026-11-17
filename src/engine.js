@@ -8,7 +8,7 @@ import {
   inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharesInbox,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
-import { validateShareDir } from './transport/fileShare.js';
+import { checkShareDirPath, validateShareDir } from './transport/fileShare.js';
 import { validateTcpConfig } from './transport/tcp.js';
 
 export const RECENT_REJECTS = 20;
@@ -675,14 +675,15 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, l
     },
   };
 
-  // The stored transport config, validated as when it was saved: refused SHARE_INVALID, TCP_INVALID or
-  // TRANSPORT_INVALID (an unknown kind).
+  // The stored transport config, checked at boot: a TCP config as when it was saved; a share dir against its path
+  // rules only (checkShareDirPath), so a share whose mount is not up yet still starts and is scanned once it appears.
+  // Refused SHARE_INVALID, TCP_INVALID or TRANSPORT_INVALID (an unknown kind).
   async function validStoredTransport(cfg) {
     if (cfg?.kind === 'tcp') {
       const { host, port, advertise } = cfg;
       return { kind: 'tcp', ...validateTcpConfig({ host, port, advertise }) };
     }
-    if (cfg?.kind === 'file-share') return { kind: 'file-share', dir: await validateShareDir(cfg.dir, store.dataDir) };
+    if (cfg?.kind === 'file-share') return { kind: 'file-share', dir: checkShareDirPath(cfg.dir, store.dataDir) };
     throw new CodedError('TRANSPORT_INVALID', `unknown transport kind ${JSON.stringify(cfg?.kind)?.slice(0, 40)}`);
   }
 

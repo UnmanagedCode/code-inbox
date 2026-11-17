@@ -19,12 +19,27 @@ const isInside = (parent, child) => {
   return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
 };
 
-// Refuses (SHARE_INVALID) a share dir that is not absolute, not an existing writable directory, or that contains
-// the data dir or lies inside it (compared by realpath): the private key must never sit on the share.
-// Resolves the dir unchanged.
-export async function validateShareDir(dir, dataDir) {
-  const refuse = (why) => { throw new CodedError('SHARE_INVALID', `share dir ${JSON.stringify(dir)} ${why}`); };
+const shareRefusal = (dir) => (why) => { throw new CodedError('SHARE_INVALID', `share dir ${JSON.stringify(dir)} ${why}`); };
+
+// The rules a share dir path must meet without touching the filesystem (a stored share is checked only against
+// these at boot, so a mount that is not up yet is picked up once it appears): an absolute path that neither lies
+// inside the data dir nor contains it, compared as resolved paths. Refuses SHARE_INVALID; resolves the dir unchanged.
+export function checkShareDirPath(dir, dataDir) {
+  const refuse = shareRefusal(dir);
   if (typeof dir !== 'string' || !dir || !path.isAbsolute(dir)) refuse('is not an absolute path');
+  const resolved = path.resolve(dir);
+  const data = path.resolve(dataDir);
+  if (isInside(data, resolved)) refuse('is inside the data dir');
+  if (isInside(resolved, data)) refuse('contains the data dir');
+  return dir;
+}
+
+// The full check when a human saves a share dir: checkShareDirPath, then it must be an existing writable directory
+// that neither contains the data dir nor lies inside it compared by realpath (symlinks resolved): the private key
+// must never sit on the share. Refuses SHARE_INVALID; resolves the dir unchanged.
+export async function validateShareDir(dir, dataDir) {
+  const refuse = shareRefusal(dir);
+  checkShareDirPath(dir, dataDir);
   let st;
   try { st = await fs.stat(dir); } catch { refuse('does not exist'); }
   if (!st.isDirectory()) refuse('is not a directory');
