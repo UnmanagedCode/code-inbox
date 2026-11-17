@@ -6,7 +6,7 @@ import type { State } from './types';
 // The `api/state` shape the backend serves: a `transport` view and no `share` key.
 const STATE: State = {
   identity: { fp: 'aaaaaaaa', fingerprint: 'aaaa-aaaa', name: 'Ann', announcedName: null, nameStatus: 'unset' },
-  transport: { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null },
+  transport: { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, url: null, hub: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null },
   directory: [],
   sharedInboxes: [],
   invites: { incoming: [], outgoing: [] },

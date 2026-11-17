@@ -6,7 +6,7 @@ import { spawnSync } from 'node:child_process';
 import { tmpDir } from './helpers.mjs';
 
 const HOOK = new URL('../.code-conductor/post-worktree-merge.sh', import.meta.url).pathname;
-const GIT = ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid'];
+const GIT = ['-c', 'user.name=t', '-c', 'user.email=t@example.invalid', '-c', 'commit.gpgsign=false', '-c', 'core.hooksPath=/dev/null'];
 const git = (cwd, ...args) => {
   const r = spawnSync('git', [...GIT, ...args], { cwd, encoding: 'utf8' });
   assert.equal(r.status, 0, r.stderr);

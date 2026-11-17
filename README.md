@@ -54,7 +54,7 @@ Contracts: [docs/protocol.md → MCP tools](docs/protocol.md#mcp-tools). Human-o
 ```
 Code Inbox page (humans) ─┐              ┌─ MCP tools (agents: list / read / send)
                           ▼              ▼
-                 routes.js ─────────► engine.js ◄──── notifier.js ──► cc send_prompt
+                      routes.js ─────► engine.js ◄──── notifier.js ──► cc send_prompt
                                      │  ▲      │
             records.js (verify) ◄────┘  │      └──► store.js ($DATA: accepted log, pending, outbox, cursors)
             state.js (pure fold) ◄──────┘
