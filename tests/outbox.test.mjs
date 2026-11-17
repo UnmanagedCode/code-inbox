@@ -296,5 +296,6 @@ test('an owed write with no recipient is kept on a system error and dropped, log
   const bug = await stubEngine(t, async () => { throw new Error('a bug'); }, log);
   await bug.announce();
   assert.equal(bug.state().diagnostics.outbox, 0);
+  assert.equal(bug.state().transport.outboxError, null, 'a dropped write leaves no standing error');
   assert.ok(log.lines.some((l) => l.includes('dropped') && l.includes('a bug')), log.lines.join('\n'));
 });

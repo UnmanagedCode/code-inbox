@@ -233,3 +233,38 @@ test('a send on a route that leaves the share creates nothing and is refused SHA
   assert.deepEqual(fs.readdirSync(root), []);
   await t.stop();
 });
+
+// Invariant (U4): directories are created one component at a time and never through a link a peer planted in the
+// share: neither a linked inbox dir nor a linked `inboxes` creates anything outside the share.
+test('a planted link inside the share creates nothing outside it', async () => {
+  const { me, t, root } = await recordingShare();
+  const inboxId = 'c'.repeat(32);
+  const outside = tmpDir('code-inbox-outside-');
+  fs.mkdirSync(path.join(root, 'inboxes'), { recursive: true });
+  fs.symlinkSync(outside, path.join(root, 'inboxes', inboxId));
+  await assert.rejects(t.send(announceOf(me, 'alice'), { route: { kind: 'inbox', id: inboxId }, to: [] }), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+  fs.rmSync(path.join(root, 'inboxes'), { recursive: true });
+  const outside2 = tmpDir('code-inbox-outside-');
+  fs.symlinkSync(outside2, path.join(root, 'inboxes'));
+  await assert.rejects(t.send(announceOf(me, 'alice'), { route: { kind: 'inbox', id: inboxId }, to: [] }), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside2), []);
+  await t.stop();
+});
+
+// Invariant (U4): saving a share whose `code-inbox` is a link is refused, and nothing is created through the link.
+test('a share whose code-inbox is a link is refused at save time', async (t) => {
+  const shareDir = tmpDir('code-inbox-share-');
+  const outside = tmpDir('code-inbox-outside-');
+  fs.symlinkSync(outside, path.join(shareDir, 'code-inbox'));
+  const a = await makeInstall(null);
+  t.after(() => a.close());
+  await assert.rejects(a.engine.setShare(shareDir), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+  // A `v1` link one level down is refused the same way.
+  fs.rmSync(path.join(shareDir, 'code-inbox'));
+  fs.mkdirSync(path.join(shareDir, 'code-inbox'));
+  fs.symlinkSync(outside, path.join(shareDir, 'code-inbox', 'v1'));
+  await assert.rejects(a.engine.setShare(shareDir), { code: 'SHARE_UNSAFE' });
+  assert.deepEqual(fs.readdirSync(outside), []);
+});

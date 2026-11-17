@@ -8,10 +8,11 @@ import { loadIdentity } from '../src/identity.js';
 import { decodeRecord, encodeRecord } from '../src/records.js';
 import { FILES } from '../src/store.js';
 import { TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, encodeFrame } from '../src/transport/frames.js';
+import { TCP_HANDSHAKE_MS } from '../src/transport/tcpSession.js';
 import { proofSigner } from '../src/transport/handshake.js';
 import { routeKey } from '../src/transport/index.js';
 import { TCP_REDIAL_MIN_MS, createTcpEndpoint, resolveTcpConfig } from '../src/transport/tcp.js';
-import { fakeClock, silentLog, tmpDir } from './helpers.mjs';
+import { fakeClock, makeInstall, silentLog, tmpDir } from './helpers.mjs';
 import {
   acceptProofs, countingListener, freePort, memCursors, personal, rawConn, rawConnect, rawPeer, settle, stubSink, stubView, tcpNode, waitFor,
 } from './tcpHelpers.mjs';
@@ -649,4 +650,22 @@ test('TCP settings are resolved outside the engine lock, with a timeout', async 
   const never = () => new Promise(() => {});
   await assert.rejects(resolveTcpConfig({ host: 'hang.example', advertise: '127.0.0.1' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
   await assert.rejects(resolveTcpConfig({ advertise: 'hang.example' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
+});
+
+// Invariant (U3): an install built by wire takes its clock for the TCP endpoint too: a fake clock decides when a
+// silent connection's handshake deadline passes.
+test('wire threads the injected clock through to the TCP endpoint', async (t) => {
+  const clock = fakeClock();
+  const a = await makeInstall(null, { schedule: clock.schedule, now: clock.now });
+  t.after(() => a.close());
+  await a.engine.setTcp({ port: 0 });
+  const port = Number(a.engine.state().transport.addresses[0].split(':').at(-1));
+  const raw = await rawConnect(port);
+  closeAll(t, raw);
+  assert.equal((await raw.next()).t, 'hello');
+  clock.advance(TCP_HANDSHAKE_MS - 1);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(raw.closed, false, 'not before the deadline');
+  clock.advance(1);
+  await waitFor(() => raw.closed, 'the handshake deadline on the fake clock', 2000);
 });

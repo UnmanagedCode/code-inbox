@@ -27,14 +27,14 @@ export function transportFactory({ identity, store, pollMs, tcpSyncMs, now, sche
     : createFileShare({ shareDir: config.dir, dataDir: store.dataDir, selfFp: identity.fp, pollMs, log }));
 }
 
-// Builds one install; the caller listens. `pollMs`, `tcpSyncMs` and `schedule` (the notifier's timers and the
-// engine's outbox retry) override the defaults (tests).
+// Builds one install; the caller listens. `pollMs`, `tcpSyncMs`, `schedule` (the notifier's timers, the engine's
+// outbox retry, the TCP endpoint's timers) and `now` (the TCP endpoint's clock) override the defaults (tests).
 // Resolves {server, engine, notifier, mcp, identity, close}.
-export async function wire({ dataDir, distDir, env = process.env, pollMs, tcpSyncMs, schedule, log = console }) {
+export async function wire({ dataDir, distDir, env = process.env, pollMs, tcpSyncMs, now, schedule, log = console }) {
   const store = createStore(dataDir, { log });
   await store.load(); // creates the data dir (0700) before the identity goes into it
   const identity = await loadIdentity(dataDir);
-  const engine = createEngine({ store, identity, log, ...(schedule ? { schedule } : {}), makeTransport: transportFactory({ identity, store, pollMs, tcpSyncMs, log }) });
+  const engine = createEngine({ store, identity, log, ...(schedule ? { schedule } : {}), makeTransport: transportFactory({ identity, store, pollMs, tcpSyncMs, now, schedule, log }) });
   await engine.boot();
   const cc = createCc({ env, log });
   const notifier = createNotifier({ engine, cc, store, log, ...(schedule ? { schedule } : {}) });

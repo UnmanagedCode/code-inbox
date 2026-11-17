@@ -81,7 +81,7 @@ export function TransportPanel({ state, refresh }: { state: State; refresh: () =
         <div role="status" aria-label="Writes waiting">
           <p className="muted">{state.diagnostics.outbox} write(s) waiting in the outbox, retried until delivered.</p>
           {t.outboxError && <p className="warning">Last attempt: {t.outboxError.code}: {t.outboxError.message}</p>}
-          {t.outboxError?.code === 'SHARE_UNAVAILABLE' && <p className="muted">The share looks unmounted. If it is mounted and new, save the share once more.</p>}
+          {t.outboxError?.code === 'SHARE_UNAVAILABLE' && <p className="muted">The share looks unmounted. If it is mounted and new, save the share once more (with it mounted).</p>}
         </div>
       )}
       <fieldset>
@@ -93,6 +93,7 @@ export function TransportPanel({ state, refresh }: { state: State; refresh: () =
         <form className="row" onSubmit={(e) => { e.preventDefault(); void run(() => api.setShare(dir)); }}>
           <label className="grow stack"><span>Share directory (absolute)</span><input value={dir} onChange={(e) => setDir(e.target.value)} placeholder="the Dropbox, SMB or NFS folder every install can reach" /></label>
           <button type="submit" disabled={busy}>Save share</button>
+          <p className="muted">Save with the share mounted: saving creates its code-inbox folder, and writes wait until that folder is there.</p>
         </form>
       ) : (
         <form onSubmit={(e) => { e.preventDefault(); void run(saveTcp); }}>

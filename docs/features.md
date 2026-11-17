@@ -21,7 +21,7 @@ One transport at a time: **File share** or **TCP (direct)**, picked with a radio
 
 | Control | Does | Refused with |
 |---|---|---|
-| **Save share** | Makes the file share the transport: stores the dir and starts scanning it | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath) |
+| **Save share** | Makes the file share the transport: stores the dir, creates its `code-inbox/v1` root and starts scanning it. The page says to save with the share mounted: a root created on the local disk under an unmounted mount point would take writes | `SHARE_INVALID`: not absolute, missing, not a directory, not writable, inside the data dir, or containing it (compared by realpath); `SHARE_UNSAFE`: its `code-inbox` or `v1` is a link, or resolves outside the share or into the data dir |
 | **Save TCP** | Makes direct TCP the transport: listens on **Listen host** (empty: `127.0.0.1`) and **Port** (empty: `TCP_DEFAULT_PORT`, `src/transport/tcp.js`). **Advertised host** (shown once the host is not loopback; required when the host is every interface: `0.0.0.0` or any spelling of `::`) is what peers dial | `TCP_INVALID` (a bad host, port or advertised host; a host that does not resolve; a host or advertised host that is, or resolves to, every interface such as `0.0.0.0`, `::`, `0`), `TCP_LISTEN_FAILED` (the port is taken or not allowed; no transport is configured until a save succeeds) |
 
 - The panel shows the transport in use, the share dir or the addresses this install is reachable at, and, when no transport could start at boot, why as `CODE: message`:

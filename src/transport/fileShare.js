@@ -37,9 +37,8 @@ export function checkShareDirPath(dir, dataDir) {
   return dir;
 }
 
-// Why a real path (symlinks resolved) overlaps the real data dir, or null.
-async function realOverlap(real, dataDir) {
-  const realData = await fs.realpath(dataDir);
+// Why a real path (symlinks resolved) overlaps the real data dir `realData`, or null.
+function realOverlap(real, realData) {
   if (isInside(realData, real)) return 'is inside the data dir (through a link)';
   if (isInside(real, realData)) return 'contains the data dir (through a link)';
   return null;
@@ -47,14 +46,40 @@ async function realOverlap(real, dataDir) {
 
 // The overlap rule on real paths, for a share dir that exists (`real` is its realpath).
 async function checkRealOverlap(dir, real, dataDir) {
-  const why = await realOverlap(real, dataDir);
+  const why = realOverlap(real, await fs.realpath(dataDir));
   if (why) shareRefusal(dir)(why);
 }
 
-// Creates the share's root (`<dir>/SHARE_ROOT`) when a human saves the share: from then on a send requires it to
-// exist, which tells a mounted share from an empty mount point.
-export async function ensureShareRoot(dir) {
-  await fs.mkdir(path.join(dir, SHARE_ROOT), { recursive: true });
+const unsafe = (why) => { throw new CodedError('SHARE_UNSAFE', why); };
+
+// Creates `base/<parts…>` one component at a time, never through a link: each component that exists must be a real
+// directory (a symlink: SHARE_UNSAFE; anything else: ENOTDIR) whose real path stays inside `realBase` (and, given `realData`, does not overlap the
+// data dir), checked before anything is created under it. Refuses SHARE_UNSAFE. Resolves the final path.
+// What remains is the race between a check and the next mkdir: a peer swapping a checked component for a link in
+// between can still get one empty directory created through it.
+async function mkdirsInside(base, parts, realBase, realData = null) {
+  let cur = base;
+  for (const part of parts) {
+    cur = path.join(cur, part);
+    try { await fs.mkdir(cur); } catch (err) { if (err.code !== 'EEXIST') throw err; }
+    const st = await fs.lstat(cur);
+    if (st.isSymbolicLink()) unsafe(`${cur} is a link, not a real directory`);
+    // Something else in a directory's place redirects nothing: a plain filesystem error, retried.
+    if (!st.isDirectory()) throw Object.assign(new Error(`${cur} is not a directory`), { code: 'ENOTDIR' });
+    const real = await fs.realpath(cur);
+    if (!isInside(realBase, real)) unsafe(`${cur} resolves outside the share`);
+    const why = realData && realOverlap(real, realData);
+    if (why) unsafe(`${cur} ${why}`);
+  }
+  return cur;
+}
+
+// Creates the share's root (`<dir>/SHARE_ROOT`) when a human saves the share (the dir passed validateShareDir): from
+// then on a send requires the root to exist. A `code-inbox` or `v1` that is a link, or resolves outside the share
+// or into the data dir, is refused SHARE_UNSAFE before anything is created through it.
+export async function ensureShareRoot(dir, dataDir) {
+  const [realDir, realData] = await Promise.all([fs.realpath(dir), fs.realpath(dataDir)]);
+  await mkdirsInside(dir, SHARE_ROOT.split(path.sep), realDir, realData);
   return dir;
 }
 
@@ -175,6 +200,7 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
   // This install's own subdir for `route`, created if missing (the root itself must exist). Refused (SHARE_UNSAFE)
   // when its path leaves the root before anything is created, when it is a symlink or not a real directory, or when
   // it resolves outside the share: a peer could otherwise redirect this install's writes.
+  // Resolves {dir, realRoot}.
   async function ownDir(route) {
     const parent = routeDir(root, route);
     const dir = path.join(parent, selfFp);
@@ -182,13 +208,9 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
     if (!isRoute(route) || !isInside(resolvedRoot, path.resolve(dir)) || path.resolve(dir) === resolvedRoot) {
       throw new CodedError('SHARE_UNSAFE', `the route ${JSON.stringify(route).slice(0, 80)} does not stay inside the share`);
     }
-    await fs.mkdir(parent, { recursive: true });
-    try { await fs.mkdir(dir); } catch (err) { if (err.code !== 'EEXIST') throw err; }
-    const st = await fs.lstat(dir);
-    if (st.isSymbolicLink() || !st.isDirectory()) throw new CodedError('SHARE_UNSAFE', `${dir} is not a real directory`);
-    const [real, realRoot] = await Promise.all([fs.realpath(dir), fs.realpath(root)]);
-    if (!isInside(realRoot, real)) throw new CodedError('SHARE_UNSAFE', `${dir} resolves outside the share`);
-    return dir;
+    const realRoot = await fs.realpath(root);
+    await mkdirsInside(root, path.relative(root, dir).split(path.sep), realRoot);
+    return { dir, realRoot };
   }
 
   // Before any write: the share's root must already exist (else SHARE_UNAVAILABLE: an unmounted mount point, or a
@@ -200,8 +222,9 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
       if (err.code !== 'ENOENT' && err.code !== 'ENOTDIR') throw err;
     }
     if (!st?.isDirectory()) throw new CodedError('SHARE_UNAVAILABLE', `the share ${shareDir} has no ${SHARE_ROOT} (not mounted?)`);
+    const realData = await fs.realpath(dataDir);
     for (const p of [shareDir, root]) {
-      const why = await realOverlap(await fs.realpath(p), dataDir);
+      const why = realOverlap(await fs.realpath(p), realData);
       if (why) throw new CodedError('SHARE_UNSAFE', `${p} ${why}`);
     }
   }
@@ -240,8 +263,10 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
     // mount is not up must not be recreated on the local disk, where the mount would later hide it.
     async send(bytes, { route, to }) {
       await checkWritable();
-      const dir = await ownDir(route);
+      const { dir, realRoot } = await ownDir(route);
       const name = `${String(now()).padStart(13, '0')}-${crypto.randomBytes(16).toString('hex')}.rec`;
+      // Once more right before the write, to narrow the window a swapped link could use.
+      if (!isInside(realRoot, await fs.realpath(dir))) throw new CodedError('SHARE_UNSAFE', `${dir} resolves outside the share`);
       await writeFileAtomic(path.join(dir, name), bytes, 0o644);
       return { delivered: [...to], pending: [] };
     },

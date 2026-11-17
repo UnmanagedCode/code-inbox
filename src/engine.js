@@ -227,7 +227,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       if (err.code === 'SHARE_UNSAFE' && refuseUnsafe) throw err;
       const code = err.code ?? 'ERROR';
       const owed = code === 'SHARE_UNSAFE' || isRetryableSendError(err);
-      outboxError = { code, message: err.message };
+      // Recorded only for a write the outbox keeps: a dropped one leaves nothing to explain or to clear.
+      if (owed || to.length) outboxError = { code, message: err.message };
       if (!owed && !to.length) log.warn(`code-inbox: sending on ${routeKey(route)} failed (${code}) and nothing is left to retry: dropped: ${err.message}`);
       else if (code !== loggedCode) log.warn(`code-inbox: sending on ${routeKey(route)} failed (${code}), kept in the outbox and retried: ${err.message}`);
       loggedCode = code;
@@ -478,7 +479,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     setShare(shareDir) {
       return locked(async () => {
         await validateShareDir(shareDir, store.dataDir);
-        await ensureShareRoot(shareDir);
+        await ensureShareRoot(shareDir, store.dataDir);
         settings = { ...settings, transport: { kind: 'file-share', dir: shareDir } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
