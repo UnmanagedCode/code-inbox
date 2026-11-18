@@ -6,7 +6,8 @@ import { FP_RE, decodeRecord } from './records.js';
 import { isRoute } from './transport/index.js';
 
 // The install's local state under the data dir, written only by this backend (docs/architecture.md → Data dir).
-// Every write goes through one lock per data dir. accepted.ndjson is append-only and assigns the acceptance seq.
+// Every write goes through one lock per data dir. accepted.ndjson assigns the acceptance seq and is append-only except
+// when an inbox is purged (dropRecords); seq.json then keeps the highest seq ever assigned, so none is reused.
 export const FILES = {
   settings: 'settings.json',
   pins: 'pins.json',
@@ -18,6 +19,8 @@ export const FILES = {
   notify: 'notify.json',
   pullCursors: 'pull-cursors.json',
   identities: 'identities.json',
+  purged: 'purged.ndjson',
+  seq: 'seq.json',
 };
 
 // `announced`: the name this install last announced (its announce is re-signed from it at every boot), or null.
@@ -72,7 +75,8 @@ export function createStore(dataDir, { log = console } = {}) {
     async load() {
       await ensurePrivateDir(dataDir);
       const accepted = await readNdjson(file('accepted'), log);
-      lastSeq = accepted.reduce((m, e) => Math.max(m, e.seq), 0);
+      const saved = await readJson(file('seq'), { lastSeq: 0 });
+      lastSeq = accepted.reduce((m, e) => Math.max(m, e.seq), Number.isSafeInteger(saved?.lastSeq) ? saved.lastSeq : 0);
       const settings = await locked(() => migrateSettings(file('settings')));
       return {
         settings: { ...DEFAULT_SETTINGS, ...settings },
@@ -84,6 +88,10 @@ export function createStore(dataDir, { log = console } = {}) {
         cursors: await readJson(file('cursors'), {}),
         notify: await readJson(file('notify'), { watermark: 0 }),
         identities: validIdentities(await readJson(file('identities'), {}), log),
+        // [{id, inbox, dead}]: the ids of records this install purged (docs/protocol.md → Closing an inbox).
+        purged: await readLines(file('purged'), log),
+        // The highest acceptance seq ever assigned, dropped lines included.
+        lastSeq,
       };
     },
     loadNotify: () => readJson(file('notify'), { watermark: 0 }),
@@ -108,6 +116,29 @@ export function createStore(dataDir, { log = console } = {}) {
         const handle = await fs.open(file('rejected'), 'a', 0o600);
         try {
           await handle.appendFile(`${JSON.stringify(entry)}\n`);
+          await handle.sync();
+        } finally {
+          await handle.close();
+        }
+      });
+    },
+    // Removes the records `ids` (a Set) from accepted.ndjson and rejected.ndjson. seq.json is written first, so the
+    // next seq stays above every seq ever assigned even when the newest line goes.
+    dropRecords(ids) {
+      return locked(async () => {
+        await writeJson(file('seq'), { lastSeq });
+        const accepted = await readLines(file('accepted'), log);
+        await writeFileAtomic(file('accepted'), accepted.filter((e) => !ids.has(e.id)).map((e) => `${JSON.stringify(e)}\n`).join(''));
+        const rejected = await readLines(file('rejected'), log);
+        await writeFileAtomic(file('rejected'), rejected.filter((e) => !ids.has(e.id)).map((e) => `${JSON.stringify(e)}\n`).join(''));
+      });
+    },
+    // Appends purge-list entries {id, inbox, dead}, durably.
+    appendPurged(entries) {
+      return locked(async () => {
+        const handle = await fs.open(file('purged'), 'a', 0o600);
+        try {
+          await handle.appendFile(entries.map((e) => `${JSON.stringify({ id: e.id, inbox: e.inbox, dead: e.dead })}\n`).join(''));
           await handle.sync();
         } finally {
           await handle.close();

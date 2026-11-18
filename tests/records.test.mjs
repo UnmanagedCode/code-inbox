@@ -150,9 +150,62 @@ test('an inbox id that does not recompute is rejected: INBOX_ID_MISMATCH', () =>
   assert.equal(decodeRecord(forge(alice, right)).ok, true);
 });
 
+// Invariant: no record is addressed to its own signer; in particular an owner cannot sign a leave of its own inbox.
 test('a record addressed to its own signer is rejected: SELF_ADDRESSED', () => {
   const nonce = newNonce();
   assert.equal(reason(forge(alice, { type: 'invite', signer: alice.fp, ts: TS, to: alice.fp, kind: 'personal', inbox: personalInboxId(alice.fp, alice.fp, nonce), nonce })), 'SELF_ADDRESSED');
+  assert.equal(reason(forge(alice, { type: 'inbox-leave', signer: alice.fp, ts: TS, to: alice.fp, inbox: sharedInboxId(alice.fp, nonce), epoch: 0 })), 'SELF_ADDRESSED', 'the owner leaving its own inbox');
+});
+
+// ---- closing an inbox ----
+
+const sharedDelete = (signer, nonce, extra = {}) => ({ type: 'inbox-delete', signer: signer.fp, ts: TS, kind: 'shared', inbox: sharedInboxId(signer.fp, nonce), nonce, ...extra });
+const personalDelete = (signer, inviter, invitee, nonce, extra = {}) => ({
+  type: 'inbox-delete', signer: signer.fp, ts: TS, kind: 'personal', inbox: personalInboxId(inviter.fp, invitee.fp, nonce), nonce,
+  to: (signer === inviter ? invitee : inviter).fp, invite: 'f'.repeat(32), ...extra,
+});
+
+// Invariant (schema pairing): `to` and `invite` ride on an inbox-delete exactly when it is personal; an inbox-leave
+// carries `to`, `inbox` and a non-negative `epoch` and nothing else. Every valid one round-trips.
+test('inbox-delete carries to and invite exactly when personal; inbox-leave round-trips', () => {
+  const nonce = newNonce();
+  for (const payload of [sharedDelete(alice, nonce), personalDelete(alice, alice, bob, nonce), { type: 'inbox-leave', signer: bob.fp, ts: TS, to: alice.fp, inbox: sharedInboxId(alice.fp, nonce), epoch: 3 }]) {
+    const { bytes, id } = encodeRecord(payload.signer === alice.fp ? alice : bob, payload);
+    const d = decodeRecord(bytes);
+    assert.equal(d.ok, true, payload.type);
+    assert.equal(d.id, id);
+    assert.deepEqual(d.payload, payload);
+  }
+  assert.equal(reason(forge(alice, sharedDelete(alice, nonce, { to: bob.fp }))), 'BAD_PAYLOAD', 'a shared delete with to');
+  assert.equal(reason(forge(alice, sharedDelete(alice, nonce, { invite: 'f'.repeat(32) }))), 'BAD_PAYLOAD', 'a shared delete with invite');
+  const { to, ...noTo } = personalDelete(alice, alice, bob, nonce);
+  assert.equal(reason(forge(alice, noTo)), 'BAD_PAYLOAD', 'a personal delete without to');
+  const { invite, ...noInvite } = personalDelete(alice, alice, bob, nonce);
+  assert.equal(reason(forge(alice, noInvite)), 'BAD_PAYLOAD', 'a personal delete without invite');
+  assert.equal(reason(forge(alice, sharedDelete(alice, nonce, { kind: 'other' }))), 'BAD_PAYLOAD', 'an unknown kind');
+  const leave = { type: 'inbox-leave', signer: bob.fp, ts: TS, to: alice.fp, inbox: sharedInboxId(alice.fp, nonce), epoch: 0 };
+  assert.equal(decodeRecord(forge(bob, leave)).ok, true, 'epoch 0');
+  assert.equal(reason(forge(bob, { ...leave, epoch: -1 })), 'BAD_PAYLOAD', 'a negative epoch');
+  const { epoch, ...noEpoch } = leave;
+  assert.equal(reason(forge(bob, noEpoch)), 'BAD_PAYLOAD', 'a leave without epoch');
+  assert.equal(reason(forge(bob, { ...leave, nonce })), 'BAD_PAYLOAD', 'an extra field');
+});
+
+// Invariant (self-certification): an inbox-delete recomputes its inbox id from its own fields: a shared one only for
+// the owner (signer + nonce), a personal one only for either party (inviter, invitee, nonce in either order).
+test('an inbox-delete that does not recompute is INBOX_ID_MISMATCH: shared from a non-owner key, personal from a non-party; either party\'s personal delete recomputes', async () => {
+  const carol = await loadIdentity(tmpDir());
+  const nonce = newNonce();
+  const owned = sharedInboxId(alice.fp, nonce);
+  assert.equal(reason(forge(bob, { type: 'inbox-delete', signer: bob.fp, ts: TS, kind: 'shared', inbox: owned, nonce })), 'INBOX_ID_MISMATCH', 'a non-owner deleting a shared inbox');
+  assert.equal(reason(forge(alice, sharedDelete(alice, nonce, { nonce: newNonce() }))), 'INBOX_ID_MISMATCH', 'the owner with another nonce');
+  assert.equal(decodeRecord(forge(alice, sharedDelete(alice, nonce))).ok, true, 'the owner');
+  assert.equal(decodeRecord(forge(alice, personalDelete(alice, alice, bob, nonce))).ok, true, 'the inviter revokes');
+  assert.equal(decodeRecord(forge(bob, personalDelete(bob, alice, bob, nonce))).ok, true, 'the invitee revokes');
+  const pid = personalInboxId(alice.fp, bob.fp, nonce);
+  const byCarol = { type: 'inbox-delete', signer: carol.fp, ts: TS, kind: 'personal', inbox: pid, nonce, to: alice.fp, invite: 'f'.repeat(32) };
+  assert.equal(reason(forge(carol, byCarol)), 'INBOX_ID_MISMATCH', 'a non-party revoking');
+  assert.equal(reason(forge(alice, personalDelete(alice, alice, bob, nonce, { to: carol.fp }))), 'INBOX_ID_MISMATCH', 'a party naming a non-party as the other party');
 });
 
 // Invariant: every type travels on exactly one route, the one the engine binds incoming records to.
@@ -162,6 +215,9 @@ test('routeFor maps each record type to its route', () => {
   assert.deepEqual(routeFor({ type: 'inbox-create', inbox }), { kind: 'directory' });
   for (const type of ['invite', 'invite-response', 'join-request', 'join-response']) assert.deepEqual(routeFor({ type, to: bob.fp, inbox }), { kind: 'mailbox', fp: bob.fp });
   for (const type of ['member', 'msg']) assert.deepEqual(routeFor({ type, inbox }), { kind: 'inbox', id: inbox });
+  assert.deepEqual(routeFor({ type: 'inbox-delete', kind: 'shared', inbox }), { kind: 'directory' });
+  assert.deepEqual(routeFor({ type: 'inbox-delete', kind: 'personal', inbox, to: bob.fp }), { kind: 'mailbox', fp: bob.fp });
+  assert.deepEqual(routeFor({ type: 'inbox-leave', inbox, to: bob.fp }), { kind: 'mailbox', fp: bob.fp });
 });
 
 // Invariant: encodeRecord refuses to sign what decodeRecord would reject, so this install never emits a bad record.

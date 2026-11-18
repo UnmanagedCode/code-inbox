@@ -2,8 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
-  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, mayRelay, membersAt, messagesOf, nameRefusal,
-  sharedOwner,
+  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, dropOnArrival, inboxesOf, invalidMessages, isValidMessage, leaveDue, mayRelay, membersAt,
+  messagesOf, nameRefusal, sharedOwner, withoutRecords,
 } from '../src/state.js';
 import { createDirectory } from '../src/directory.js';
 
@@ -343,4 +343,125 @@ test('mayRelay admits only a msg on a shared inbox from that inbox\'s owner', ()
   assert.equal(mayRelay(index, A, { kind: 'inbox', id: PERSONAL }, { type: 'msg', signer: B, inbox: PERSONAL, body: 'hi' }), false, 'not a personal inbox');
   const unknown = 'f'.repeat(32);
   assert.equal(mayRelay(index, A, { kind: 'inbox', id: unknown }, { ...fromB, inbox: unknown }), false, 'not an inbox unknown here');
+});
+
+// ---- closing an inbox ----
+
+const sharedDel = (signer = A, inbox = INBOX) => rec({ type: 'inbox-delete', signer, kind: 'shared', inbox, nonce: 'd'.repeat(32) });
+const personalDel = (signer, to, invite, inbox = INBOX) => rec({ type: 'inbox-delete', signer, kind: 'personal', inbox, nonce: 'e'.repeat(32), to, invite });
+const leave = (signer, epoch, extra = {}) => rec({ type: 'inbox-leave', signer, to: A, inbox: INBOX, epoch, ...extra });
+const noPurge = () => ({ ids: new Map(), dead: new Set() });
+
+// Invariant: an inbox-delete certifies itself (records.js recomputes its id), so the fold accepts it whatever is
+// known: it never waits for the inbox's create or invite.
+test('an inbox-delete is accepted with nothing known: it never pends', () => {
+  const empty = buildIndex([]);
+  assert.equal(verdict(empty, sharedDel()), 'accept');
+  assert.equal(verdict(empty, personalDel(B, A, 'f'.repeat(32))), 'accept');
+});
+
+// Invariant: an inbox-leave waits for the inbox and its epoch, goes to the inbox's owner only, and comes only from a
+// member at the epoch it cites.
+test('inbox-leave: INBOX_UNSEEN and EPOCH_UNSEEN pend; NOT_OWNER and NOT_MEMBER reject; a member at its epoch is accepted', () => {
+  assert.deepEqual(classify(buildIndex([]), leave(B, 1)), { verdict: 'pending', reason: 'INBOX_UNSEEN' });
+  const index = buildIndex([create(), member(1, 'add', B)]);
+  assert.deepEqual(classify(index, leave(B, 1, { to: C })), { verdict: 'reject', reason: 'NOT_OWNER' });
+  assert.deepEqual(classify(index, leave(B, 2)), { verdict: 'pending', reason: 'EPOCH_UNSEEN' });
+  assert.deepEqual(classify(index, leave(C, 1)), { verdict: 'reject', reason: 'NOT_MEMBER' });
+  assert.deepEqual(classify(index, leave(B, 0)), { verdict: 'reject', reason: 'NOT_MEMBER' }, 'not yet a member at epoch 0');
+  assert.deepEqual(classify(index, leave(B, 1)), { verdict: 'accept' });
+});
+
+// Invariant (the newer member record wins): the owner owes a leaver's removal only while the leaver is a current
+// member and no member record naming it is newer (by member seq) than the epoch the leave cites: a removal written
+// first, or a re-admission written before a stale leave arrived, settles it. Records naming others never do.
+test('leaveDue: due while a member; not after a removal; not after a re-add newer than the leave\'s epoch; still due when newer member records name others', () => {
+  const index = buildIndex([create(), member(1, 'add', B)]);
+  const l = leave(B, 1);
+  addRecord(index, l);
+  assert.equal(leaveDue(index, l), true, 'a current member');
+  addRecord(index, member(2, 'add', C));
+  addRecord(index, member(3, 'remove', C, { keepHead: null }));
+  assert.equal(leaveDue(index, l), true, 'newer records name someone else');
+  addRecord(index, member(4, 'remove', B, { keepHead: null }));
+  assert.equal(leaveDue(index, l), false, 'removed already');
+  addRecord(index, member(5, 'add', B));
+  assert.equal(leaveDue(index, l), false, 're-added after the leave\'s epoch: a stale leave');
+  const fresh = leave(B, 5);
+  addRecord(index, fresh);
+  assert.equal(leaveDue(index, fresh), true, 'a leave citing the re-admission epoch');
+});
+
+// Invariant: a record is dropped on arrival exactly when it was purged here (by id), belongs to a dead shared inbox
+// (a purged create or the owner's own kept delete), or answers a purged invite or join request; nothing else is.
+test('dropOnArrival: a purged id, a dead shared inbox (purged create or the owner\'s own delete), an answer to a purged invite or request; nothing else', () => {
+  const OTHER = 'b'.repeat(32);
+  const PERSONAL = 'a'.repeat(32);
+  const inv = rec({ type: 'invite', signer: A, to: B, kind: 'shared', inbox: OTHER, nonce: '1'.repeat(32) });
+  const req = rec({ type: 'join-request', signer: B, to: A, inbox: OTHER });
+  const purged = { ids: new Map([[inv.id, OTHER], [req.id, OTHER]]), dead: new Set([INBOX]) };
+  const empty = buildIndex([]);
+  assert.equal(dropOnArrival(empty, purged, inv), 'PURGED');
+  assert.equal(dropOnArrival(empty, purged, msg(B, { epoch: 1, prev: null })), 'DEAD_INBOX', 'a msg of a dead inbox');
+  assert.equal(dropOnArrival(empty, purged, rec({ type: 'join-request', signer: C, to: A, inbox: INBOX })), 'DEAD_INBOX', 'a join request for a dead inbox');
+  const resp = rec({ type: 'invite-response', signer: B, to: A, invite: inv.id, inbox: OTHER, accept: true });
+  assert.equal(dropOnArrival(empty, purged, resp), 'PURGED_DEPENDENCY');
+  const jresp = rec({ type: 'join-response', signer: A, to: B, request: req.id, inbox: OTHER, accept: false });
+  assert.equal(dropOnArrival(empty, purged, jresp), 'PURGED_DEPENDENCY');
+  // The owner's own kept delete marks its inbox dead with nothing on the purge list.
+  const owner = buildIndex([sharedDel(A, OTHER)]);
+  assert.equal(dropOnArrival(owner, noPurge(), rec({ type: 'invite-response', signer: B, to: A, invite: 'f'.repeat(32), inbox: OTHER, accept: true })), 'DEAD_INBOX');
+  // Nothing else: another inbox, a live answer, and a personal inbox whose revoke is kept.
+  assert.equal(dropOnArrival(empty, purged, rec({ type: 'msg', signer: B, inbox: OTHER, body: 'x', epoch: 1, prev: null })), null, 'another inbox');
+  assert.equal(dropOnArrival(empty, purged, rec({ type: 'invite-response', signer: B, to: A, invite: 'f'.repeat(32), inbox: OTHER, accept: true })), null, 'an answer to a live invite');
+  const revoker = buildIndex([personalDel(A, B, 'f'.repeat(32), PERSONAL)]);
+  assert.equal(dropOnArrival(revoker, noPurge(), rec({ type: 'msg', signer: B, inbox: PERSONAL, body: 'x' })), null, 'a personal revoke marks nothing dead');
+});
+
+// Every map of an index as plain sorted data (record ids for records), to compare two indexes.
+function shape(index) {
+  const idOf = (v) => (Array.isArray(v) ? v.map(idOf).sort() : v && typeof v === 'object' && 'id' in v ? v.id : v);
+  const out = {};
+  for (const [k, v] of Object.entries(index)) {
+    if (k === 'maxSeq') continue;
+    if (v instanceof Map) out[k] = [...v].map(([key, val]) => [key, k === 'rejected' ? val : idOf(val)]).sort((a, b) => (a[0] < b[0] ? -1 : 1));
+    else if (v instanceof Set) out[k] = [...v].sort();
+    else out[k] = v;
+  }
+  return out;
+}
+
+// Invariant: removing records gives exactly the index the remaining records build (every map and view, pending and
+// refused ids included), with every cache empty, and never lowers the acceptance head.
+test('withoutRecords equals an index built from the remaining records', () => {
+  const OTHER = 'b'.repeat(32);
+  const otherCreate = rec({ type: 'inbox-create', signer: B, inbox: OTHER, nonce: '2'.repeat(32), name: 'other' });
+  const c = create();
+  const inv = rec({ type: 'invite', signer: A, to: B, kind: 'shared', inbox: INBOX, nonce: 'd'.repeat(32) });
+  const resp = rec({ type: 'invite-response', signer: B, to: A, invite: inv.id, inbox: INBOX, accept: true });
+  const add = member(1, 'add', B);
+  const req = rec({ type: 'join-request', signer: C, to: A, inbox: INBOX });
+  const m1 = msg(B, { epoch: 1, prev: null });
+  const o1 = rec({ type: 'msg', signer: B, inbox: OTHER, body: 'kept', epoch: 0, prev: null });
+  const l = leave(B, 1);
+  const all = [otherCreate, c, inv, resp, add, req, m1, o1, l];
+  const pend = rec({ type: 'msg', signer: B, inbox: INBOX, body: 'later', epoch: 9, prev: null });
+  const pendOther = rec({ type: 'msg', signer: B, inbox: OTHER, body: 'later', epoch: 9, prev: null });
+  const index = buildIndex(all);
+  for (const p of [pend, pendOther]) addPending(index, p);
+  addRejected(index, 'r'.repeat(32), { reason: 'NOT_MEMBER', type: 'msg', inbox: INBOX, signer: C });
+  addRejected(index, 's'.repeat(32), { reason: 'NOT_MEMBER', type: 'msg', inbox: OTHER, signer: C });
+  assert.ok(isValidMessage(index, m1) && isValidMessage(index, o1), 'caches filled');
+  const head = index.maxSeq;
+  const gone = new Set([c.id, inv.id, resp.id, add.id, req.id, m1.id, l.id, pend.id, 'r'.repeat(32)]);
+  const after = withoutRecords(index, gone);
+  const expected = buildIndex([otherCreate, o1]);
+  addPending(expected, pendOther);
+  addRejected(expected, 's'.repeat(32), { reason: 'NOT_MEMBER', type: 'msg', inbox: OTHER, signer: C });
+  assert.deepEqual(shape(after), shape(expected));
+  assert.equal(after.verdicts.size + after.chains.size, 0, 'no cache survives');
+  assert.ok(after.maxSeq >= head, 'the acceptance head never moves back');
+  assert.deepEqual(inboxesOf(after, B).map((b) => b.id), [OTHER]);
+  assert.equal(currentMembers(after, INBOX), null);
+  assert.equal(index.byId.has(c.id), true, 'the input index is left alone');
 });

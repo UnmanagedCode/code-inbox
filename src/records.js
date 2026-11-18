@@ -30,11 +30,13 @@ export const newNonce = () => crypto.randomBytes(16).toString('hex');
 // ---- routes: where a record travels (Route helpers: src/transport/index.js) ----
 
 const DIRECTORY_TYPES = new Set(['announce', 'inbox-create']);
-const MAILBOX_TYPES = new Set(['invite', 'invite-response', 'join-request', 'join-response']);
+const MAILBOX_TYPES = new Set(['invite', 'invite-response', 'join-request', 'join-response', 'inbox-leave']);
 
-// The route a payload must travel on: the binding the engine checks for every incoming record.
+// The route a payload must travel on: the binding the engine checks for every incoming record. A shared delete is
+// public on the directory; a personal one goes to the other party's mailbox.
 export function routeFor(payload) {
   if (DIRECTORY_TYPES.has(payload.type)) return { kind: 'directory' };
+  if (payload.type === 'inbox-delete') return payload.kind === 'shared' ? { kind: 'directory' } : { kind: 'mailbox', fp: payload.to };
   if (MAILBOX_TYPES.has(payload.type)) return { kind: 'mailbox', fp: payload.to };
   return { kind: 'inbox', id: payload.inbox };
 }
@@ -65,6 +67,11 @@ const SCHEMA = {
   member: { fields: { inbox: isId, seq: isInt(1), op: oneOf('add', 'remove'), member: isFp, keepHead: isIdOrNull }, optional: ['keepHead'] },
   // A shared-inbox message carries epoch and prev (the same sender's previous message there, null for its first).
   msg: { fields: { inbox: isId, body: isBody, epoch: isInt(0), prev: isIdOrNull }, optional: ['epoch', 'prev'] },
+  // Closes an inbox (docs/protocol.md → Closing an inbox): the owner's shared Delete, or either party's personal Revoke,
+  // which names the other party (`to`) and the personal invite's record id (`invite`).
+  'inbox-delete': { fields: { kind: oneOf('personal', 'shared'), inbox: isId, nonce: isId, to: isFp, invite: isId }, optional: ['to', 'invite'] },
+  // A member leaving a shared inbox, to its owner; `epoch` is the leaver's current epoch.
+  'inbox-leave': { fields: { to: isFp, inbox: isId, epoch: isInt(0) } },
 };
 export const RECORD_TYPES = Object.keys(SCHEMA);
 
@@ -95,6 +102,12 @@ export function checkPayload(p) {
   if (p.type === 'member' && (p.op === 'remove') !== ('keepHead' in p)) return bad('BAD_PAYLOAD', 'keepHead belongs to a remove, and every remove has one');
   if (p.type === 'msg' && ('epoch' in p) !== ('prev' in p)) return bad('BAD_PAYLOAD', 'a shared message carries both epoch and prev; a personal one neither');
   if (p.type === 'inbox-create' && sharedInboxId(p.signer, p.nonce) !== p.inbox) return bad('INBOX_ID_MISMATCH', 'shared inbox id does not recompute');
+  if (p.type === 'inbox-delete') {
+    const personal = p.kind === 'personal';
+    if (('to' in p) !== personal || ('invite' in p) !== personal) return bad('BAD_PAYLOAD', 'to and invite belong to a personal inbox-delete, and every personal one has both');
+    const ok = personal ? personalInboxId(p.signer, p.to, p.nonce) === p.inbox || personalInboxId(p.to, p.signer, p.nonce) === p.inbox : sharedInboxId(p.signer, p.nonce) === p.inbox;
+    if (!ok) return bad('INBOX_ID_MISMATCH', `${p.kind} inbox id does not recompute from the signer`);
+  }
   if (p.type === 'invite') {
     const expected = p.kind === 'personal' ? personalInboxId(p.signer, p.to, p.nonce) : sharedInboxId(p.signer, p.nonce);
     if (expected !== p.inbox) return bad('INBOX_ID_MISMATCH', `${p.kind} inbox id does not recompute`);
