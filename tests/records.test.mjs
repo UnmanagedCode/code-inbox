@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import { loadIdentity } from '../src/identity.js';
 import {
-  BODY_MAX_BYTES, CARD_PREFIX, RECORD_MAX_BYTES, TS_MAX, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
+  ANNOUNCE_MAX_BYTES, BODY_MAX_BYTES, CARD_PREFIX, RECORD_MAX_BYTES, TS_MAX, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, recordId, routeFor, sharedInboxId,
 } from '../src/records.js';
 import { tmpDir } from './helpers.mjs';
 
@@ -10,7 +10,7 @@ const alice = await loadIdentity(tmpDir());
 const bob = await loadIdentity(tmpDir());
 const TS = 1_700_000_000_000;
 
-const announce = (id = alice, extra = {}) => ({ type: 'announce', signer: id.fp, ts: TS, name: 'alice', addr: [], ...extra });
+const announce = (id = alice, extra = {}) => ({ type: 'announce', signer: id.fp, ts: TS, name: 'alice', ...extra });
 
 // Builds an envelope by hand: signs `payloadBytes` with `signer` under `domain`, bypassing encodeRecord's checks.
 function forge(signer, payload, { domain = 'code-inbox/v1\0', key = signer.publicRaw, extra = {} } = {}) {
@@ -164,9 +164,10 @@ test('a contact card round-trips and refuses a wrong prefix, non-canonical base6
   const { bytes } = encodeRecord(alice, announce());
   const card = encodeCard(bytes);
   assert.ok(card.startsWith(CARD_PREFIX));
+  assert.equal(CARD_PREFIX, 'code-inbox-card:v2:');
   assert.deepEqual(decodeCard(`  ${card}\n`), bytes);
   const body = card.slice(CARD_PREFIX.length);
-  assert.equal(decodeCard(`code-inbox-card:v2:${body}`), null);
+  assert.equal(decodeCard(`code-inbox-card:v1:${body}`), null);
   assert.equal(decodeCard(body), null);
   assert.equal(decodeCard(`${CARD_PREFIX}${body}=`), null);
   assert.equal(decodeCard(`${CARD_PREFIX}AB`), null); // decodes, but re-encodes as AA: not canonical

@@ -1,10 +1,18 @@
 import { useState } from 'react';
 import { api } from '../api';
-import type { State } from '../types';
+import type { Presence, State } from '../types';
 import { who } from '../format';
 import { useAction } from '../useAction';
 import { Panel } from './Panel';
 
+// Where an identity is now, in words: each hub that has it and each session to it.
+export function describePresence(presence: Presence[]) {
+  if (presence.length === 0) return 'not connected';
+  return presence.map((p) => (p.via === 'hub' ? `on hub ${p.address}` : p.address ? `connected via ${p.address}` : 'connected to your listener')).join(', ');
+}
+
+// Every identity this install knows of, strangers included (seen on a hub or met on a connection): any of them can be
+// invited, which makes it a contact.
 export function DirectoryPanel({ state, refresh }: { state: State; refresh: () => void }) {
   const [inboxName, setInboxName] = useState('');
   const { busy, error, run } = useAction(refresh);
@@ -15,7 +23,11 @@ export function DirectoryPanel({ state, refresh }: { state: State; refresh: () =
         <ul className="list">
           {state.directory.map((d) => (
             <li key={d.fp} className="row">
-              <span className="grow"><strong>{d.name}</strong> <span className="mono muted">{d.fingerprint}</span></span>
+              <span className="grow">
+                <strong>{d.name}</strong> <span className="mono muted">{d.fingerprint}</span>
+                {!d.contact && <> <span className="tag">not a contact</span></>}
+                {' '}<span role="status" aria-label={`Presence of ${d.name}`} className="muted">{describePresence(d.presence)}</span>
+              </span>
               <button type="button" disabled={busy} onClick={() => void run(() => api.invite(d.fp))}>Invite to personal inbox</button>
             </li>
           ))}

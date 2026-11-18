@@ -6,22 +6,22 @@ import net from 'node:net';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { loadIdentity } from '../src/identity.js';
-import { decodeCard, decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
-import { createStore } from '../src/store.js';
-import { HUB_FRAME_MAX, HUB_WATCH_MAX, TCP_HELLO_FRAME_MAX } from '../src/transport/frames.js';
+import { ANNOUNCE_MAX_BYTES, decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
+import { HUB_FRAME_MAX, TCP_HELLO_FRAME_MAX } from '../src/transport/frames.js';
 import { makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
-import { createHubEndpoint, resolveHubConfig } from '../src/transport/hubClient.js';
 import { routeKey } from '../src/transport/index.js';
-import { TCP_REDIAL_MAX_MS, TCP_REDIAL_MIN_MS, createTcpEndpoint } from '../src/transport/tcp.js';
-import { fakeClock, makeInstall, silentLog, tmpDir } from './helpers.mjs';
-import { hubNode, lyingHub, rawHubLink, startHub, tunnelPeer } from './hubHelpers.mjs';
-import { freePort, memCursors, personal, rawConnect, settle, stubSink, stubView, waitFor } from './tcpHelpers.mjs';
+import { TCP_REDIAL_MAX_MS, TCP_REDIAL_MIN_MS } from '../src/transport/endpoint.js';
+import { createNetworkEndpoint } from '../src/transport/network.js';
+import { fakeClock, silentLog, tmpDir } from './helpers.mjs';
+import { lyingHub, rawHubLink, startHub, tunnelPeer } from './hubHelpers.mjs';
+import { netNode } from './netHelpers.mjs';
+import { helloFrame, memCursors, personal, rawConnect, settle, stubSink, stubView, waitFor } from './tcpHelpers.mjs';
 
-// The hub and the hub client over real loopback sockets on ephemeral ports. Engines run with an hour-long maintain
-// interval: every sync is driven by the test. Each test closes every hub, link and engine it opened.
+// The hub and the hub mode of a connection over real loopback sockets on ephemeral ports. Engines run with an
+// hour-long maintain interval: every sync is driven by the test. Each test closes every hub, link and engine it opened.
 
 const newIdentity = () => loadIdentity(tmpDir('code-inbox-id-'));
-const announceOf = (identity, addr = []) => encodeRecord(identity, { type: 'announce', signer: identity.fp, ts: Date.now(), name: `n${identity.fp.slice(0, 6)}`, addr }).bytes;
+const announceOf = (identity, name = `n${identity.fp.slice(0, 6)}`) => encodeRecord(identity, { type: 'announce', signer: identity.fp, ts: Date.now(), name }).bytes;
 const cardOf = (identity) => encodeCard(announceOf(identity));
 const b64 = (bytes) => Buffer.from(bytes).toString('base64url');
 const randomFp = () => crypto.randomBytes(32).toString('hex');
@@ -29,7 +29,12 @@ const closeAll = (t, ...things) => t.after(async () => { for (const x of things)
 const header = (n) => { const b = Buffer.alloc(4); b.writeUInt32BE(n); return b; };
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const of = (frames, t) => frames.filter((f) => f.t === t);
+const decodeRecordOf = (b64rec) => decodeRecord(Buffer.from(b64rec, 'base64url')).payload;
 const sessionsWith = (node, fp) => node.transport.stats().sessions.filter((s) => s.remote.includes(fp));
+// An engine whose one connection is the hub at `addr`.
+const hubNode = (name, addr, opts = {}) => netNode(name, { listen: null, connections: [addr], ...opts });
+const hubRow = (node) => node.transport.stats().connections[0];
+const connected = (node) => hubRow(node)?.state === 'up';
 
 // ---- routing ----
 
@@ -55,20 +60,20 @@ test('the hub routes a stream only to the link that proved its target', async (t
   assert.deepEqual(await A.nextOf('close'), { t: 'close', s: 5, reason: 'ABSENT' });
   A.send({ t: 'ping' });
   await A.nextOf('pong');
-  assert.deepEqual(C.frames.map((f) => f.t).filter((x) => x !== 'ping'), ['hello', 'ok']);
+  assert.deepEqual(C.frames.map((f) => f.t).filter((x) => !['ping', 'peer'].includes(x)), ['hello', 'ok']);
   assert.equal(hub.stats().streams, 1);
 });
 
-// Invariant: an unauthenticated connection can make the hub write only its `hello`: no stream, no watch, no
-// registered fingerprint, and a bad proof ends it with PROOF.
-test('an unregistered connection can open no stream, watch nothing and learn nothing', async (t) => {
+// Invariant: an unauthenticated connection can make the hub write only its `hello`: no stream, no announce, no
+// registered fingerprint, no roster, and a bad proof ends it with PROOF.
+test('an unregistered connection can open no stream, announce nothing and receive no roster', async (t) => {
   const { hub, port } = await startHub(t);
   const b = await newIdentity();
   const B = await rawHubLink(port, [b]);
   closeAll(t, B);
   const tries = [
     [{ t: 'open', s: 1, to: b.fp }, 'PROTOCOL'],
-    [{ t: 'watch', id: 1, fps: [b.fp] }, 'PROTOCOL'],
+    [{ t: 'announce', rec: b64(announceOf(b)) }, 'PROTOCOL'],
     [{ t: 'register', ids: [{ key: b64(b.publicRaw), sig: b64(crypto.randomBytes(64)) }] }, 'PROOF'],
   ];
   for (const [frame, reason] of tries) {
@@ -80,6 +85,7 @@ test('an unregistered connection can open no stream, watch nothing and learn not
   }
   assert.equal(hub.stats().handshakeFailures, 3);
   assert.deepEqual(B.frames.map((f) => f.t).filter((x) => x !== 'ping'), ['hello', 'ok']);
+  assert.equal(hub.stats().announces, 0);
 });
 
 // Invariant: a registration proof is bound to both nonces and the role `hub`: it fails on any other connection, a
@@ -103,41 +109,40 @@ test('a registration proof from another connection or role is refused, and a hub
   await role.whenClosed;
   assert.equal(role.frames.at(-1).reason, 'PROOF');
 
-  // A hub that hands a client a TCP endpoint's nonce as its own gets a `hub` proof over it; relayed as a `prove`
-  // to that endpoint, it is refused.
+  // A hub that hands a client an endpoint's nonce as its own gets a `hub` proof over it; relayed as a `prove` to that
+  // endpoint's listener, it is refused.
   const x = await newIdentity();
-  const endpoint = createTcpEndpoint({ port: 0, syncMs: 3_600_000, log: silentLog });
+  const endpoint = createNetworkEndpoint({ listen: { port: 0 }, syncMs: 3_600_000, log: silentLog });
   await endpoint.attach({ identity: proofSigner(x), view: stubView(), cursors: memCursors() }).start(stubSink());
   t.after(() => endpoint.close());
   const tcp = await rawConnect(endpoint.stats().listening.port);
   closeAll(t, tcp);
   const theirs = await tcp.nextOf('hello');
   const clientNonce = newHandshakeNonce();
-  tcp.send({ t: 'hello', v: 1, nonce: clientNonce });
+  tcp.send(helloFrame(clientNonce));
   tcp.send({ t: 'prove', target: x.fp, ids: makeProofs([proofSigner(victim)], 'hub', clientNonce, theirs.nonce, '') });
   await tcp.whenClosed;
   assert.equal(tcp.frames.at(-1).reason, 'PROOF');
 });
 
-// Invariant: newest registration wins: the older link is told DUPLICATE, its streams close GONE at their peers,
-// watchers hear it leave and come back, and new opens reach the new link.
+// Invariant: newest registration wins: the older link is told DUPLICATE, its streams close GONE at their peers, the
+// roster keeps the fp present (no `gone`), and new opens reach the new link.
 test('a second link proving the same fingerprint replaces the first', async (t) => {
   const { hub, port } = await startHub(t);
   const [a, b] = [await newIdentity(), await newIdentity()];
   const A = await rawHubLink(port, [a]);
   const B = await rawHubLink(port, [b]);
   closeAll(t, A, B);
-  A.send({ t: 'watch', id: 1, fps: [b.fp] });
-  assert.deepEqual(await A.nextOf('present'), { t: 'present', id: 1, fps: [b.fp] });
+  assert.deepEqual(await A.nextOf('peer'), { t: 'peer', fp: b.fp, rec: null });
   A.send({ t: 'open', s: 1, to: b.fp });
   await B.nextOf('incoming');
   const B2 = await rawHubLink(port, [b]);
   closeAll(t, B2);
   await B.whenClosed;
   assert.deepEqual(B.frames.at(-1), { t: 'bye', reason: 'DUPLICATE' });
-  await waitFor(() => of(A.frames, 'presence').length === 2, 'b to leave and come back');
+  await waitFor(() => of(A.frames, 'peer').length === 2, 'b to be reported again');
   assert.deepEqual(of(A.frames, 'close'), [{ t: 'close', s: 1, reason: 'GONE' }]);
-  assert.deepEqual(of(A.frames, 'presence'), [{ t: 'presence', fp: b.fp, online: false }, { t: 'presence', fp: b.fp, online: true }]);
+  assert.deepEqual(of(A.frames, 'gone'), []);
   A.send({ t: 'open', s: 3, to: b.fp });
   assert.equal((await B2.nextOf('incoming')).t, 'incoming');
   assert.deepEqual([hub.stats().links, hub.stats().fps], [2, 2]);
@@ -147,17 +152,17 @@ test('a second link proving the same fingerprint replaces the first', async (t) 
 // the clock runs, and the page shows HUB_DUPLICATE.
 test('a hub client replaced by a duplicate stops reconnecting and shows HUB_DUPLICATE', async (t) => {
   const clock = fakeClock();
-  const { hub, port, url } = await startHub(t);
-  const alice = await hubNode('alice', { url, schedule: clock.schedule, now: clock.now });
+  const { hub, port, addr } = await startHub(t);
+  const alice = await hubNode('alice', addr, { schedule: clock.schedule, now: clock.now });
   closeAll(t, alice);
-  await waitFor(() => alice.connected(), 'alice registered');
+  await waitFor(() => connected(alice), 'alice registered');
   const copy = await rawHubLink(port, [alice.identity]);
   closeAll(t, copy);
-  await waitFor(() => alice.transport.stats().hub.error?.code === 'HUB_DUPLICATE', 'HUB_DUPLICATE');
-  for (let i = 0; i < 10; i += 1) { clock.advance(TCP_REDIAL_MAX_MS); await sleep(5); }
+  await waitFor(() => hubRow(alice).error?.code === 'HUB_DUPLICATE', 'HUB_DUPLICATE');
+  for (let i = 0; i < 10; i += 1) { clock.advance(TCP_REDIAL_MAX_MS); await alice.engine.sync(); await sleep(5); }
   assert.equal(hub.stats().links, 1);
-  assert.equal(alice.connected(), false);
-  assert.equal(alice.engine.state().transport.hub.error.code, 'HUB_DUPLICATE');
+  assert.equal(hubRow(alice).state, 'stopped');
+  assert.equal(alice.engine.state().transport.connections[0].error.code, 'HUB_DUPLICATE');
   assert.equal(copy.closed, false);
 });
 
@@ -165,18 +170,18 @@ test('a hub client replaced by a duplicate stops reconnecting and shows HUB_DUPL
 // endpoint, or a second one attached) is never stopped as a duplicate of itself: only the current link may record
 // HUB_DUPLICATE.
 test('a client that re-registers its own identities is not stopped as its own duplicate', async (t) => {
-  const { hub, port, url } = await startHub(t);
-  const endpoint = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog });
-  const alice = await hubNode('alice', { url, endpoint });
-  const carol = await hubNode('carol', { url, endpoint });
+  const { hub, port, addr } = await startHub(t);
+  const endpoint = createNetworkEndpoint({ connections: [addr], syncMs: 3_600_000, log: silentLog });
+  const alice = await hubNode('alice', addr, { endpoint });
+  const carol = await hubNode('carol', addr, { endpoint });
   t.after(async () => { await alice.close(); await carol.close(); endpoint.close(); });
-  await waitFor(() => hub.stats().fps === 2 && alice.connected(), 'both identities on one link');
+  await waitFor(() => hub.stats().fps === 2 && connected(alice), 'both identities on one link');
   assert.equal(hub.stats().links, 1);
   await carol.close();
-  await waitFor(() => hub.stats().fps === 1 && hub.stats().links === 1 && alice.connected(), 'alice re-registered alone');
+  await waitFor(() => hub.stats().fps === 1 && hub.stats().links === 1 && connected(alice), 'alice re-registered alone');
   await sleep(50);
-  assert.equal(alice.connected(), true);
-  assert.equal(alice.transport.stats().hub.error, null);
+  assert.equal(connected(alice), true);
+  assert.equal(hubRow(alice).error, null);
   // The link that is current takes streams.
   const m = await rawHubLink(port, [await newIdentity()]);
   closeAll(t, m);
@@ -188,22 +193,22 @@ test('a client that re-registers its own identities is not stopped as its own du
 // or after close() with a binding still attached, the redial delay passes with exactly the links expected.
 test('a link the client left arms no reconnect', async (t) => {
   const clock = fakeClock();
-  const { hub, url } = await startHub(t);
-  const shared = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
-  const alice = await hubNode('alice', { url, endpoint: shared, schedule: clock.schedule, now: clock.now });
-  const carol = await hubNode('carol', { url, endpoint: shared, schedule: clock.schedule, now: clock.now });
+  const { hub, addr } = await startHub(t);
+  const shared = createNetworkEndpoint({ connections: [addr], syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
+  const alice = await hubNode('alice', addr, { endpoint: shared, schedule: clock.schedule, now: clock.now });
+  const carol = await hubNode('carol', addr, { endpoint: shared, schedule: clock.schedule, now: clock.now });
   t.after(async () => { await alice.close(); await carol.close(); shared.close(); });
-  await waitFor(() => hub.stats().fps === 2 && alice.connected(), 'both identities on one link');
+  await waitFor(() => hub.stats().fps === 2 && connected(alice), 'both identities on one link');
   await carol.close();
-  await waitFor(() => hub.stats().fps === 1 && hub.stats().links === 1 && alice.connected(), 'alice re-registered alone');
+  await waitFor(() => hub.stats().fps === 1 && hub.stats().links === 1 && connected(alice), 'alice re-registered alone');
   clock.advance(2 * TCP_REDIAL_MIN_MS);
   await sleep(50);
-  assert.deepEqual([hub.stats().links, alice.connected(), alice.transport.stats().hub.error], [1, true, null]);
+  assert.deepEqual([hub.stats().links, connected(alice), hubRow(alice).error], [1, true, null]);
 
-  const own = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
-  const bob = await hubNode('bob', { url, endpoint: own, schedule: clock.schedule, now: clock.now });
+  const own = createNetworkEndpoint({ connections: [addr], syncMs: 3_600_000, log: silentLog, schedule: clock.schedule, now: clock.now });
+  const bob = await hubNode('bob', addr, { endpoint: own, schedule: clock.schedule, now: clock.now });
   closeAll(t, bob);
-  await waitFor(() => bob.connected() && hub.stats().links === 2, 'bob registered');
+  await waitFor(() => connected(bob) && hub.stats().links === 2, 'bob registered');
   own.close(); // the binding stays attached
   await waitFor(() => hub.stats().links === 1, 'bob\'s link to go');
   clock.advance(2 * TCP_REDIAL_MIN_MS);
@@ -214,18 +219,18 @@ test('a link the client left arms no reconnect', async (t) => {
 // Invariant (review C1): detaching an identity re-registers the rest even after HUB_DUPLICATE stopped the link: a
 // copy of the detached identity no longer conflicts, so the client comes back.
 test('detaching the duplicated identity brings a stopped client back', async (t) => {
-  const { hub, port, url } = await startHub(t);
-  const shared = createHubEndpoint({ url, syncMs: 3_600_000, log: silentLog });
-  const alice = await hubNode('alice', { url, endpoint: shared });
-  const carol = await hubNode('carol', { url, endpoint: shared });
+  const { hub, port, addr } = await startHub(t);
+  const shared = createNetworkEndpoint({ connections: [addr], syncMs: 3_600_000, log: silentLog });
+  const alice = await hubNode('alice', addr, { endpoint: shared });
+  const carol = await hubNode('carol', addr, { endpoint: shared });
   t.after(async () => { await alice.close(); await carol.close(); shared.close(); });
-  await waitFor(() => hub.stats().fps === 2 && alice.connected(), 'both identities on one link');
+  await waitFor(() => hub.stats().fps === 2 && connected(alice), 'both identities on one link');
   const copy = await rawHubLink(port, [carol.identity]);
   closeAll(t, copy);
-  await waitFor(() => alice.transport.stats().hub.error?.code === 'HUB_DUPLICATE', 'HUB_DUPLICATE');
+  await waitFor(() => hubRow(alice).error?.code === 'HUB_DUPLICATE', 'HUB_DUPLICATE');
   await carol.close();
-  await waitFor(() => alice.connected(), 'alice back on the hub');
-  assert.equal(alice.transport.stats().hub.error, null);
+  await waitFor(() => connected(alice), 'alice back on the hub');
+  assert.equal(hubRow(alice).error, null);
   assert.equal(copy.closed, false);
   assert.equal(hub.stats().fps, 2);
 });
@@ -235,14 +240,14 @@ test('detaching the duplicated identity brings a stopped client back', async (t)
 test('a hub that refuses the registration shows HUB_REFUSED and the client retries', async (t) => {
   const clock = fakeClock();
   const lying = await lyingHub(t, { refuse: true });
-  const alice = await hubNode('alice', { url: lying.url, schedule: clock.schedule, now: clock.now });
+  const alice = await hubNode('alice', lying.addr, { schedule: clock.schedule, now: clock.now });
   closeAll(t, alice);
-  await waitFor(() => alice.transport.stats().hub.error?.code === 'HUB_REFUSED', 'HUB_REFUSED');
+  await waitFor(() => hubRow(alice).error?.code === 'HUB_REFUSED', 'HUB_REFUSED');
   assert.equal(lying.accepted, 1);
   clock.advance(TCP_REDIAL_MIN_MS);
   await waitFor(() => lying.accepted === 2, 'a reconnect after the backoff');
   await sleep(20);
-  assert.equal(alice.transport.stats().hub.error.code, 'HUB_REFUSED');
+  assert.equal(hubRow(alice).error.code, 'HUB_REFUSED');
   clock.advance(TCP_REDIAL_MIN_MS);
   await sleep(50);
   assert.equal(lying.accepted, 2, 'the second wait is longer: backoff doubles');
@@ -257,12 +262,12 @@ test('a hub that refuses the registration shows HUB_REFUSED and the client retri
 test('a misrouting hub cannot make a session with the wrong identity', async (t) => {
   let ids = {};
   const lying = await lyingHub(t, { route: (to) => lying.linkOf(to === ids.bob ? ids.mallory : to) });
-  const alice = await hubNode('alice', { url: lying.url });
-  const bob = await hubNode('bob', { url: lying.url });
-  const mallory = await hubNode('mallory', { url: lying.url });
+  const alice = await hubNode('alice', lying.addr);
+  const bob = await hubNode('bob', lying.addr);
+  const mallory = await hubNode('mallory', lying.addr);
   closeAll(t, alice, bob, mallory);
   ids = { bob: bob.fp, mallory: mallory.fp };
-  await waitFor(() => alice.connected() && bob.connected() && mallory.connected(), 'all registered');
+  await waitFor(() => connected(alice) && connected(bob) && connected(mallory), 'all registered');
   await alice.engine.importCard(bob.card());
   await alice.engine.sync();
   await waitFor(() => alice.transport.stats().handshakeFailures >= 1, 'the misrouted handshake to fail');
@@ -279,10 +284,10 @@ test('a misrouting hub cannot make a session with the wrong identity', async (t)
 // (ROUTE_MISMATCH).
 test('a hub that forges from is refused end to end', async (t) => {
   const lying = await lyingHub(t);
-  const alice = await hubNode('alice', { url: lying.url });
-  const bob = await hubNode('bob', { url: lying.url });
+  const alice = await hubNode('alice', lying.addr);
+  const bob = await hubNode('bob', lying.addr);
   closeAll(t, alice, bob);
-  await waitFor(() => alice.connected() && bob.connected(), 'both registered');
+  await waitFor(() => connected(alice) && connected(bob), 'both registered');
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
   assert.equal(sessionsWith(alice, bob.fp).length, 1);
@@ -300,19 +305,19 @@ test('a hub that forges from is refused end to end', async (t) => {
   assert.ok(!alice.engine.state().directory.some((d) => d.fp === carol.fp));
 });
 
-// Invariant: peerOnline comes only from an end-to-end session, never the hub's word: a presence notice followed by
-// a stream that answers garbage leaves the outbox as it was.
+// Invariant: peerOnline comes only from an end-to-end session, never the hub's word: a roster `peer` notice followed
+// by a stream that answers garbage leaves the outbox as it was.
 test('hub presence never fires peerOnline', async (t) => {
   const garbage = Buffer.concat([header(5), Buffer.from('{oops')]);
   const lying = await lyingHub(t, { onOpen: (link, f) => { link.send({ t: 'data', s: f.s, b: b64(garbage) }); return true; } });
-  const alice = await hubNode('alice', { url: lying.url });
+  const alice = await hubNode('alice', lying.addr);
   closeAll(t, alice);
-  await waitFor(() => alice.connected(), 'alice registered');
+  await waitFor(() => connected(alice), 'alice registered');
   const bob = await newIdentity();
   await alice.engine.importCard(cardOf(bob));
   await alice.engine.invite(bob.fp);
   assert.equal(alice.engine.state().diagnostics.outbox, 1);
-  lying.notify(lying.linkOf(alice.fp), { t: 'presence', fp: bob.fp, online: true });
+  lying.notify(lying.linkOf(alice.fp), { t: 'peer', fp: bob.fp, rec: b64(announceOf(bob)) });
   await waitFor(() => alice.transport.stats().handshakeFailures >= 1, 'the garbage answer to fail the handshake');
   await alice.engine.sync();
   assert.deepEqual(alice.online, []);
@@ -324,9 +329,9 @@ test('hub presence never fires peerOnline', async (t) => {
 // Invariant: the hub stores nothing: a record for an offline peer waits in the sender's outbox and goes out when
 // the peer's session through the hub becomes ready.
 test('an offline peer gets the record from the outbox when it comes back through the hub', async (t) => {
-  const { url } = await startHub(t);
-  const alice = await hubNode('alice', { url });
-  let bob = await hubNode('bob', { url });
+  const { addr } = await startHub(t);
+  const alice = await hubNode('alice', addr);
+  let bob = await hubNode('bob', addr);
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
@@ -335,25 +340,22 @@ test('an offline peer gets the record from the outbox when it comes back through
   await waitFor(() => sessionsWith(alice, bob.fp).length === 0, 'alice to see bob leave');
   await alice.engine.sendMessage(inbox, 'while you were out');
   assert.equal(alice.engine.state().diagnostics.outbox, 1);
-  bob = await hubNode('bob', { dataDir: bob.dataDir });
+  bob = await hubNode('bob', addr, { dataDir: bob.dataDir });
   await waitFor(() => bob.engine.messages(inbox).length === 1, 'the message');
   assert.deepEqual(bob.engine.messages(inbox).map((m) => m.body), ['while you were out']);
   await waitFor(() => alice.engine.state().diagnostics.outbox === 0, 'the outbox to drain');
   assert.ok(alice.online.includes(bob.fp));
 });
 
-// Invariant: many clients share one hub, and members known only by fingerprint reach each other through it with no
-// whois (no install answers one).
+// Invariant: many clients share one hub, and members reach each other through it: co-members are contacts, and the
+// roster says where they are.
 test('many clients on one hub exchange a shared inbox', async (t) => {
-  const { hub, url } = await startHub(t);
-  let whois = 0;
-  const counting = (node) => { const f = node.view.announceFor; node.view.announceFor = (...a) => { whois += 1; return f(...a); }; };
-  const owner = await hubNode('owner', { url });
+  const { hub, addr } = await startHub(t);
+  const owner = await hubNode('owner', addr);
   const members = [];
-  for (let i = 0; i < 6; i += 1) members.push(await hubNode(`m${i}`, { url }));
+  for (let i = 0; i < 6; i += 1) members.push(await hubNode(`m${i}`, addr));
   const all = [owner, ...members];
   t.after(async () => { for (const n of all) await n.close(); });
-  for (const n of all) counting(n);
   for (const m of members) await m.engine.importCard(owner.card());
   await settle(all);
   const { id: team } = await owner.engine.createSharedInbox('team');
@@ -366,16 +368,15 @@ test('many clients on one hub exchange a shared inbox', async (t) => {
   const expected = members.map((m) => `from ${m.name}`).sort();
   for (const n of all) assert.deepEqual(n.engine.messages(team).map((x) => x.body).sort(), expected, n.name);
   assert.equal(hub.stats().links, 7);
-  assert.equal(whois, 0);
 });
 
 // Invariant: least disclosure binds peers end to end through the hub: a stranger's pull is answered only for what
-// it may read (denials carry no head), alice's pull names only routes the stranger could serve, and whois about
-// someone the stranger shares no inbox with answers nothing.
+// it may read (denials carry no head), alice's pull names only routes the stranger could serve, and no frame asks
+// about anyone else (a whois closes the session).
 test('least disclosure holds through the hub', async (t) => {
-  const { port, url } = await startHub(t);
-  const alice = await hubNode('alice', { url });
-  const bob = await hubNode('bob', { url });
+  const { port, addr } = await startHub(t);
+  const alice = await hubNode('alice', addr);
+  const bob = await hubNode('bob', addr);
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
@@ -393,44 +394,141 @@ test('least disclosure holds through the hub', async (t) => {
   const recs = await tun.nextOf('recs');
   assert.deepEqual(recs.routes.map((r) => [routeKey(r.route), r.status, (r.recs?.length ?? 0) > 0]), [[`inbox:${inbox}`, 'denied', false], [`mailbox:${bob.fp}`, 'denied', false], ['directory', 'ok', true]]);
   for (const r of recs.routes.slice(0, 2)) assert.deepEqual(Object.keys(r).sort(), ['route', 'status']);
-  tun.send({ t: 'whois', id: 9, from: mallory.fp, to: alice.fp, fps: [bob.fp] });
-  assert.deepEqual((await tun.nextOf('cards')).recs, []);
   await alice.engine.sync();
   for (const p of of(tun.frames, 'pull')) for (const r of p.routes) assert.ok(!routeKey(r.route).startsWith('inbox:'));
   assert.ok(!JSON.stringify(tun.frames.filter((f) => f.t === 'pull')).includes(team));
+  tun.send({ t: 'whois', id: 9, from: mallory.fp, to: alice.fp, fps: [bob.fp] });
+  assert.deepEqual(await tun.nextOf('bye'), { t: 'bye', reason: 'PROTOCOL' });
 });
 
-// Invariant: what the hub learns of a client's contacts is its dial set: the watch is exactly its contacts, and a
-// stranger whose stream arrived is neither watched nor dialed.
-test('a hub client watches only its dial set', async (t) => {
+// Invariant (A1): a hub never receives a contact list: what a client sends it is its registration, its own
+// announces and stream frames. Every announce is signed by a registered fp, and no other fp appears outside `open.to`.
+test('a client sends a hub only its registration, its own announces and stream frames', async (t) => {
   const lying = await lyingHub(t);
-  const alice = await hubNode('alice', { url: lying.url });
-  closeAll(t, alice);
-  await waitFor(() => alice.connected(), 'alice registered');
-  const bob = await newIdentity();
-  const carol = await newIdentity();
-  await alice.engine.importCard(cardOf(bob));
+  const alice = await hubNode('alice', lying.addr);
+  const bob = await hubNode('bob', lying.addr);
+  closeAll(t, alice, bob);
+  await waitFor(() => connected(alice) && connected(bob), 'both registered');
+  const [carol, dave] = [await newIdentity(), await newIdentity()];
   await alice.engine.importCard(cardOf(carol));
+  await alice.engine.importCard(cardOf(dave));
+  await alice.engine.importCard(bob.card());
   await alice.engine.invite(carol.fp);
-  await alice.engine.sync();
-  const atAlice = lying.linkOf(alice.fp);
-  const lastWatch = () => of(lying.received(atAlice), 'watch').at(-1).fps;
-  assert.deepEqual(lastWatch(), [...alice.view.contacts()].sort());
-  assert.deepEqual(lastWatch(), [bob.fp, carol.fp].sort());
-  // A stranger dials in and pushes its announce; alice announces to everyone she knows, the stranger included.
-  const mallory = await newIdentity();
-  const link = await rawHubLink(lying.port, [mallory]);
-  closeAll(t, link);
-  const tun = await tunnelPeer(link, mallory, alice.fp);
-  tun.send({ t: 'rec', from: mallory.fp, to: alice.fp, route: { kind: 'directory' }, rec: b64(announceOf(mallory)) });
-  await waitFor(() => alice.engine.state().directory.some((d) => d.fp === mallory.fp), 'mallory in the directory');
-  link.destroy();
-  await waitFor(() => sessionsWith(alice, mallory.fp).length === 0, 'mallory to leave');
-  lying.notify(atAlice, { t: 'presence', fp: mallory.fp, online: true });
   await alice.engine.announce();
-  await alice.engine.sync();
-  for (const w of of(lying.received(atAlice), 'watch')) assert.ok(!w.fps.includes(mallory.fp));
-  assert.ok(!of(lying.received(atAlice), 'open').some((f) => f.to === mallory.fp));
+  await settle([alice, bob]);
+  const sent = lying.received(lying.linkOf(alice.fp));
+  assert.ok(sent.every((f) => ['open', 'data', 'close', 'announce', 'ping', 'pong', 'bye'].includes(f.t)), [...new Set(sent.map((f) => f.t))].join());
+  assert.ok(of(sent, 'announce').length >= 2);
+  assert.ok(of(sent, 'announce').every((f) => decodeRecordOf(f.rec).signer === alice.fp));
+  assert.deepEqual([...new Set(of(sent, 'open').map((f) => f.to))], [bob.fp]);
+  const control = JSON.stringify(sent.filter((f) => f.t !== 'data' && f.t !== 'open' && f.t !== 'announce'));
+  for (const fp of [bob.fp, carol.fp, dave.fp]) assert.ok(!control.includes(fp));
+});
+
+// ---- the roster ----
+
+// Invariant (A1 D13): a newcomer is told every fp registered on other links with its announce, and every other link
+// is told the newcomer's fps, then its announce once given.
+test('the hub sends a newcomer every registered announce and every other link the newcomer\'s', async (t) => {
+  const { hub, port } = await startHub(t);
+  const [a, b, c] = [await newIdentity(), await newIdentity(), await newIdentity()];
+  const A = await rawHubLink(port, [a]);
+  A.send({ t: 'announce', rec: b64(announceOf(a, 'alice')) });
+  const B = await rawHubLink(port, [b]);
+  closeAll(t, A, B);
+  B.send({ t: 'announce', rec: b64(announceOf(b, 'bob')) });
+  const peerOf = (L, fp) => of(L.frames, 'peer').filter((f) => f.fp === fp).at(-1);
+  await waitFor(() => peerOf(B, a.fp)?.rec && peerOf(A, b.fp)?.rec, 'both announces relayed');
+  assert.equal(decodeRecordOf(peerOf(B, a.fp).rec).name, 'alice');
+  assert.equal(decodeRecordOf(peerOf(A, b.fp).rec).name, 'bob');
+  const C = await rawHubLink(port, [c]);
+  closeAll(t, C);
+  await waitFor(() => peerOf(C, a.fp) && peerOf(C, b.fp) && peerOf(A, c.fp) && peerOf(B, c.fp), 'the newcomer burst and fan-out');
+  assert.deepEqual([decodeRecordOf(peerOf(C, a.fp).rec).name, decodeRecordOf(peerOf(C, b.fp).rec).name], ['alice', 'bob']);
+  assert.deepEqual(peerOf(A, c.fp), { t: 'peer', fp: c.fp, rec: null });
+  assert.equal(of(C.frames, 'peer').some((f) => f.fp === c.fp), false);
+  assert.deepEqual([hub.stats().announces, hub.stats().rosterPending], [2, 0]);
+  // An announce must be signed by an fp the link registered.
+  A.send({ t: 'announce', rec: b64(announceOf(c)) });
+  await A.whenClosed;
+  assert.deepEqual(A.frames.at(-1), { t: 'bye', reason: 'PROTOCOL' });
+});
+
+// Invariant (A1 D13): a link that closes is reported gone for the fps it still held; a fp re-registered on another
+// link is never reported gone, only present again.
+test('a closed link\'s fingerprints are reported gone; a re-registered one is not', async (t) => {
+  const { port } = await startHub(t);
+  const [a, b, c] = [await newIdentity(), await newIdentity(), await newIdentity()];
+  const A = await rawHubLink(port, [a]);
+  const B = await rawHubLink(port, [b, c]);
+  closeAll(t, A);
+  await waitFor(() => of(A.frames, 'peer').length === 2, 'b and c present');
+  const C2 = await rawHubLink(port, [c]); // c moves to a new link: B is closed DUPLICATE
+  closeAll(t, C2);
+  await B.whenClosed;
+  await waitFor(() => of(A.frames, 'gone').length === 1 && of(A.frames, 'peer').length === 3, 'b gone, c present again');
+  assert.deepEqual(of(A.frames, 'gone'), [{ t: 'gone', fp: b.fp }]);
+  assert.deepEqual(of(A.frames, 'peer').at(-1), { t: 'peer', fp: c.fp, rec: null });
+});
+
+// Invariant (A1 D13, realistic availability): roster entries that do not fit a link that is not reading wait, never
+// dropped: once it reads again it gets every fp's latest state, coalesced, and keeps its link.
+test('a slow reader receives the roster late and coalesced, never loses an entry, and keeps its link', async (t) => {
+  const accepted = [];
+  const createServer = (onConn) => net.createServer((s) => { accepted.push(s); onConn(s); });
+  const limits = { maxStreams: 1, writeBufferMax: 1024, controlBufferMax: 1024 };
+  const { hub, port } = await startHub(t, { limits, createServer });
+  const r = await newIdentity();
+  const R = await rawHubLink(port, [r]);
+  closeAll(t, R);
+  accepted[0].cork();
+  const ids = [];
+  for (let i = 0; i < 8; i += 1) ids.push(await newIdentity());
+  const links = [];
+  for (const id of ids) {
+    const L = await rawHubLink(port, [id]);
+    for (let k = 0; k < 3; k += 1) L.send({ t: 'announce', rec: b64(announceOf(id, `v${k}`)) });
+    links.push(L);
+  }
+  closeAll(t, ...links);
+  // Half of them leave again.
+  for (const L of links.slice(0, 4)) L.destroy();
+  await waitFor(() => hub.stats().links === 5, 'four links gone');
+  await waitFor(() => hub.stats().rosterPending > 0, 'entries waiting for the corked link');
+  assert.ok(accepted[0].writableLength <= limits.maxStreams * limits.writeBufferMax + limits.controlBufferMax);
+  assert.equal(hub.stats().dropped, 0);
+  accepted[0].uncork();
+  const latest = () => {
+    const state = new Map();
+    for (const f of R.frames) if (f.t === 'peer' || f.t === 'gone') state.set(f.fp, f);
+    return state;
+  };
+  await waitFor(() => {
+    const st = latest();
+    return ids.slice(4).every((id) => st.get(id.fp)?.t === 'peer' && st.get(id.fp).rec && decodeRecordOf(st.get(id.fp).rec).name === 'v2')
+      && ids.slice(0, 4).every((id) => !st.has(id.fp) || st.get(id.fp).t === 'gone');
+  }, 'the final roster', 5000);
+  assert.equal(R.closed, false);
+  assert.equal(hub.stats().rosterPending, 0);
+});
+
+// Invariant: a client shows only announces that verify as the fp the roster names (the kept signature check).
+test('a forwarded announce whose signature fails is not shown', async (t) => {
+  const lying = await lyingHub(t);
+  const alice = await hubNode('alice', lying.addr);
+  closeAll(t, alice);
+  await waitFor(() => connected(alice), 'alice registered');
+  const [bob, carol] = [await newIdentity(), await newIdentity()];
+  const forged = Buffer.from(announceOf(bob, 'bob'));
+  forged[forged.length - 5] ^= 1; // the signature no longer verifies
+  const link = lying.linkOf(alice.fp);
+  const before = alice.transport.stats().dropped;
+  lying.notify(link, { t: 'peer', fp: bob.fp, rec: b64(forged) });
+  lying.notify(link, { t: 'peer', fp: bob.fp, rec: b64(announceOf(carol, 'carol')) }); // carol's, named as bob's
+  lying.notify(link, { t: 'peer', fp: carol.fp, rec: b64(announceOf(carol, 'carol')) });
+  await waitFor(() => alice.engine.state().directory.some((d) => d.fp === carol.fp), 'carol shown');
+  assert.deepEqual(alice.engine.state().directory.map((d) => d.name), ['carol']);
+  assert.equal(alice.transport.stats().dropped, before + 2);
 });
 
 // ---- the open port ----
@@ -464,7 +562,8 @@ test('hub framing limits close a link', async (t) => {
     { t: 'open', s: 2, to: a.fp },
     { t: 'incoming', s: 2 },
     { t: 'data', s: 1, b: 'a+b/' },
-    { t: 'watch', id: 1, fps: Array(HUB_WATCH_MAX + 1).fill(a.fp) },
+    { t: 'announce', rec: b64(Buffer.alloc(ANNOUNCE_MAX_BYTES + 1, 1)) },
+    { t: 'watch', id: 1, fps: [a.fp] },
   ];
   for (const f of violations) {
     const raw = await rawHubLink(port, [a]);
@@ -596,7 +695,7 @@ test('filling every stream to a non-reading receiver closes streams, never its l
 });
 
 // Invariant (review R1): control frames owed to a link that holds its whole data budget and does not read are
-// dropped and counted, never the link: here the receiver itself asks for `present` answers it cannot take.
+// dropped and counted, never the link: here the receiver itself asks for `pong` answers it cannot take.
 test('control frames a full link cannot take are dropped, never the link', async (t) => {
   const accepted = [];
   const createServer = (onConn) => net.createServer((s) => { accepted.push(s); onConn(s); });
@@ -620,8 +719,8 @@ test('control frames a full link cannot take are dropped, never the link', async
   const held = accepted[0].writableLength;
   assert.ok(held > limits.maxStreams * limits.writeBufferMax - 3000, `${held} bytes of data held`);
   const before = hub.stats().dropped;
-  for (let id = 1; id <= 60; id += 1) R.send({ t: 'watch', id, fps: [a.fp] });
-  await waitFor(() => hub.stats().dropped > before, 'present answers to be dropped');
+  for (let i = 0; i < 400; i += 1) R.send({ t: 'ping' });
+  await waitFor(() => hub.stats().dropped > before, 'pong answers to be dropped');
   assert.ok(accepted[0].writableLength <= limits.maxStreams * limits.writeBufferMax + limits.controlBufferMax);
   assert.equal(hub.stats().links, 2);
   accepted[0].uncork();
@@ -634,12 +733,12 @@ test('control frames a full link cannot take are dropped, never the link', async
 // Invariant (conductor note 1, client side): a session's back-pressure counts only its own unflushed bytes, so a
 // session with bytes waiting on the shared hub link does not close another session on that link.
 test('a busy session on a hub link does not close another session on it', async (t) => {
-  const { url } = await startHub(t);
+  const { addr } = await startHub(t);
   let socket;
   const connect = (opts) => { socket = net.connect(opts); return socket; };
-  const alice = await hubNode('alice', { url, connect, limits: { writeBufferMax: 20_000 } });
-  const bob = await hubNode('bob', { url });
-  const carol = await hubNode('carol', { url });
+  const alice = await hubNode('alice', addr, { connect, limits: { writeBufferMax: 20_000 } });
+  const bob = await hubNode('bob', addr);
+  const carol = await hubNode('carol', addr);
   const all = [alice, bob, carol];
   t.after(async () => { for (const n of all) await n.close(); });
   await bob.engine.importCard(alice.card());
@@ -663,79 +762,20 @@ test('a busy session on a hub link does not close another session on it', async 
 test('a hub restart: clients reconnect, re-register and deliver what waited', async (t) => {
   const first = await startHub(t);
   const limits = { redialMinMs: 20, redialMaxMs: 100 };
-  const alice = await hubNode('alice', { url: first.url, limits });
-  const bob = await hubNode('bob', { url: first.url, limits });
+  const alice = await hubNode('alice', first.addr, { limits });
+  const bob = await hubNode('bob', first.addr, { limits });
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
   const inbox = await personal(alice, bob);
   first.hub.close();
-  await waitFor(() => !alice.connected() && sessionsWith(alice, bob.fp).length === 0, 'the hub to go');
+  await waitFor(() => !connected(alice) && sessionsWith(alice, bob.fp).length === 0, 'the hub to go');
   await alice.engine.sendMessage(inbox, 'after the restart');
   assert.equal(alice.engine.state().diagnostics.outbox, 1);
   const second = await startHub(t, { port: first.port });
   await waitFor(() => bob.engine.messages(inbox).length === 1, 'the message through the new hub', 5000);
   assert.deepEqual(bob.engine.messages(inbox).map((m) => m.body), ['after the restart']);
   assert.equal(second.hub.stats().links, 2);
-});
-
-// ---- settings ----
-
-// Invariant: hub settings are checked like TCP and share settings: refused HUB_INVALID on a save (malformed,
-// wildcard, unresolvable, too long), checked at boot where an unresolvable host still starts, resolved outside the
-// engine lock, and the announce and card carry the hub address.
-test('hub settings are validated on save and checked at boot', async (t) => {
-  const install = await makeInstall(null);
-  t.after(() => install.close());
-  for (const url of ['tcp://127.0.0.1:5', 'hub://127.0.0.1:0', 'hub://0.0.0.0:5', 'hub://[::]:5', `hub://${'a'.repeat(250)}.example:5`, 'hub://127.0.0.1', 5]) {
-    const res = await install.rest('POST', '/api/hub', { url });
-    assert.deepEqual([res.status, res.json.code], [400, 'HUB_INVALID'], String(url));
-  }
-  const lookup = async (name) => {
-    if (name === 'zero.example') return [{ address: '0.0.0.0', family: 4 }];
-    if (name === 'hub.example') return [{ address: '127.0.0.1', family: 4 }];
-    throw Object.assign(new Error('not found'), { code: 'ENOTFOUND' });
-  };
-  await assert.rejects(resolveHubConfig({ url: 'hub://zero.example:5' }, { lookup }), { code: 'HUB_INVALID' });
-  await assert.rejects(resolveHubConfig({ url: 'hub://nowhere.example:5' }, { lookup }), { code: 'HUB_INVALID' });
-  assert.deepEqual(await resolveHubConfig({ url: 'hub://nowhere.example:5' }, { lookup, mustResolve: false }), { url: 'hub://nowhere.example:5' });
-  await assert.rejects(resolveHubConfig({ url: 'hub://zero.example:5' }, { lookup, mustResolve: false }), { code: 'HUB_INVALID' });
-  assert.deepEqual(await resolveHubConfig({ url: 'hub://[::1]:5' }), { url: 'hub://[::1]:5' });
-
-  // A stored hub whose host does not resolve yet still starts (and keeps trying); a malformed one starts nothing.
-  const seeded = async (url) => {
-    const dataDir = tmpDir('code-inbox-hub-');
-    const store = createStore(dataDir, { log: silentLog });
-    const { settings } = await store.load();
-    await store.saveSettings({ ...settings, transport: { kind: 'hub', url } });
-    return dataDir;
-  };
-  const deadPort = await freePort();
-  const offline = await hubNode('offline', { dataDir: await seeded('hub://nowhere.example:5'), lookup, connect: () => net.connect({ host: '127.0.0.1', port: deadPort }) });
-  closeAll(t, offline);
-  assert.deepEqual([offline.engine.state().transport.kind, offline.engine.state().transport.configured, offline.engine.state().transport.error], ['hub', true, null]);
-  await waitFor(() => offline.engine.state().transport.hub.error?.code === 'ECONNREFUSED', 'the refused connect to show');
-  const malformed = await hubNode('bad', { dataDir: await seeded('hub://0.0.0.0:5'), lookup });
-  closeAll(t, malformed);
-  assert.equal(malformed.engine.state().transport.configured, false);
-  assert.equal(malformed.engine.state().transport.error.code, 'HUB_INVALID');
-
-  // The lookup runs before the engine lock is taken.
-  let release;
-  const gate = new Promise((r) => { release = r; });
-  const slow = await hubNode('slow', { lookup: async (name) => { if (name === 'hub.example') await gate; return lookup(name); }, connect: () => net.connect({ host: '127.0.0.1', port: deadPort }) });
-  closeAll(t, slow);
-  await slow.engine.setTcp({ port: 0 });
-  await slow.engine.announce();
-  const saving = slow.engine.setHub({ url: 'hub://hub.example:9' });
-  assert.deepEqual(await slow.engine.setName('slow2'), { name: 'slow2' }, 'another action ran while the lookup waited');
-  release();
-  assert.deepEqual(await saving, { url: 'hub://hub.example:9', addresses: ['hub://hub.example:9'] });
-  const view = slow.engine.state().transport;
-  assert.deepEqual([view.kind, view.url, view.addresses, view.cardStale], ['hub', 'hub://hub.example:9', ['hub://hub.example:9'], true]);
-  await slow.engine.announce();
-  assert.equal(slow.engine.state().transport.cardStale, false);
-  assert.deepEqual(decodeRecord(decodeCard(slow.card())).payload.addr, ['hub://hub.example:9']);
 });
 
 // Invariant: the hub is standalone: nothing it imports reaches the plugin host's modules.

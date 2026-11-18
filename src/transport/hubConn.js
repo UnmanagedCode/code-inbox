@@ -1,16 +1,19 @@
-import { FrameError, HUB_FRAME_MAX, TCP_HELLO_FRAME_MAX, createDecoder, encodeFrame, parseHubFrame } from './frames.js';
+import { FrameError, HELLO_VERSION, HUB_FRAME_MAX, TCP_HELLO_FRAME_MAX, createDecoder, encodeFrame, parseHubFrame } from './frames.js';
 import { makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
 
 // One hub-link connection, either side (docs/protocol.md → Hub link wire format): the hello exchange, `register` /
 // `ok`, phase frame limits, deadlines, keepalive, the write-buffer cap and `bye`. Every frame is handled
 // synchronously: neither side awaits inbound work, so there is no inbound queue and the socket is never paused.
-// The client proves its identities with role `hub` and bound `''`; the hub verifies and signs nothing.
+// The client proves its identities with role `hub` and bound `''`; the hub verifies and signs nothing. The hub's
+// hello says kind `hub`; the client side starts after its greeting (greeting.js) read that hello.
 
 /**
  * @param {object} o
  * @param {import('node:net').Socket} o.socket
  * @param {'hub'|'client'} o.role
  * @param {{fp, publicRaw, signProof}[]} [o.signers]   client: every identity to register
+ * @param {{myNonce, peerNonce, rest: Buffer}} [o.greeted]   client (required): the greeting's result on a paused
+ *                                                    socket; the client registers at once, then resumes it
  * @param {{handshakeMs, frameMs, idleMs, pingMs, writeBufferMax}} o.limits   writeBufferMax: unflushed link bytes
  * @param {boolean} [o.dropOverflow]   a frame that would pass writeBufferMax is dropped (send → false) instead of
  *                                     destroying the link: the hub, so no stream or peer can cost a client its link
@@ -20,9 +23,10 @@ import { makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
  * @param {(conn, frame) => void} o.onFrame             every ready-phase frame but ping/pong/bye; may throw FrameError
  * @param {(conn) => void} o.onClose                    once, ready or not
  */
-export function createHubConn({ socket, role, signers = [], limits, dropOverflow = false, onDrop = () => {}, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
+export function createHubConn({ socket, role, signers = [], greeted = null, limits, dropOverflow = false, onDrop = () => {}, schedule, onRegistered = () => {}, onReady = () => {}, onFrame, onClose }) {
+  if (role === 'client' && !greeted) throw new Error('a hub-link client starts after its greeting');
   const decoder = createDecoder({ maxFrame: TCP_HELLO_FRAME_MAX });
-  const myNonce = newHandshakeNonce();
+  const myNonce = greeted ? greeted.myNonce : newHandshakeNonce();
   let phase = 'hello';
   const timers = { handshake: schedule(() => destroy(), limits.handshakeMs), frame: null, idle: null, ping: null };
   let settle;
@@ -92,16 +96,15 @@ export function createHubConn({ socket, role, signers = [], limits, dropOverflow
     onReady(conn);
   }
 
+  function register(peerNonce) {
+    send({ t: 'register', ids: makeProofs(signers, 'hub', myNonce, peerNonce, '') });
+    phase = 'ok';
+  }
+
   function handshake(f) {
     if (phase === 'hello') {
-      const peerNonce = f.nonce;
-      if (role === 'client') {
-        send({ t: 'register', ids: makeProofs(signers, 'hub', myNonce, peerNonce, '') });
-        phase = 'ok';
-      } else {
-        conn.peerNonce = peerNonce;
-        phase = 'register';
-      }
+      conn.peerNonce = f.nonce;
+      phase = 'register';
     } else if (phase === 'register') {
       const fps = verifyProofs(f.ids, 'hub', conn.peerNonce, myNonce, '');
       if (!fps) { close('PROOF'); return; }
@@ -124,7 +127,7 @@ export function createHubConn({ socket, role, signers = [], limits, dropOverflow
     onFrame(conn, f);
   }
 
-  socket.on('data', (chunk) => {
+  function onData(chunk) {
     if (conn.closed) return;
     if (conn.ready) armIdle();
     decoder.push(chunk);
@@ -141,11 +144,22 @@ export function createHubConn({ socket, role, signers = [], limits, dropOverflow
     } catch (err) {
       if (err instanceof FrameError) close(err.code); else destroy();
     }
-  });
+  }
+
   // Stream data is small request/response pairs inside: Nagle plus delayed ACKs would add tens of ms to each.
   socket.setNoDelay(true);
+  socket.on('data', onData);
   socket.on('error', (err) => { conn.error = err; destroy(); });
   socket.on('close', () => teardown());
-  send({ t: 'hello', v: 1, nonce: myNonce });
+  if (greeted) {
+    // Register now, then read what followed the hub's hello and let the paused socket flow (deferred, so the caller
+    // holds the conn first; attaching a `data` listener does not resume a socket paused explicitly).
+    register(greeted.peerNonce);
+    queueMicrotask(() => {
+      if (socket.destroyed) { destroy(); return; }
+      if (greeted.rest.length) onData(greeted.rest);
+      socket.resume();
+    });
+  } else send({ t: 'hello', v: HELLO_VERSION, nonce: myNonce, kind: 'hub' });
   return conn;
 }

@@ -1,12 +1,12 @@
-// The pure fold of accepted records (+ this install's name pins) into what the install knows: the directory,
-// invites, inboxes, membership and which messages are valid. No I/O; the engine owns persistence.
+// The pure fold of accepted records (+ this install's name pins) into what the install knows: invites, inboxes,
+// membership and which messages are valid, plus the name rules over the in-memory announces (src/directory.js). No
+// I/O; the engine owns persistence. Announces are never records in the log.
 //
 // A record is {seq, id, payload}: `seq` is the local acceptance seq, `id` the record id (records.js). The index also
 // holds the records waiting for a dependency (`pending`) and the ids refused for good (`rejected`): message validity
 // walks through both, so a verdict never depends on the order records arrived in.
 // Validity rules: docs/protocol.md → Record types.
 
-const cmpTsId = (a, b) => (a.payload.ts - b.payload.ts) || (a.id < b.id ? -1 : a.id > b.id ? 1 : 0);
 const lowestId = (recs) => recs.reduce((best, r) => (!best || r.id < best.id ? r : best), null);
 const push = (map, key, rec) => { const list = map.get(key); if (list) list.push(rec); else map.set(key, [rec]); };
 
@@ -14,7 +14,7 @@ export function createIndex() {
   return {
     byId: new Map(),
     maxSeq: 0,
-    announces: new Map(), // signer fp → [rec]
+    named: new Set(), // every fp an accepted record names (signer, to, member): whose identity the install keeps
     inboxCreates: new Map(), // inbox id → [rec] (one signer and nonce per id; several only if re-signed)
     invites: new Map(), // invite record id → rec
     personalInvites: new Map(), // inbox id → [rec]
@@ -28,7 +28,7 @@ export function createIndex() {
     pending: new Map(), // record id → {id, payload, …}: verified, route-bound, waiting for a dependency
     rejected: new Map(), // record id → {reason, type, inbox, signer}: refused for good
     // Settled message verdicts (accept/reject; never pending) and completed kept-chain walks. A settled verdict changes
-    // only through a record that is not a msg or an announce (membership and removals, invites, responses,
+    // only through a record that is not a msg (membership and removals, invites, responses,
     // inbox-creates), which clears `verdicts`. A completed walk may have crossed pending records; refusing one of them
     // ends the walk sooner, so a refusal clears both. A new message or pending record only settles what was undecided,
     // and undecided verdicts are never kept.
@@ -49,11 +49,11 @@ export const addRejected = (index, id, info) => {
 export function addRecord(index, rec) {
   if (index.byId.has(rec.id)) return;
   index.byId.set(rec.id, rec);
-  if (rec.payload.type !== 'msg' && rec.payload.type !== 'announce') index.verdicts.clear();
+  if (rec.payload.type !== 'msg') index.verdicts.clear();
   index.maxSeq = Math.max(index.maxSeq, rec.seq);
   const p = rec.payload;
+  for (const fp of [p.signer, p.to, p.member]) if (typeof fp === 'string') index.named.add(fp);
   switch (p.type) {
-    case 'announce': push(index.announces, p.signer, rec); break;
     case 'inbox-create': push(index.inboxCreates, p.inbox, rec); break;
     case 'invite':
       index.invites.set(rec.id, rec);
@@ -214,7 +214,6 @@ function verdictOf(index, rec) {
 export function classify(index, rec) {
   const p = rec.payload;
   switch (p.type) {
-    case 'announce':
     case 'inbox-create':
       return accept;
     case 'invite': {
@@ -270,16 +269,16 @@ export const isValidMessage = (index, rec) => verdictOf(index, rec).verdict === 
 
 // ---- directory and names ----
 
-// The identities this install knows, with the name rules applied (docs/protocol.md → Names):
-// a name pinned to another key → hidden NAME_TAKEN; an unpinned name with several claimants → all hidden
-// NAME_CONFLICT; an unpinned name with one claimant → shown, and returned in `newPins` for the engine to persist.
-// Resolves {identities: Map fp → {fp, id, name, ts, addr, shown, reason}, newPins: {name: fp}}: `id` is the current
+// The identities this install knows, with the name rules applied (docs/protocol.md → Names), over `announces`: the
+// current announce per fp ([{id, payload}], src/directory.js). A name pinned to another key → hidden NAME_TAKEN; an
+// unpinned name with several claimants → all hidden NAME_CONFLICT; an unpinned name with one claimant → shown, and
+// returned in `newPins` (the engine persists those of identities it keeps).
+// Resolves {identities: Map fp → {fp, id, name, ts, shown, reason}, newPins: {name: fp}}: `id` is the current
 // announce's record id.
-export function directory(index, pins) {
+export function directory(announces, pins) {
   const identities = new Map();
-  for (const [fp, recs] of index.announces) {
-    const cur = [...recs].sort(cmpTsId).at(-1);
-    identities.set(fp, { fp, id: cur.id, name: cur.payload.name, ts: cur.payload.ts, addr: cur.payload.addr, shown: false, reason: null });
+  for (const { id, payload } of announces) {
+    identities.set(payload.signer, { fp: payload.signer, id, name: payload.name, ts: payload.ts, shown: false, reason: null });
   }
   const byName = new Map();
   for (const ident of identities.values()) push(byName, ident.name, ident);
@@ -295,9 +294,9 @@ export function directory(index, pins) {
 
 // Why `name` cannot be this install's (`selfFp`): NAME_TAKEN (pinned to another key), NAME_CONFLICT (another key's
 // current announce claims it), or null.
-export function nameRefusal(index, pins, selfFp, name) {
+export function nameRefusal(announces, pins, selfFp, name) {
   if (Object.hasOwn(pins, name) && pins[name] !== selfFp) return 'NAME_TAKEN';
-  const { identities } = directory(index, pins);
+  const { identities } = directory(announces, pins);
   for (const ident of identities.values()) if (ident.fp !== selfFp && ident.name === name) return 'NAME_CONFLICT';
   return null;
 }
@@ -411,21 +410,6 @@ export function mayRead(index, reader, route) {
 export function mayPull(index, self, peer, route) {
   if (route.kind === 'mailbox') return route.fp === self;
   return mayRead(index, peer, route);
-}
-
-// Whether `a` and `b` are the two parties of a personal inbox or both current members of a shared inbox, as this
-// install knows them: the only case in which `a` may learn `b`'s announce from this install (TCP whois).
-export function sharesInbox(index, a, b) {
-  if (a === b) return false;
-  for (const recs of index.personalInvites.values()) {
-    const { signer, to } = lowestId(recs).payload;
-    if ((signer === a && to === b) || (signer === b && to === a)) return true;
-  }
-  for (const id of index.inboxCreates.keys()) {
-    const members = currentMembers(index, id);
-    if (members?.has(a) && members.has(b)) return true;
-  }
-  return false;
 }
 
 // The identities `self` has a relationship with, so may dial: `imported` (card imports), the counterparties of

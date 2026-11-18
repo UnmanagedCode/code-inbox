@@ -20,27 +20,40 @@ export interface NotifyView {
   autoStart: { ok: boolean; autoStart?: boolean; code?: string; error?: string } | null;
 }
 
+export interface Coded { code: string; message: string }
+
+// One configured connection: `kind` is what its far end said it is (null until one answered).
+export interface ConnectionView {
+  address: string;
+  kind: 'peer' | 'hub' | null;
+  state: 'connecting' | 'up' | 'waiting' | 'idle' | 'stopped';
+  peers: Person[];
+  error: Coded | null;
+}
+
 export interface TransportView {
-  kind: 'file-share' | 'tcp' | 'hub' | null;
+  kind: 'file-share' | 'network' | null;
   configured: boolean;
   dir: string | null;
-  host: string | null;
-  port: number | null;
-  advertise: string | null;
-  url: string | null;
-  // The hub link's state (kind 'hub' with a transport running), else null.
-  hub: { connected: boolean; error: { code: string; message: string } | null } | null;
-  addresses: string[];
+  // The saved listener (network mode), and where it is bound while it is up.
+  listen: { host: string; port: number } | null;
+  listening: { host: string; port: number } | null;
+  connections: ConnectionView[];
   card: string | null;
-  cardStale: boolean;
-  error: { code: string; message: string } | null;
-  outboxError: { code: string; message: string } | null;
+  error: Coded | null;
+  outboxError: Coded | null;
 }
+
+// Where an identity can be reached now: a session's route (address: its connection, null for one accepted on the
+// listener) or a hub's roster.
+export interface Presence { via: 'direct' | 'hub'; address: string | null }
+
+export interface DirectoryEntry { fp: string; fingerprint: string; name: string; contact: boolean; presence: Presence[] }
 
 export interface State {
   identity: { fp: string; fingerprint: string; name: string | null; announcedName: string | null; nameStatus: string };
   transport: TransportView;
-  directory: { fp: string; fingerprint: string; name: string }[];
+  directory: DirectoryEntry[];
   sharedInboxes: SharedInbox[];
   invites: { incoming: Invite[]; outgoing: Invite[] };
   joinRequests: { incoming: JoinRequest[]; outgoing: JoinRequest[] };

@@ -1,16 +1,16 @@
 import { EventEmitter } from 'node:events';
+import { createDirectory } from './directory.js';
 import { CodedError } from './errors.js';
 import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
   addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayPull, mayRead, removePending, currentEpoch, currentMembers, directory,
-  inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharesInbox,
+  inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { checkStoredShareDir, ensureShareRoot, validateShareDir } from './transport/fileShare.js';
-import { resolveHubConfig } from './transport/hubClient.js';
-import { resolveTcpConfig } from './transport/tcp.js';
+import { resolveNetworkConfig } from './transport/network.js';
 
 export const RECENT_REJECTS = 20;
 export const READ_LIMIT_DEFAULT = 50;
@@ -34,8 +34,8 @@ const defaultSchedule = (fn, ms) => {
 
 // The install's protocol core: ingest (transport → verify → route binding → authorization → store) and every
 // action a human or agent can take. Surfaces (REST, MCP) call these and only map results onto their wire shapes.
-// `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir},
-// {kind:'tcp', host, port, advertise} or {kind:'hub', url}); `view` is the read-only engine view a transport may need
+// `makeTransport(config, view)` builds the transport for `settings.transport` ({kind:'file-share', dir} or
+// {kind:'network', listen, connections}); `view` is the read-only engine view a transport may need
 // (docs/transport.md).
 // `schedule(fn, ms)` → cancel drives the outbox retry timer (tests inject one).
 // `lookup` replaces the DNS lookup TCP and hub settings are checked with (tests).
@@ -56,9 +56,12 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   let retryTimer = null; // cancel function of the armed outbox retry
   let stopped = false;
   let interestKey = '';
-  let imported = []; // fingerprints of identities whose contact card a human imported
+  // The announces this install knows, in memory only (src/directory.js); `identities` is what of them persists
+  // (identities.json): {fp: {announce: base64url, imported}} for card imports and every fp the log names.
+  const known = createDirectory();
+  let identities = {};
+  let ownAnnounce = null; // this install's current signed announce (re-signed at boot from settings.announced)
   const ownLog = new Map(); // routeKey → [{seq, bytes}] of records signed by self, seq ascending
-  const announceBytes = new Map(); // announce record id → bytes
 
   function noteReject(reason, detail, id) {
     rejected.count += 1;
@@ -68,17 +71,47 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
 
   // ---- derived views ----
 
-  const dir = () => directory(index, pins);
+  const dir = () => directory(known.entries(), pins);
   function person(fp, ids = dir().identities) {
     const ident = ids.get(fp);
     return { fp, name: ident?.shown ? ident.name : null };
   }
 
+  const imported = () => Object.keys(identities).filter((fp) => identities[fp].imported);
+  // The identities this install keeps across a restart: card imports and every fp its log names.
+  const kept = (fp) => fp !== self && (identities[fp]?.imported || index.named.has(fp));
+
+  // Pins only names of this install and of identities it keeps: a stranger's name is judged in memory and never
+  // written, until it becomes a counterparty (then it pins, first key wins).
   async function persistNewPins() {
-    const { newPins } = dir();
-    if (Object.keys(newPins).length === 0) return;
-    pins = { ...pins, ...newPins };
+    const add = Object.entries(dir().newPins).filter(([, fp]) => fp === self || kept(fp));
+    if (add.length === 0) return;
+    pins = { ...pins, ...Object.fromEntries(add) };
     await store.savePins(pins);
+  }
+
+  // identities.json follows the memory directory for every kept fp: written (whole, atomically) only on a change.
+  async function syncIdentities() {
+    let changed = false;
+    const next = { ...identities };
+    for (const e of known.entries()) {
+      const fp = e.payload.signer;
+      if (!kept(fp)) continue;
+      const announce = Buffer.from(e.bytes).toString('base64url');
+      if (next[fp]?.announce === announce) continue;
+      next[fp] = { announce, imported: next[fp]?.imported ?? false };
+      changed = true;
+    }
+    if (!changed) return;
+    identities = next;
+    await store.saveIdentities(identities);
+  }
+
+  // A verified announce (writer binding already checked) into the memory directory; never into the log.
+  async function noteAnnounce(d, bytes) {
+    if (!known.note({ id: d.id, payload: d.payload, bytes })) return;
+    await persistNewPins();
+    await syncIdentities();
   }
 
   function refreshInterest() {
@@ -94,7 +127,6 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   // ---- ingest ----
 
   function remember(seq, id, payload, route, bytes) {
-    if (payload.type === 'announce') announceBytes.set(id, bytes);
     if (payload.signer !== self) return;
     const key = routeKey(route);
     const list = ownLog.get(key);
@@ -150,6 +182,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     // Even a pending record can settle others: a removal's kept chain is walked through pending records.
     await drainPending(reactions);
     await persistNewPins();
+    await syncIdentities();
     refreshInterest();
     await react(reactions);
   }
@@ -184,15 +217,27 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         noteReject('ROUTE_MISMATCH', `${d.payload.type} arrived on ${isRoute(route) ? routeKey(route) : 'an invalid route'}`, d.id);
         return { retry: false };
       }
-      await admit({ id: d.id, payload: d.payload, route, bytes: Buffer.from(bytes) });
+      if (d.payload.type === 'announce') await noteAnnounce(d, bytes);
+      else await admit({ id: d.id, payload: d.payload, route, bytes: Buffer.from(bytes) });
       return { retry: false };
+    });
+  }
+
+  // The sink's `announce`: a hub-relayed announce. Self-certifying (the writer is its own signer, as for a card),
+  // announces only, into memory only.
+  function ingestAnnounce(bytes) {
+    return locked(async () => {
+      const d = decodeRecord(bytes);
+      if (!d.ok || d.payload.type !== 'announce') { noteReject(d.ok ? 'ROUTE_MISMATCH' : d.reason, d.ok ? `a relayed ${d.payload.type}` : d.detail, d.id); return; }
+      await noteAnnounce(d, bytes);
     });
   }
 
   // ---- sending ----
 
   function recipientsOf(p) {
-    if (p.type === 'announce' || p.type === 'inbox-create') return [...dir().identities.keys()].filter((fp) => fp !== self);
+    // An inbox-create goes to the contacts; anyone else gets it from this install's directory route when it pulls.
+    if (p.type === 'inbox-create') return contactsOf(index, self, imported());
     if ('to' in p) return [p.to];
     const inv = personalInvite(index, p.inbox);
     const set = new Set(inv ? [inv.payload.signer, inv.payload.to] : currentMembers(index, p.inbox) ?? []);
@@ -353,45 +398,52 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     return { status: 'ok', recs, more: lo < list.length, head };
   }
 
-  const announceOf = (fp) => {
-    const id = dir().identities.get(fp)?.id;
-    return id ? announceBytes.get(id) ?? null : null;
-  };
-
   const view = {
-    addrsOf: (fp) => dir().identities.get(fp)?.addr ?? [],
-    // `fp`'s announce for `requester`, only when the two share an inbox here (member discovery); else null.
-    announceFor: (requester, fp) => (sharesInbox(index, requester, fp) ? announceOf(fp) : null),
-    contacts: () => contactsOf(index, self, imported),
+    contacts: () => contactsOf(index, self, imported()),
     mayPull: (peer, route) => mayPull(index, self, peer, route),
     serve,
   };
 
+  // A connection's row for the page: the fps it reached, named when the directory shows them.
+  const connectionView = (ids) => (c) => ({
+    address: c.address,
+    kind: c.kind,
+    state: c.state,
+    peers: c.remote.map((fp) => ({ fp, name: ids.get(fp)?.shown ? ids.get(fp).name : null })),
+    error: c.error,
+  });
+
   function transportView() {
     const cfg = settings.transport;
-    const tcp = cfg?.kind === 'tcp' ? cfg : null;
-    const hub = cfg?.kind === 'hub' ? cfg : null;
-    const link = hub && transport?.stats ? transport.stats().hub : null;
-    const addresses = transport ? transport.addresses() : [];
-    const own = dir().identities.get(self);
-    const bytes = announceOf(self);
+    const network = cfg?.kind === 'network' ? cfg : null;
+    const stats = network && transport?.stats ? transport.stats() : null;
+    const ids = dir().identities;
+    const bytes = ownAnnounce;
     return {
-      kind: ['file-share', 'tcp', 'hub'].includes(cfg?.kind) ? cfg.kind : null,
+      kind: ['file-share', 'network'].includes(cfg?.kind) ? cfg.kind : null,
       configured: !!transport,
       dir: cfg?.kind === 'file-share' ? cfg.dir : null,
-      host: tcp?.host ?? null,
-      port: tcp?.port ?? null,
-      advertise: tcp?.advertise ?? null,
-      url: hub?.url ?? null,
-      // The hub link's state, for display only.
-      hub: link ? { connected: link.connected, error: link.error } : null,
-      addresses,
+      listen: network?.listen ?? null,
+      // Where the listener is bound (the port of an ephemeral listen), while it is up.
+      listening: stats?.listening ?? null,
+      // Each configured connection's state, for display only; the saved list while no transport runs.
+      connections: stats ? stats.connections.map(connectionView(ids))
+        : (network?.connections ?? []).map((address) => ({ address, kind: null, state: 'connecting', peers: [], error: null })),
       card: bytes ? encodeCard(bytes) : null,
-      cardStale: !!bytes && JSON.stringify(own.addr) !== JSON.stringify(addresses),
       error: transportError,
       // The latest send failure still holding writes in the outbox (SHARE_UNAVAILABLE: the share is not mounted).
       outboxError,
     };
+  }
+
+  // Every shown identity but this install, strangers included: whether it is a contact, and where it can be reached
+  // now (`presence`: [{via, address}], empty when not reachable; the file share reports none).
+  function directoryView(ids) {
+    const contacts = new Set(contactsOf(index, self, imported()));
+    const presence = transport?.stats ? transport.stats().presence : {};
+    return [...ids.values()].filter((i) => i.shown && i.fp !== self).map((i) => ({
+      fp: i.fp, fingerprint: formatFingerprint(i.fp), name: i.name, contact: contacts.has(i.fp), presence: presence[i.fp] ?? [],
+    }));
   }
 
   const listInboxes = () => {
@@ -407,20 +459,28 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       const loaded = await store.load();
       settings = loaded.settings;
       pins = loaded.pins;
-      imported = loaded.contacts;
+      identities = loaded.identities;
       cursors = loaded.cursors;
       outbox = loaded.outbox;
       index = createIndex();
+      // identities.json entries were verified as their fp's announces by the store.
+      for (const { announce } of Object.values(identities)) {
+        const bytes = Buffer.from(announce, 'base64url');
+        const d = decodeRecord(bytes);
+        known.note({ id: d.id, payload: d.payload, bytes });
+      }
+      if (settings.announced) signOwnAnnounce(settings.announced);
       for (const e of loaded.accepted) {
         const d = decodeRecord(e.bytes);
         if (!d.ok) { log.warn(`code-inbox: accepted record seq ${e.seq} no longer decodes (${d.reason}): skipped`); continue; }
+        if (d.payload.type === 'announce') { log.warn(`code-inbox: accepted record seq ${e.seq} is an announce, which the log no longer holds: skipped`); continue; }
         addRecord(index, { seq: e.seq, id: d.id, payload: d.payload, route: e.route });
         remember(e.seq, d.id, d.payload, e.route, e.bytes);
       }
       for (const { id, ...info } of loaded.rejected) addRejected(index, id, info);
       for (const e of loaded.pending) {
         const d = decodeRecord(e.bytes);
-        if (d.ok && !index.byId.has(d.id) && !index.rejected.has(d.id)) addPending(index, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
+        if (d.ok && d.payload.type !== 'announce' && !index.byId.has(d.id) && !index.rejected.has(d.id)) addPending(index, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
       }
       // Close the crash windows: pending records whose dependency was settled, and admissions not yet written.
       const reactions = [];
@@ -441,7 +501,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         try {
           await startTransport(config);
         } catch (err) {
-          if (err.code !== 'TCP_LISTEN_FAILED') throw err;
+          if (err.code !== 'LISTEN_FAILED') throw err;
           log.warn(`code-inbox: ${err.message}`);
           return;
         }
@@ -475,7 +535,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     setName(name) {
       return locked(async () => {
         if (typeof name !== 'string' || !NAME_RE.test(name)) refuse('NAME_INVALID', 'a name is 1–32 of A–Z a–z 0–9 . _ -, starting with a letter or digit');
-        const r = nameRefusal(index, pins, self, name);
+        const r = nameRefusal(known.entries(), pins, self, name);
         if (r) refuse(r, r === 'NAME_TAKEN' ? `the name ${name} is pinned to another identity` : `another identity claims the name ${name}`);
         settings = { ...settings, name };
         await store.saveSettings(settings);
@@ -496,38 +556,26 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       });
     },
 
-    // Refused TCP_INVALID (resolveTcpConfig) or TCP_LISTEN_FAILED (the port is taken or not allowed): then no
-    // transport is configured until a human saves settings that listen.
-    // The host is resolved before the engine lock is taken: a slow DNS answer blocks no other action.
-    async setTcp(input) {
-      const cfg = await resolveTcpConfig(input, { lookup });
+    // Saves the whole network config and rebuilds the transport. Refused NETWORK_INVALID (resolveNetworkConfig,
+    // which must resolve every host on a save) or LISTEN_FAILED (the listen port is taken or not allowed): then no
+    // transport is configured until a human saves settings that listen. Hosts are resolved before the engine lock is
+    // taken: a slow DNS answer blocks no other action.
+    async setNetwork(input) {
+      const cfg = await resolveNetworkConfig(input, { lookup, mustResolve: true });
       return locked(async () => {
-        settings = { ...settings, transport: { kind: 'tcp', ...cfg } };
+        settings = { ...settings, transport: { kind: 'network', ...cfg } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
         // Admissions owed since a boot that started no transport (e.g. the port was taken then), and the outbox.
         await reconcileAdmissions();
         await flushOutbox();
-        return { ...cfg, addresses: transport.addresses() };
+        return { ...cfg, listening: transport.stats().listening };
       });
     },
 
-    // Refused HUB_INVALID (resolveHubConfig, which must resolve the host on a save). Starting never fails because
-    // the hub is unreachable: the client keeps reconnecting. Resolved before the engine lock is taken.
-    async setHub(input) {
-      const cfg = await resolveHubConfig(input, { lookup, mustResolve: true });
-      return locked(async () => {
-        settings = { ...settings, transport: { kind: 'hub', ...cfg } };
-        await store.saveSettings(settings);
-        await startTransport(settings.transport);
-        await reconcileAdmissions();
-        await flushOutbox();
-        return { ...cfg, addresses: transport.addresses() };
-      });
-    },
-
-    // Imports another identity's contact card: its announce is ingested as if its signer wrote it (route
-    // directory, writer = signer; every other check still runs), and the identity becomes a contact to dial.
+    // Imports another identity's contact card: its announce goes to the memory directory as if its signer wrote it
+    // (writer = signer, as for a hub-relayed announce), and the identity becomes a contact, kept in identities.json.
+    // A card says who someone is, never where: it gives no route.
     async importCard(text) {
       const result = await locked(async () => {
         const bytes = decodeCard(text);
@@ -536,11 +584,10 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         const p = d.payload;
         if (p.type !== 'announce') refuse('CARD_INVALID', `a contact card carries an announce, not ${p.type}`);
         if (p.signer === self) refuse('CARD_INVALID', 'that is this install\'s own card');
-        await admit({ id: d.id, payload: p, route: routeFor(p), bytes });
-        if (!imported.includes(p.signer)) {
-          imported = [...imported, p.signer];
-          await store.saveContacts(imported);
-        }
+        known.note({ id: d.id, payload: p, bytes });
+        identities = { ...identities, [p.signer]: { announce: Buffer.from(known.get(p.signer).bytes).toString('base64url'), imported: true } };
+        await store.saveIdentities(identities);
+        await persistNewPins();
         const ident = dir().identities.get(p.signer);
         return { fp: p.signer, name: ident?.name ?? p.name, shown: !!ident?.shown };
       });
@@ -549,14 +596,22 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       return result;
     },
 
+    // Signs this install's announce, remembers its name (settings.announced: re-signed at every boot) and presents
+    // it: the transport gives it to every peer and hub; on the file share it is written as the directory file.
     announce() {
       return locked(async () => {
         requireTransport();
         const { name } = settings;
         if (!name) refuse('NAME_MISSING', 'set a name before announcing');
-        const r = nameRefusal(index, pins, self, name);
+        const r = nameRefusal(known.entries(), pins, self, name);
         if (r) refuse(r, `the name ${name} cannot be announced: ${r}`);
-        return { id: await publish({ type: 'announce', name, addr: transport.addresses() }) };
+        settings = { ...settings, announced: name };
+        await store.saveSettings(settings);
+        const { bytes, id } = signOwnAnnounce(name);
+        await persistNewPins();
+        transport.setAnnounce(bytes);
+        if (transport.capabilities.directory) await deliver(bytes, { kind: 'directory' }, []);
+        return { id };
       });
     },
 
@@ -743,7 +798,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
           nameStatus: own ? (own.shown ? 'shown' : own.reason) : 'unannounced',
         },
         transport: transportView(),
-        directory: [...ids.values()].filter((i) => i.shown && i.fp !== self).map((i) => ({ fp: i.fp, fingerprint: formatFingerprint(i.fp), name: i.name })),
+        directory: directoryView(ids),
         sharedInboxes: sharedInboxes(index).map((s) => ({
           id: s.id, name: s.name, owner: person(s.owner, ids), memberCount: s.members?.length ?? null,
           isMember: !!s.members?.includes(self), isOwner: s.owner === self, requestPending: outgoingJoin.has(s.id),
@@ -756,23 +811,31 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     },
   };
 
-  // The stored transport config, checked at boot: a TCP config as when it was saved (resolveTcpConfig); a hub url as
-  // when it was saved, except that a host that does not resolve yet still starts (resolveHubConfig); a share dir
-  // by checkStoredShareDir, which does not require it to exist, so a share whose mount is not up yet still starts and
-  // is scanned once it appears. Refused SHARE_INVALID, TCP_INVALID, HUB_INVALID or TRANSPORT_INVALID (an unknown kind).
+  // Signs this install's announce of `name` now, into the memory directory (and the card); → {bytes, id}.
+  function signOwnAnnounce(name) {
+    const signed = encodeRecord(identity, { type: 'announce', name, signer: self, ts: now() });
+    known.note(signed);
+    ownAnnounce = signed.bytes;
+    return signed;
+  }
+
+  // The stored transport config, checked at boot: network settings as when they were saved, except that a
+  // connection host that does not resolve yet still starts (resolveNetworkConfig, mustResolve false); a share dir by
+  // checkStoredShareDir, which does not require it to exist, so a share whose mount is not up yet still starts and is
+  // scanned once it appears. Refused SHARE_INVALID, SHARE_UNSAFE, NETWORK_INVALID or TRANSPORT_INVALID (any other
+  // kind).
   async function validStoredTransport(cfg) {
-    if (cfg?.kind === 'tcp') {
-      const { host, port, advertise } = cfg;
-      return { kind: 'tcp', ...(await resolveTcpConfig({ host, port, advertise }, { lookup })) };
+    if (cfg?.kind === 'network') {
+      const { listen, connections } = cfg;
+      return { kind: 'network', ...(await resolveNetworkConfig({ listen, connections }, { lookup, mustResolve: false })) };
     }
-    if (cfg?.kind === 'hub') return { kind: 'hub', ...(await resolveHubConfig({ url: cfg.url }, { lookup, mustResolve: false })) };
     if (cfg?.kind === 'file-share') return { kind: 'file-share', dir: await checkStoredShareDir(cfg.dir, store.dataDir) };
     throw new CodedError('TRANSPORT_INVALID', `unknown transport kind ${JSON.stringify(cfg?.kind)?.slice(0, 40)}`);
   }
 
   // Swaps in the transport for `config`. The old one is stopped without waiting: its scan or pull may be queued
-  // behind the engine lock the caller holds. Its sink ignores whatever it still offers. A TCP listener that cannot
-  // bind leaves no transport configured and refuses TCP_LISTEN_FAILED.
+  // behind the engine lock the caller holds. Its sink ignores whatever it still offers. A listener that cannot bind
+  // leaves no transport configured and refuses LISTEN_FAILED.
   async function startTransport(config) {
     const old = transport;
     const t = assertTransport(makeTransport(config, view));
@@ -783,9 +846,13 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     if (old) old.stop().catch((err) => log.warn(`code-inbox: stopping the previous transport failed: ${err.message}`));
     interestKey = '';
     refreshInterest();
+    t.setAnnounce(ownAnnounce);
     try {
       await t.start({
         record: (incoming) => (transport === t ? ingest(incoming) : Promise.resolve({ retry: false })),
+        announce: (bytes) => {
+          if (transport === t) ingestAnnounce(bytes).catch((err) => log.warn(`code-inbox: a relayed announce failed: ${err.message}`));
+        },
         peerOnline: (fp) => {
           if (transport === t) locked(() => flushOutbox(fp)).catch((err) => log.warn(`code-inbox: flushing the outbox failed: ${err.message}`));
         },
@@ -793,8 +860,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     } catch (err) {
       if (transport === t) transport = null;
       t.stop().catch(() => {});
-      if (config.kind !== 'tcp') throw err;
-      transportError = { code: 'TCP_LISTEN_FAILED', message: `cannot listen on ${config.host}:${config.port}: ${err.code ?? err.message}` };
+      if (config.kind !== 'network') throw err;
+      const at = config.listen ? `${config.listen.host}:${config.listen.port}` : 'no address';
+      transportError = { code: 'LISTEN_FAILED', message: `cannot listen on ${at}: ${err.code ?? err.message}` };
       throw new CodedError(transportError.code, transportError.message);
     }
   }

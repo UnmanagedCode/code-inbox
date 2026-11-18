@@ -8,7 +8,7 @@ import { FILE_RE, SHARE_ROOT, checkShareDirPath, checkStoredShareDir, createFile
 import { makeInstall, makeNetwork, syncAll, tmpDir, tree } from './helpers.mjs';
 
 const TS = 1_700_000_000_000;
-const announceOf = (id, name) => encodeRecord(id, { type: 'announce', signer: id.fp, ts: TS, name, addr: [] }).bytes;
+const announceOf = (id, name) => encodeRecord(id, { type: 'announce', signer: id.fp, ts: TS, name }).bytes;
 
 // A transport over a fresh share whose sink records every offer and answers `answer(incoming)` (default: done).
 async function recordingShare({ answer = () => ({ retry: false }) } = {}) {

@@ -49,7 +49,7 @@ export function App() {
           <DirectoryPanel state={state} refresh={refresh} />
           <IdentityPanel state={state} refresh={refresh} />
           <TransportPanel state={state} refresh={refresh} />
-          {(state.transport.kind === 'tcp' || state.transport.kind === 'hub') && <ContactsPanel state={state} refresh={refresh} />}
+          {state.transport.kind === 'network' && <ContactsPanel state={state} refresh={refresh} />}
           <NotificationsPanel state={state} refresh={refresh} />
           <DiagnosticsPanel diagnostics={state.diagnostics} />
         </>

@@ -1,15 +1,17 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import net from 'node:net';
 import path from 'node:path';
 import { OUTBOX_RETRY_MS, createEngine } from '../src/engine.js';
 import { decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
 import { createStore } from '../src/store.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
-import { TCP_REDIAL_MAX_MS, TCP_REDIAL_MIN_MS } from '../src/transport/tcp.js';
+import { TCP_REDIAL_MIN_MS } from '../src/transport/endpoint.js';
 import { captureLog, fakeClock, makeInstall, makeNetwork, silentLog, syncAll, tmpDir, tree } from './helpers.mjs';
-import { countingListener, tcpNode, waitFor } from './tcpHelpers.mjs';
+import { netNode } from './netHelpers.mjs';
+import { countingListener, waitFor } from './tcpHelpers.mjs';
 
 // The outbox keeps every write a transport could not take, and the engine re-sends it on its own: after a transport
 // starts, and on the OUTBOX_RETRY_MS timer while anything waits. Clocks are fake: a retry tick is clock.advance.
@@ -149,41 +151,33 @@ test('the retry timer is armed only while the outbox holds anything, and stops w
   assert.equal(clock.pending() <= idle, true, 'stopping cleared the retry timer');
 });
 
-// Invariant (T3): over TCP the timer re-sends through `send`, so an unreachable recipient is dialed only as its
-// address's redial backoff allows: the dial times follow the doubling schedule, each at the first retry tick at or
-// after the backoff ends, never one dial per tick.
-test('outbox retries over TCP follow the redial backoff, doubling up to its maximum', async (t) => {
+// Invariant (T3): the outbox timer re-sends through `send`, which never reconnects a connection: a connection to a
+// dead address reconnects only on its own backoff (doubling from TCP_REDIAL_MIN_MS up to the maximum), whatever the
+// retry ticks do, and the owed invite stays in the outbox.
+test('outbox retries never reconnect a connection faster than its backoff', async (t) => {
   const clock = fakeClock();
   const dead = await countingListener();
-  const alice = await tcpNode('alice', { schedule: clock.schedule, now: clock.now });
+  const times = [];
+  const connect = (o) => { times.push(clock.now()); return net.connect(o); };
+  const max = 8 * TCP_REDIAL_MIN_MS;
+  const alice = await netNode('alice', { listen: null, connections: [dead.addr], connect, schedule: clock.schedule, now: clock.now, limits: { redialMaxMs: max } });
   t.after(async () => { await alice.close(); await dead.close(); });
   const bob = await loadIdentity(tmpDir());
-  const card = encodeCard(encodeRecord(bob, { type: 'announce', signer: bob.fp, ts: Date.now(), name: 'bob', addr: [dead.addr] }).bytes);
-  const t0 = clock.now();
-  await alice.engine.importCard(card); // dials bob once, in the background
+  await alice.engine.importCard(encodeCard(encodeRecord(bob, { type: 'announce', signer: bob.fp, ts: Date.now(), name: 'bob' }).bytes));
   await alice.engine.invite(bob.fp);
   assert.equal(outboxOf(alice), 1);
-  const settled = () => waitFor(() => alice.transport.stats().connections === 0, 'the dial to settle');
-  await waitFor(() => dead.count === 1, 'the first dial');
+  const step = TCP_REDIAL_MIN_MS / 4;
+  const settled = () => waitFor(() => alice.status(dead.addr).state === 'waiting', 'the attempt to fail');
   await settled();
-  const dials = [0];
-  for (let i = 0; i < 40; i += 1) {
-    const before = dead.count;
-    await tick(clock, alice);
+  for (let at = 0; at < 2 * OUTBOX_RETRY_MS; at += step) {
+    clock.advance(step);
     await settled();
-    if (dead.count > before) dials.push(clock.now() - t0);
-    assert.ok(dead.count - before <= 1, 'at most one dial per tick');
   }
-  // The schedule: after the k-th failure wait min(MIN·2^(k-1), MAX), then dial at the next retry tick.
-  const expected = [0];
-  for (let k = 1, at = 0; ; k += 1) {
-    const ready = at + Math.min(TCP_REDIAL_MIN_MS * 2 ** (k - 1), TCP_REDIAL_MAX_MS);
-    at = Math.ceil(ready / OUTBOX_RETRY_MS) * OUTBOX_RETRY_MS;
-    if (at > 40 * OUTBOX_RETRY_MS) break;
-    expected.push(at);
-  }
-  assert.deepEqual(dials, expected);
-  assert.ok(dials.length < 20, `${dials.length} dials in 40 ticks`);
+  // Each wait is the backoff after the failure (observed at the end of a step), never shorter.
+  const gaps = times.slice(1).map((x, i) => x - times[i]);
+  const backoff = (k) => Math.min(TCP_REDIAL_MIN_MS * 2 ** k, max);
+  gaps.forEach((g, k) => assert.ok(g >= backoff(k) && g < backoff(k) + step, `gap ${k}: ${g}`));
+  assert.ok(gaps.filter((g) => g >= max).length >= 3, 'the maximum was reached');
   assert.equal(outboxOf(alice), 1);
 });
 
@@ -276,11 +270,11 @@ async function stubEngine(t, send, log) {
   const store = createStore(dataDir, { log: silentLog });
   await store.load();
   const identity = await loadIdentity(dataDir);
-  const transport = { capabilities: { directory: true, push: false }, addresses: () => [], start: async () => {}, setInterest() {}, send, sync: async () => {}, stop: async () => {} };
+  const transport = { capabilities: { directory: true, push: false }, start: async () => {}, setInterest() {}, setAnnounce() {}, stats: () => ({ listening: null, connections: [], presence: {} }), send, sync: async () => {}, stop: async () => {} };
   const engine = createEngine({ store, identity, log, schedule: fakeClock().schedule, makeTransport: () => transport });
   t.after(() => engine.stop());
   await engine.boot();
-  await engine.setTcp({ port: 0 }); // any config: the stub ignores it
+  await engine.setNetwork({ listen: null }); // any config: the stub ignores it
   await engine.setName('alice');
   return engine;
 }

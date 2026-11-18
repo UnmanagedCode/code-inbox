@@ -4,6 +4,7 @@ import crypto from 'node:crypto';
 import {
   addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
 } from '../src/state.js';
+import { createDirectory } from '../src/directory.js';
 
 // Pure fold tests: synthetic records (the fold trusts records.js for signatures and id recomputation).
 const fp = (s) => crypto.createHash('sha256').update(s).digest('hex');
@@ -16,7 +17,9 @@ const INBOX = 'c'.repeat(32);
 let seq = 0;
 // A record with a fresh seq; `id` defaults to a hash of the payload (pass one to control lowest-id ties).
 const rec = (payload, id) => ({ seq: ++seq, id: id ?? fp(JSON.stringify(payload) + seq).slice(0, 32), payload: { ts: 1000 + seq, ...payload } });
-const announce = (signer, name, ts) => rec({ type: 'announce', signer, name, addr: [], ...(ts ? { ts } : {}) });
+// The in-memory announce map the name rules run over (src/directory.js).
+const announce = (signer, name, ts) => rec({ type: 'announce', signer, name, ...(ts ? { ts } : {}) });
+const announces = (...recs) => { const d = createDirectory(); for (const r of recs) d.note({ ...r, bytes: Buffer.from(r.id) }); return d.entries(); };
 const create = (owner = A) => rec({ type: 'inbox-create', signer: owner, inbox: INBOX, nonce: 'd'.repeat(32), name: 'team' });
 const member = (s, op, who, extra = {}, id) => rec({ type: 'member', signer: A, inbox: INBOX, seq: s, op, member: who, ...extra }, id);
 const msg = (signer, extra = {}) => rec({ type: 'msg', signer, inbox: INBOX, body: 'hi', ...extra });
@@ -26,8 +29,7 @@ const verdict = (index, r) => classify(index, r).verdict;
 
 // Invariant: a pinned name belongs to its key forever here; another key announcing it is never shown.
 test('a name pinned to one key and announced by another is hidden: NAME_TAKEN', () => {
-  const index = buildIndex([announce(A, 'alice'), announce(M, 'alice')]);
-  const { identities, newPins } = directory(index, { alice: A });
+  const { identities, newPins } = directory(announces(announce(A, 'alice'), announce(M, 'alice')), { alice: A });
   assert.equal(identities.get(A).shown, true);
   assert.equal(identities.get(M).shown, false);
   assert.equal(identities.get(M).reason, 'NAME_TAKEN');
@@ -36,8 +38,7 @@ test('a name pinned to one key and announced by another is hidden: NAME_TAKEN', 
 
 // Invariant: two keys claiming an unpinned name show neither (a backdated ts cannot win the race).
 test('an unpinned name with two claimants hides both: NAME_CONFLICT', () => {
-  const index = buildIndex([announce(A, 'alice'), announce(M, 'alice', 1)]);
-  const { identities, newPins } = directory(index, {});
+  const { identities, newPins } = directory(announces(announce(A, 'alice'), announce(M, 'alice', 1)), {});
   assert.equal(identities.get(A).reason, 'NAME_CONFLICT');
   assert.equal(identities.get(M).reason, 'NAME_CONFLICT');
   assert.equal(identities.get(A).shown || identities.get(M).shown, false);
@@ -46,20 +47,19 @@ test('an unpinned name with two claimants hides both: NAME_CONFLICT', () => {
 
 // Invariant: a sole claimant is shown and pinned on first show.
 test('a sole claimant is shown and returned as a new pin', () => {
-  const { identities, newPins } = directory(buildIndex([announce(A, 'alice')]), {});
+  const { identities, newPins } = directory(announces(announce(A, 'alice')), {});
   assert.equal(identities.get(A).shown, true);
   assert.deepEqual(newPins, { alice: A });
 });
 
 // Invariant: an identity's current name is its latest announce by ts (record id breaking ties).
 test("an identity's latest announce is its current name", () => {
-  const index = buildIndex([announce(A, 'alice', 5), announce(A, 'alicia', 9), announce(A, 'old', 1)]);
-  assert.equal(directory(index, {}).identities.get(A).name, 'alicia');
+  assert.equal(directory(announces(announce(A, 'alice', 5), announce(A, 'alicia', 9), announce(A, 'old', 1)), {}).identities.get(A).name, 'alicia');
 });
 
 // Invariant: this install cannot take a name pinned to, or claimed by, another key.
 test('nameRefusal refuses a name pinned to or claimed by another key', () => {
-  const index = buildIndex([announce(B, 'bob')]);
+  const index = announces(announce(B, 'bob'));
   assert.equal(nameRefusal(index, { alice: M }, A, 'alice'), 'NAME_TAKEN');
   assert.equal(nameRefusal(index, {}, A, 'bob'), 'NAME_CONFLICT');
   assert.equal(nameRefusal(index, { alice: A }, A, 'alice'), null);

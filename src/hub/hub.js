@@ -1,14 +1,16 @@
 import net from 'node:net';
 import { CodedError } from '../errors.js';
+import { decodeRecord } from '../records.js';
 import { isHost } from '../transport/addr.js';
-import { FrameError, HUB_WATCH_MAX, encodeFrame } from '../transport/frames.js';
+import { FrameError, encodeFrame } from '../transport/frames.js';
 import { createHubConn } from '../transport/hubConn.js';
 import { SESSION_LIMITS } from '../transport/tcpSession.js';
 
-// The hub (docs/transport.md → Hub): a standalone router every install can dial out to. Clients prove their
-// fingerprints on their link (`register`); a stream opened to a fingerprint reaches only the link that proved it,
-// and its bytes pass through as opaque chunks the hub never parses. It stores nothing, holds no key and is never
-// trusted for authenticity: endpoints run their own handshake inside each stream.
+// The hub (docs/hub.md): a standalone router every install can connect out to. Clients prove their fingerprints on
+// their link (`register`); a stream opened to a fingerprint reaches only the link that proved it, and its bytes pass
+// through as opaque chunks the hub never parses. Each client gives the hub its own signed announce, and the hub keeps
+// every link told who else is registered (the roster: `peer` and `gone`). It stores nothing on disk, holds no key and
+// is never trusted for authenticity: endpoints run their own handshake inside each stream.
 
 export const HUB_DEFAULT_PORT = 47822;
 export const HUB_MAX_LINKS = 1024;
@@ -67,8 +69,7 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
   const dataMax = lim.maxStreams * lim.writeBufferMax;
   const linkLimits = { ...lim, writeBufferMax: dataMax + lim.controlBufferMax };
   const links = new Set();
-  const byFp = new Map(); // fp → the ready link that proved it
-  const watchers = new Map(); // fp → Set<link> watching it
+  const byFp = new Map(); // fp → the link that proved it (newest registration)
   const counters = { handshakeFailures: 0, dropped: 0 };
   let server = null;
   let bound = null;
@@ -76,8 +77,46 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
   const handshaking = () => [...links].filter((c) => !c.ready).length;
   const streamCount = () => [...links].reduce((n, c) => n + (c.streams?.size ?? 0), 0) / 2;
 
-  function notify(fp, online, except) {
-    for (const w of watchers.get(fp) ?? []) if (w !== except) w.send({ t: 'presence', fp, online });
+  // ---- the roster ----
+  // Each link owes the roster entries in its `dirty` set: one frame per fp, built from the current state when it is
+  // written (`peer` while the fp is registered on another ready link, else `gone`). An entry that does not fit the
+  // link's whole total waits there, never dropped; a flush toward the link pumps it again. So a slow reader gets
+  // every fp's latest state late, never a stale or lost one, and the queue is bounded by the fps registered.
+  const readyLinks = () => [...links].filter((l) => l.ready && !l.closed);
+
+  function rosterFrame(L, fp) {
+    const holder = byFp.get(fp);
+    if (holder && holder !== L && holder.ready && !holder.closed) {
+      const rec = holder.anns.get(fp);
+      return { t: 'peer', fp, rec: rec ? Buffer.from(rec).toString('base64url') : null };
+    }
+    return { t: 'gone', fp };
+  }
+
+  function pump(L) {
+    L.pumpArmed = false;
+    if (L.closed || !L.ready) return;
+    for (const fp of [...L.dirty]) {
+      const buf = encodeFrame(rosterFrame(L, fp));
+      if (!L.fits(buf.length)) return;
+      L.dirty.delete(fp);
+      L.send(buf);
+    }
+  }
+
+  // Pumps once, after the current event: a burst of changes (a registration replacing another) settles first.
+  function kick(L) {
+    if (L.pumpArmed || !L.dirty.size) return;
+    L.pumpArmed = true;
+    setImmediate(() => pump(L));
+  }
+
+  function markDirty(fps, except) {
+    for (const L of readyLinks()) {
+      if (L === except) continue;
+      for (const fp of fps) L.dirty.add(fp);
+      kick(L);
+    }
   }
 
   // Forgets a stream pair; the end that did not ask hears `close {reason}`.
@@ -89,19 +128,6 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     if (tellBoth) end.conn.send({ t: 'close', s: end.s, reason });
   }
 
-  function setWatch(c, fps) {
-    for (const fp of c.watch) {
-      const set = watchers.get(fp);
-      set.delete(c);
-      if (!set.size) watchers.delete(fp);
-    }
-    c.watch = new Set(fps.slice(0, HUB_WATCH_MAX));
-    for (const fp of c.watch) {
-      if (!watchers.has(fp)) watchers.set(fp, new Set());
-      watchers.get(fp).add(c);
-    }
-  }
-
   // Newest registration wins: every other link holding one of these fps is told DUPLICATE and torn down.
   function onRegistered(c, fps) {
     for (const fp of fps) {
@@ -111,8 +137,11 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     for (const fp of fps) byFp.set(fp, c);
   }
 
+  // A newcomer: every other link hears of its fps, and it hears of every fp registered on another link.
   function onReady(c) {
-    for (const fp of c.fps) notify(fp, true, c);
+    markDirty(c.fps, c);
+    for (const [fp, holder] of byFp) if (holder !== c) c.dirty.add(fp);
+    kick(c);
   }
 
   function onFrame(c, f) {
@@ -147,22 +176,24 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     } else if (f.t === 'close') {
       const end = c.streams.get(f.s);
       if (end) dropPair(end, 'CLOSED');
-    } else if (f.t === 'watch') {
-      setWatch(c, f.fps);
-      c.send({ t: 'present', id: f.id, fps: [...c.watch].filter((fp) => byFp.has(fp) && byFp.get(fp) !== c) });
+    } else if (f.t === 'announce') {
+      // Bound by its own signature to its signer, which must be an fp this link proved and still holds.
+      const d = decodeRecord(f.rec);
+      if (!d.ok || d.payload.type !== 'announce' || byFp.get(d.payload.signer) !== c) throw new FrameError('PROTOCOL', 'an announce must be signed by an identity this link registered');
+      c.anns.set(d.payload.signer, f.rec);
+      markDirty([d.payload.signer], c);
     }
   }
 
   function onClose(c) {
     links.delete(c);
+    c.anns.clear();
+    c.dirty.clear();
     if (!c.ready) { counters.handshakeFailures += 1; return; }
-    for (const fp of c.fps) {
-      if (byFp.get(fp) !== c) continue;
-      byFp.delete(fp);
-      notify(fp, false, c);
-    }
+    const gone = c.fps.filter((fp) => byFp.get(fp) === c);
+    for (const fp of gone) byFp.delete(fp);
+    markDirty(gone, c);
     for (const end of [...c.streams.values()]) dropPair(end, 'GONE');
-    setWatch(c, []);
   }
 
   function accept(socket) {
@@ -171,7 +202,13 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
     c.streams = new Map(); // s → {conn, s, bytes, peer}
     c.dataBytes = 0; // unflushed stream data toward this link, every end counted
     c.nextS = 2;
-    c.watch = new Set();
+    c.anns = new Map(); // fp → this link's announce bytes for it
+    c.dirty = new Set(); // roster entries owed to this link
+    c.pumpArmed = false;
+    // Room left under the link's whole total, and a pump after every flush while roster entries wait.
+    c.fits = (n) => socket.writableLength + n <= linkLimits.writeBufferMax;
+    const send = c.send;
+    c.send = (frame, onFlushed) => send(frame, (...a) => { onFlushed?.(...a); kick(c); });
     links.add(c);
   }
 
@@ -201,6 +238,8 @@ export function createHub({ host = '127.0.0.1', port = HUB_DEFAULT_PORT, limits 
       handshaking: handshaking(),
       fps: byFp.size,
       streams: streamCount(),
+      announces: [...links].reduce((n, c) => n + c.anns.size, 0),
+      rosterPending: [...links].reduce((n, c) => n + c.dirty.size, 0),
       handshakeFailures: counters.handshakeFailures,
       dropped: counters.dropped,
     }),

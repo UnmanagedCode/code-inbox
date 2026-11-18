@@ -11,38 +11,53 @@ import { TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, encodeFrame } from '../src/transpor
 import { TCP_HANDSHAKE_MS } from '../src/transport/tcpSession.js';
 import { proofSigner } from '../src/transport/handshake.js';
 import { routeKey } from '../src/transport/index.js';
-import { TCP_REDIAL_MIN_MS, createTcpEndpoint, resolveTcpConfig } from '../src/transport/tcp.js';
+import { TCP_REDIAL_MIN_MS } from '../src/transport/endpoint.js';
+import { createNetworkEndpoint, resolveNetworkConfig } from '../src/transport/network.js';
 import { fakeClock, makeInstall, silentLog, tmpDir } from './helpers.mjs';
+import { lyingHub, rawHubLink } from './hubHelpers.mjs';
+import { netNode } from './netHelpers.mjs';
 import {
-  acceptProofs, countingListener, freePort, memCursors, personal, rawConn, rawConnect, rawPeer, settle, stubSink, stubView, tcpNode, waitFor,
+  acceptProofs, countingListener, freePort, helloFrame, memCursors, personal, rawConn, rawConnect, rawPeer, settle, stubSink, stubView, waitFor,
 } from './tcpHelpers.mjs';
 
-// The TCP transport over real loopback sockets on ephemeral ports. Engines run with an hour-long maintain interval:
-// every sync is driven by the test. Each test closes every socket, listener and engine it opened.
+// The network endpoint's listener and direct connections over real loopback sockets on ephemeral ports. Engines run
+// with an hour-long maintain interval: every sync is driven by the test. Each test closes every socket, listener and
+// engine it opened.
 
 const newIdentity = () => loadIdentity(tmpDir('code-inbox-id-'));
-const announceOf = (identity, addr = []) => encodeRecord(identity, { type: 'announce', signer: identity.fp, ts: Date.now(), name: `n${identity.fp.slice(0, 6)}`, addr }).bytes;
+const announceOf = (identity) => encodeRecord(identity, { type: 'announce', signer: identity.fp, ts: Date.now(), name: `n${identity.fp.slice(0, 6)}` }).bytes;
 const b64 = (bytes) => Buffer.from(bytes).toString('base64url');
 const randomFp = () => crypto.randomBytes(32).toString('hex');
+const nonce = () => crypto.randomBytes(32).toString('hex');
 
-// One endpoint with one identity attached and a stub view and sink: the transport alone, no engine.
-async function stubEndpoint(t, { view = stubView(), limits, now, schedule } = {}) {
-  const identity = await newIdentity();
-  const endpoint = createTcpEndpoint({ port: 0, limits, now, schedule, syncMs: 3_600_000, log: silentLog });
+// One endpoint with one identity attached and a stub view and sink: the transport alone, no engine. It listens
+// unless `listen` is null, and keeps `connections`.
+async function stubEndpoint(t, { view = stubView(), limits, now, schedule, listen = { port: 0 }, connections = [], identity } = {}) {
+  identity ??= await newIdentity();
+  const endpoint = createNetworkEndpoint({ listen, connections, limits, now, schedule, syncMs: 3_600_000, log: silentLog });
   const transport = endpoint.attach({ identity: proofSigner(identity), view, cursors: memCursors() });
   const sink = stubSink();
   await transport.start(sink);
   t.after(() => endpoint.close());
-  return { identity, fp: identity.fp, endpoint, transport, sink, port: endpoint.stats().listening.port };
+  return { identity, fp: identity.fp, endpoint, transport, sink, port: endpoint.stats().listening?.port };
+}
+
+// A raw TCP server collecting a rawConn per accepted socket.
+async function rawServer(t) {
+  const conns = [];
+  const srv = net.createServer((s) => conns.push(rawConn(s)));
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { for (const c of conns) c.destroy(); srv.close(); });
+  return { conns, addr: `127.0.0.1:${srv.address().port}` };
 }
 
 const closeAll = (t, ...things) => t.after(async () => { for (const x of things) await (x.close ?? x.destroy).call(x); });
 
 test('one endpoint serves several identities over one pooled connection', async (t) => {
-  const e1 = createTcpEndpoint({ port: 0, syncMs: 3_600_000, log: silentLog });
-  const alice = await tcpNode('alice', { endpoint: e1 });
-  const carol = await tcpNode('carol', { endpoint: e1 });
-  const bob = await tcpNode('bob');
+  const e1 = createNetworkEndpoint({ listen: { port: 0 }, syncMs: 3_600_000, log: silentLog });
+  const alice = await netNode('alice', { endpoint: e1 });
+  const carol = await netNode('carol', { endpoint: e1 });
+  const bob = await netNode('bob', { connections: [`127.0.0.1:${e1.stats().listening.port}`] });
   closeAll(t, alice, carol, bob, e1);
   await bob.engine.importCard(alice.card());
   await bob.engine.importCard(carol.card());
@@ -61,10 +76,10 @@ test('one endpoint serves several identities over one pooled connection', async 
 });
 
 test('a frame is delivered to the addressed identity only', async (t) => {
-  const e1 = createTcpEndpoint({ port: 0, syncMs: 3_600_000, log: silentLog });
-  const alice = await tcpNode('alice', { endpoint: e1 });
-  const carol = await tcpNode('carol', { endpoint: e1 });
-  const bob = await tcpNode('bob');
+  const e1 = createNetworkEndpoint({ listen: { port: 0 }, syncMs: 3_600_000, log: silentLog });
+  const alice = await netNode('alice', { endpoint: e1 });
+  const carol = await netNode('carol', { endpoint: e1 });
+  const bob = await netNode('bob', { connections: [`127.0.0.1:${e1.stats().listening.port}`] });
   closeAll(t, alice, carol, bob, e1);
   await bob.engine.importCard(alice.card());
   await settle([alice, carol, bob]);
@@ -91,7 +106,7 @@ test('a bad proof closes the connection and the acceptor signs nothing', async (
   const raw = await rawConnect(a.port);
   closeAll(t, raw);
   const hello = await raw.next();
-  raw.send({ t: 'hello', v: 1, nonce: crypto.randomBytes(32).toString('hex') });
+  raw.send(helloFrame());
   raw.send({ t: 'prove', target: a.fp, ids: [{ key: b64(mallory.publicRaw), sig: b64(crypto.randomBytes(64)) }] });
   await raw.whenClosed;
   assert.equal(hello.t, 'hello');
@@ -116,60 +131,112 @@ test('a proof from another connection is refused', async (t) => {
   assert.deepEqual(raw.frames.map((f) => [f.t, f.reason]), [['hello', undefined], ['bye', 'PROOF']]);
 });
 
+// Invariant (D3): a listener accepts an untargeted dial proof (bound ''), and still refuses a proof naming a target
+// not attached here; a dialer refuses an acceptor's proof signed for the dial role.
 test('a proof bound to another target or role is refused', async (t) => {
   const a = await stubEndpoint(t);
   const mallory = await newIdentity();
+  // An untargeted dial: whoever the listener serves.
+  const untargeted = await rawPeer(a.port, mallory, null);
+  closeAll(t, untargeted);
+  assert.equal(untargeted.accept.t, 'prove');
+  await waitFor(() => a.endpoint.stats().sessions.length === 1, 'the untargeted session');
   // A dialer proof naming a target not attached here (a relay of a proof meant for someone else).
   const elsewhere = randomFp();
   const raw = await rawConnect(a.port);
   closeAll(t, raw);
-  const { nonce } = await raw.nextOf('hello');
-  const mine = crypto.randomBytes(32).toString('hex');
-  raw.send({ t: 'hello', v: 1, nonce: mine });
-  raw.send({ t: 'prove', target: elsewhere, ids: [{ key: b64(mallory.publicRaw), sig: b64(proofSigner(mallory).signProof('dial', mine, nonce, elsewhere)) }] });
+  const { nonce: theirs } = await raw.nextOf('hello');
+  const mine = nonce();
+  raw.send(helloFrame(mine));
+  raw.send({ t: 'prove', target: elsewhere, ids: [{ key: b64(mallory.publicRaw), sig: b64(proofSigner(mallory).signProof('dial', mine, theirs, elsewhere)) }] });
   await raw.whenClosed;
   assert.deepEqual(raw.frames.map((f) => [f.t, f.reason]), [['hello', undefined], ['bye', 'PROOF']]);
 
-  // An acceptor answering with a proof signed for the dial role: the dialer refuses it.
+  // An acceptor answering with a proof signed for the dial role: the dialer (a connection) refuses it.
   const target = await newIdentity();
-  const conns = [];
-  const srv = net.createServer((s) => conns.push(rawConn(s)));
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  t.after(() => { for (const c of conns) c.destroy(); srv.close(); });
-  const dialer = await stubEndpoint(t, { view: stubView({ contacts: [target.fp], addrs: { [target.fp]: [`tcp://127.0.0.1:${srv.address().port}`] } }) });
-  const syncing = dialer.transport.sync();
-  await waitFor(() => conns.length === 1, 'the dial');
-  const acc = conns[0];
-  const myNonce = crypto.randomBytes(32).toString('hex');
-  acc.send({ t: 'hello', v: 1, nonce: myNonce });
+  const srv = await rawServer(t);
+  const dialer = await stubEndpoint(t, { listen: null, connections: [srv.addr] });
+  await waitFor(() => srv.conns.length === 1, 'the connection');
+  const acc = srv.conns[0];
+  const myNonce = nonce();
+  acc.send(helloFrame(myNonce));
   const dHello = await acc.nextOf('hello');
-  assert.equal((await acc.nextOf('prove')).target, target.fp);
+  assert.equal((await acc.nextOf('prove')).target, null);
   acc.send({ t: 'prove', ids: acceptProofs([target], 'dial', myNonce, dHello.nonce, [dialer.fp]) });
   assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
+  await waitFor(() => dialer.endpoint.stats().connections[0].error?.code === 'CONNECTION_REFUSED', 'the refusal on the connection');
+  assert.deepEqual(dialer.endpoint.stats().sessions, []);
+});
+
+// Invariant (misrouting defence): a targeted dial (a hub stream) refuses an acceptor that validly proves someone
+// other than its target.
+test('a dialer refuses an acceptor that validly proves someone other than its target', async (t) => {
+  const target = await newIdentity();
+  const impostor = await newIdentity();
+  const opened = [];
+  const lying = await lyingHub(t, { onOpen: (link, f) => { opened.push({ link, s: f.s }); return true; } });
+  const dialer = await stubEndpoint(t, { listen: null, connections: [lying.addr], view: stubView({ contacts: [target.fp] }) });
+  await waitFor(() => dialer.endpoint.stats().connections[0].state === 'up', 'the hub link');
+  // The target registers on the hub: the roster reports it, and the dialer opens a stream to it.
+  const targetLink = await rawHubLink(lying.port, [target]);
+  closeAll(t, targetLink);
+  const syncing = dialer.transport.sync();
+  await waitFor(() => opened.length === 1, 'the stream open');
+  const { link, s } = opened[0];
+  const inStream = streamReader(lying, link, s);
+  const myNonce = nonce();
+  lying.inject(link, s, helloFrame(myNonce));
+  const dHello = await inStream.nextOf('hello');
+  assert.equal((await inStream.nextOf('prove')).target, target.fp);
+  // A correct accept proof (role, nonces, bound to the dialer) by an identity the dialer never asked for.
+  lying.inject(link, s, { t: 'prove', ids: acceptProofs([impostor], 'accept', myNonce, dHello.nonce, [dialer.fp]) });
+  assert.equal((await inStream.nextOf('bye')).reason, 'PROOF');
   await syncing;
   assert.deepEqual(dialer.endpoint.stats().sessions, []);
 });
 
-test('a dialer refuses an acceptor that validly proves someone other than its target', async (t) => {
-  const target = await newIdentity();
-  const impostor = await newIdentity();
-  const conns = [];
-  const srv = net.createServer((s) => conns.push(rawConn(s)));
-  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
-  t.after(() => { for (const c of conns) c.destroy(); srv.close(); });
-  const dialer = await stubEndpoint(t, { view: stubView({ contacts: [target.fp], addrs: { [target.fp]: [`tcp://127.0.0.1:${srv.address().port}`] } }) });
-  const syncing = dialer.transport.sync();
-  await waitFor(() => conns.length === 1, 'the dial');
-  const acc = conns[0];
-  const myNonce = crypto.randomBytes(32).toString('hex');
-  acc.send({ t: 'hello', v: 1, nonce: myNonce });
-  const dHello = await acc.nextOf('hello');
-  await acc.nextOf('prove');
-  // A correct accept proof (role, nonces, bound to the dialer) by an identity the dialer never asked for.
-  acc.send({ t: 'prove', ids: acceptProofs([impostor], 'accept', myNonce, dHello.nonce, [dialer.fp]) });
-  assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
-  await syncing;
-  assert.deepEqual(dialer.endpoint.stats().sessions, []);
+// The endpoint frames a lying hub's `link` sent on stream `s` (decoded from its `data` frames).
+function streamReader(lying, link, s) {
+  const r = { read: 0 };
+  const frames = () => {
+    const out = [];
+    let buf = Buffer.alloc(0);
+    for (const f of lying.received(link)) {
+      if (f.t !== 'data' || f.s !== s) continue;
+      buf = Buffer.concat([buf, Buffer.from(f.b, 'base64url')]);
+      while (buf.length >= 4 && buf.length >= 4 + buf.readUInt32BE(0)) {
+        out.push(JSON.parse(buf.subarray(4, 4 + buf.readUInt32BE(0)).toString('utf8')));
+        buf = buf.subarray(4 + buf.readUInt32BE(0));
+      }
+    }
+    return out;
+  };
+  r.nextOf = async (type) => {
+    for (;;) {
+      const all = frames();
+      while (r.read < all.length) { const f = all[r.read++]; if (f.t === type) return f; }
+      await new Promise((res) => setTimeout(res, 2));
+    }
+  };
+  return r;
+}
+
+// Invariant (D3): a connection names no fingerprint: it reaches whoever proves at its address, but never this
+// install's own identities (a connection to its own listener is refused, shown and backed off).
+test('an untargeted dialer accepts whoever proves, never its own identities', async (t) => {
+  const b = await stubEndpoint(t);
+  const addrB = `127.0.0.1:${b.port}`;
+  const a = await stubEndpoint(t, { listen: null, connections: [addrB] });
+  await waitFor(() => a.endpoint.stats().connections[0].state === 'up', 'the connection');
+  assert.deepEqual(a.endpoint.stats().sessions, [{ role: 'dial', via: 'direct', address: addrB, remote: [b.fp] }]);
+  assert.deepEqual(a.endpoint.stats().connections[0], { address: addrB, kind: 'peer', state: 'up', remote: [b.fp], error: null });
+
+  const clock = fakeClock();
+  const port = await freePort();
+  const self = await stubEndpoint(t, { listen: { port }, connections: [`127.0.0.1:${port}`], now: clock.now, schedule: clock.schedule });
+  await waitFor(() => self.endpoint.stats().connections[0].error?.code === 'CONNECTION_REFUSED', 'the refusal');
+  assert.equal(self.endpoint.stats().connections[0].state, 'waiting');
+  assert.deepEqual(self.endpoint.stats().sessions, []);
 });
 
 test('no frame is acted on before the handshake completes', async (t) => {
@@ -180,7 +247,7 @@ test('no frame is acted on before the handshake completes', async (t) => {
   const early = await rawConnect(a.port);
   closeAll(t, early);
   await early.nextOf('hello');
-  early.send({ t: 'hello', v: 1, nonce: crypto.randomBytes(32).toString('hex') });
+  early.send(helloFrame());
   early.send({ t: 'rec', from: mallory.fp, to: a.fp, route: { kind: 'directory' }, rec: b64(announceOf(mallory)) });
   await early.whenClosed;
   assert.equal(early.frames.at(-1).reason, 'PROTOCOL');
@@ -189,7 +256,7 @@ test('no frame is acted on before the handshake completes', async (t) => {
   closeAll(t, raw);
   const { nonce } = await raw.nextOf('hello');
   const mine = crypto.randomBytes(32).toString('hex');
-  raw.send({ t: 'hello', v: 1, nonce: mine });
+  raw.send(helloFrame(mine));
   raw.send({ t: 'prove', target: a.fp, ids: [{ key: b64(mallory.publicRaw), sig: b64(proofSigner(mallory).signProof('dial', mine, nonce, a.fp)) }] });
   await raw.nextOf('prove');
   raw.send({ t: 'pull', id: 1, from: mallory.fp, to: a.fp, routes: [{ route: { kind: 'directory' }, since: 0 }] });
@@ -213,11 +280,11 @@ test('a record whose from is not proven on the session is refused', async (t) =>
 });
 
 test('a record signed by someone other than its from is refused ROUTE_MISMATCH', async (t) => {
-  const alice = await tcpNode('alice');
+  const alice = await netNode('alice');
   closeAll(t, alice);
   const mallory = await newIdentity();
   const bob = await newIdentity();
-  const raw = await rawPeer(alice.transport.stats().listening.port, mallory, alice.fp);
+  const raw = await rawPeer(alice.port(), mallory, alice.fp);
   closeAll(t, raw);
   // A genuine announce of bob's, relayed by mallory.
   raw.send({ t: 'rec', from: mallory.fp, to: alice.fp, route: { kind: 'directory' }, rec: b64(announceOf(bob)) });
@@ -257,6 +324,20 @@ test('a stalled partial frame and a stalled handshake are closed', async (t) => 
   raw.write(encodeFrame({ t: 'ping' }).subarray(0, 6));
   await raw.whenClosed;
   assert.equal(raw.frames.at(-1).reason, 'LIMIT');
+
+  // A connection target that never says hello: the attempt ends CONNECTION_TIMEOUT and waits out its backoff.
+  const clock = fakeClock();
+  const silentSrv = await rawServer(t);
+  const c = await stubEndpoint(t, { listen: null, connections: [silentSrv.addr], now: clock.now, schedule: clock.schedule });
+  await waitFor(() => silentSrv.conns.length === 1, 'the connection');
+  clock.advance(TCP_HANDSHAKE_MS);
+  await waitFor(() => c.endpoint.stats().connections[0].error?.code === 'CONNECTION_TIMEOUT', 'the timeout');
+  assert.equal(c.endpoint.stats().connections[0].state, 'waiting');
+  clock.advance(TCP_REDIAL_MIN_MS - 1);
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(silentSrv.conns.length, 1);
+  clock.advance(1);
+  await waitFor(() => silentSrv.conns.length === 2, 'the reconnect after the backoff');
 });
 
 test('connections beyond the cap are refused at accept', async (t) => {
@@ -270,13 +351,12 @@ test('connections beyond the cap are refused at accept', async (t) => {
   closeAll(t, c3);
   await c3.whenClosed;
   assert.deepEqual(c3.frames, []);
-  assert.equal(a.endpoint.stats().connections, 2);
+  assert.equal(a.endpoint.stats().sessionCount, 2);
 });
 
 test('an offline recipient gets the record from the outbox when it reconnects', async (t) => {
-  const port = await freePort();
-  const alice = await tcpNode('alice');
-  let bob = await tcpNode('bob', { port });
+  const alice = await netNode('alice');
+  let bob = await netNode('bob', { listen: null, connections: [alice.addr()] });
   const bobDir = bob.dataDir;
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
@@ -286,9 +366,9 @@ test('an offline recipient gets the record from the outbox when it reconnects', 
   await waitFor(() => alice.transport.stats().sessions.length === 0, 'alice to see bob leave');
   await alice.engine.sendMessage(inbox, 'while you were out');
   assert.equal(alice.engine.state().diagnostics.outbox, 1);
-  bob = await tcpNode('bob', { dataDir: bobDir });
-  assert.deepEqual(bob.transport.addresses(), [`tcp://127.0.0.1:${port}`]);
-  await bob.engine.sync(); // bob dials alice: alice hears peerOnline(bob) and flushes her outbox
+  bob = await netNode('bob', { dataDir: bobDir });
+  assert.deepEqual(bob.engine.settings().transport.connections, [alice.addr()]);
+  await bob.engine.sync(); // bob's connection is up: alice hears peerOnline(bob) and flushes her outbox
   await waitFor(() => alice.engine.state().diagnostics.outbox === 0, 'the outbox to drain');
   await settle([alice, bob]);
   assert.deepEqual(bob.engine.messages(inbox).map((m) => m.body), ['while you were out']);
@@ -297,8 +377,8 @@ test('an offline recipient gets the record from the outbox when it reconnects', 
 test('a late joiner pulls the history from the per-peer cursor', async (t) => {
   let served = 0;
   const countServe = (view) => ({ ...view, serve: (...a) => { const r = view.serve(...a); served += r.recs?.length ?? 0; return r; } });
-  const alice = await tcpNode('alice', { wrapView: countServe });
-  let bob = await tcpNode('bob');
+  const alice = await netNode('alice', { wrapView: countServe });
+  let bob = await netNode('bob', { listen: null, connections: [alice.addr()] });
   const bobDir = bob.dataDir;
   t.after(async () => { await alice.close(); await bob.close(); });
   const { id: team } = await alice.engine.createSharedInbox('team');
@@ -320,7 +400,7 @@ test('a late joiner pulls the history from the per-peer cursor', async (t) => {
   assert.equal(served, 0);
   // And across a restart of bob's backend.
   await bob.close();
-  bob = await tcpNode('bob', { dataDir: bobDir });
+  bob = await netNode('bob', { dataDir: bobDir });
   await bob.engine.sync();
   assert.equal(served, 0);
   assert.deepEqual(bob.engine.messages(team).map((m) => m.body), ['m1', 'm2', 'm3']);
@@ -328,9 +408,9 @@ test('a late joiner pulls the history from the per-peer cursor', async (t) => {
 
 test('a denied pull keeps its cursor', async (t) => {
   const denied = [];
-  const watchServe = (view) => ({ ...view, serve: (reader, route, ...a) => { const r = view.serve(reader, route, ...a); if (r.status === 'denied') denied.push(routeKey(route)); return r; } });
-  const alice = await tcpNode('alice', { wrapView: watchServe });
-  const bob = await tcpNode('bob');
+  const spyServe = (view) => ({ ...view, serve: (reader, route, ...a) => { const r = view.serve(reader, route, ...a); if (r.status === 'denied') denied.push(routeKey(route)); return r; } });
+  const alice = await netNode('alice', { wrapView: spyServe });
+  const bob = await netNode('bob', { listen: null, connections: [alice.addr()] });
   t.after(async () => { await alice.close(); await bob.close(); });
   const { id: team } = await alice.engine.createSharedInbox('team');
   await alice.engine.sendMessage(team, 'm1');
@@ -348,15 +428,16 @@ test('a denied pull keeps its cursor', async (t) => {
 });
 
 test('inbox and mailbox records are served only to parties or members', async (t) => {
-  const alice = await tcpNode('alice');
-  const bob = await tcpNode('bob');
+  const alice = await netNode('alice');
+  const bob = await netNode('bob', { listen: null, connections: [alice.addr()] });
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
   const inbox = await personal(alice, bob);
   await alice.engine.sendMessage(inbox, 'private');
+  await alice.engine.createSharedInbox('team'); // an inbox-create: what alice's directory route serves
   const carol = await newIdentity();
-  const raw = await rawPeer(alice.transport.stats().listening.port, carol, alice.fp);
+  const raw = await rawPeer(alice.port(), carol, alice.fp);
   closeAll(t, raw);
   const routes = [{ kind: 'inbox', id: inbox }, { kind: 'mailbox', fp: bob.fp }, { kind: 'directory' }];
   raw.send({ t: 'pull', id: 7, from: carol.fp, to: alice.fp, routes: routes.map((route) => ({ route, since: 0 })) });
@@ -367,8 +448,8 @@ test('inbox and mailbox records are served only to parties or members', async (t
 });
 
 test('a peer\'s pull names only the routes it could serve', async (t) => {
-  const alice = await tcpNode('alice');
-  const bob = await tcpNode('bob');
+  const alice = await netNode('alice');
+  const bob = await netNode('bob', { listen: null, connections: [alice.addr()] });
   t.after(async () => { await alice.close(); await bob.close(); });
   await bob.engine.importCard(alice.card());
   await settle([alice, bob]);
@@ -377,7 +458,7 @@ test('a peer\'s pull names only the routes it could serve', async (t) => {
   assert.ok(alice.engine.state().inboxes.some((b) => b.id === inbox));
   // A stranger connects: alice's pull on the new session names her directory and her mailbox, nothing else.
   const mallory = await newIdentity();
-  const raw = await rawPeer(alice.transport.stats().listening.port, mallory, alice.fp);
+  const raw = await rawPeer(alice.port(), mallory, alice.fp);
   closeAll(t, raw);
   const pull = await raw.nextOf('pull');
   assert.deepEqual(pull.routes.map((r) => routeKey(r.route)).sort(), ['directory', `mailbox:${alice.fp}`]);
@@ -387,98 +468,61 @@ test('a peer\'s pull names only the routes it could serve', async (t) => {
   assert.ok(!JSON.stringify(raw.frames).includes(team) && !JSON.stringify(raw.frames).includes(inbox));
 });
 
-test('members discover each other through a verified whois hint', async (t) => {
-  const alice = await tcpNode('alice');
-  const bob = await tcpNode('bob');
-  const carol = await tcpNode('carol');
-  const all = [alice, bob, carol];
-  t.after(async () => { for (const n of all) await n.close(); });
-  // bob and carol each know only alice's card.
-  await bob.engine.importCard(alice.card());
-  await carol.engine.importCard(alice.card());
-  await settle(all);
-  const { id: team } = await alice.engine.createSharedInbox('team');
-  await alice.engine.inviteMember(team, bob.fp);
-  await alice.engine.inviteMember(team, carol.fp);
-  await settle(all);
-  for (const n of [bob, carol]) await n.engine.respondInvite(n.engine.state().invites.incoming[0].id, true);
-  await settle(all, 3);
-  await carol.engine.sendMessage(team, 'hi bob');
-  await settle(all, 3);
-  assert.deepEqual(bob.engine.messages(team).map((m) => m.body), ['hi bob']);
-  assert.ok(carol.transport.stats().sessions.some((s) => s.remote.includes(bob.fp)), 'carol reached bob directly');
 
-  // alice answers whois about bob to a co-member of bob's (carol), and to nobody else.
-  const port = alice.transport.stats().listening.port;
-  const whois = async (identity) => {
-    const raw = await rawPeer(port, identity, alice.fp);
-    raw.send({ t: 'whois', id: 9, from: identity.fp, to: alice.fp, fps: [bob.fp] });
-    const cards = await raw.nextOf('cards');
-    raw.destroy();
-    return cards.recs.map((r) => decodeRecord(Buffer.from(r, 'base64url')).payload);
-  };
-  assert.deepEqual((await whois(carol.identity)).map((p) => [p.type, p.signer]), [['announce', bob.fp]]);
-  assert.deepEqual(await whois(await newIdentity()), []);
-
-  // A whois reply signed by anyone but the identity asked about is never a dial hint.
-  const dave = await newIdentity();
-  const eve = await newIdentity();
-  const trap = await countingListener();
-  t.after(() => trap.close());
-  const x = await stubEndpoint(t, { view: stubView({ contacts: [dave.fp] }) });
-  const asked = [];
-  const m = await rawPeer(x.port, await newIdentity(), x.fp, {
-    onFrame: (f, conn) => {
-      if (f.t !== 'whois') return false;
-      asked.push(...f.fps);
-      conn.send({ t: 'cards', id: f.id, from: f.to, to: f.from, recs: [b64(announceOf(eve, [trap.addr]))] });
-      return true;
-    },
-  });
-  closeAll(t, m);
-  await waitFor(() => x.endpoint.stats().sessions.length === 1, 'the session');
-  await x.transport.sync();
-  assert.deepEqual(asked, [dave.fp]);
-  assert.equal(trap.count, 0);
-});
-
-test('a stranger\'s announce never makes this install dial it', async (t) => {
-  const alice = await tcpNode('alice');
-  closeAll(t, alice);
-  const trap = await countingListener();
-  t.after(() => trap.close());
+// Invariant (D6): a stranger (a proven non-contact) is served while its session lives, but never becomes a contact
+// and is never dialed, whether it dialed in, this install met it on one of its connections, or a hub reports it.
+test('a stranger is served but never dialed, whether it dialed in, was met on a connection or is on a hub', async (t) => {
+  const lying = await lyingHub(t);
   const mallory = await newIdentity();
-  const raw = await rawPeer(alice.transport.stats().listening.port, mallory, alice.fp);
-  raw.send({ t: 'rec', from: mallory.fp, to: alice.fp, route: { kind: 'directory' }, rec: b64(announceOf(mallory, [trap.addr])) });
+  const eve = await stubEndpoint(t);
+  const alice = await netNode('alice', { connections: [lying.addr, `127.0.0.1:${eve.port}`] });
+  closeAll(t, alice);
+  await waitFor(() => alice.status(lying.addr).state === 'up' && alice.status(`127.0.0.1:${eve.port}`).state === 'up', 'both connections');
+  // eve, met on a connection, is served: she pulled alice's directory.
+  assert.deepEqual(alice.status(`127.0.0.1:${eve.port}`).remote, [eve.fp]);
+  // mallory dials in and pushes his announce.
+  const raw = await rawPeer(alice.port(), mallory, alice.fp);
+  raw.send({ t: 'rec', from: mallory.fp, to: alice.fp, route: { kind: 'directory' }, rec: b64(announceOf(mallory)) });
   await waitFor(() => alice.engine.state().directory.some((d) => d.fp === mallory.fp), 'mallory in the directory');
   raw.destroy();
   await raw.whenClosed;
-  await waitFor(() => alice.transport.stats().sessions.length === 0, 'mallory to leave');
-  await alice.engine.announce(); // addressed to every known identity, mallory included: pending, not dialed
+  await waitFor(() => alice.sessionsWith(mallory.fp).length === 0, 'mallory to leave');
+  // mallory registers on alice's hub: the roster tells alice he is there.
+  const onHub = await rawHubLink(lying.port, [mallory]);
+  closeAll(t, onHub);
+  await waitFor(() => alice.transport.stats().presence[mallory.fp]?.some((p) => p.via === 'hub'), 'mallory on the hub');
+  await alice.engine.announce();
   await alice.engine.sync();
-  assert.equal(trap.count, 0);
+  assert.deepEqual(alice.view.contacts(), []);
+  const opens = lying.received(lying.linkOf(alice.fp)).filter((f) => f.t === 'open');
+  assert.deepEqual(opens, []);
 });
 
+// Invariant: two direct sessions between the same endpoints (each has a connection to the other's listener) leave
+// one, the same on both sides, and nothing is lost.
 test('simultaneous dials leave one session and lose nothing', async (t) => {
-  // Contacts stay hidden from both transports until both are ready to dial each other in the same tick.
+  // Connections fail until the gate opens, then both retry on the same clock tick.
+  const clock = fakeClock();
+  const dead = await freePort();
   const gate = { open: false };
-  const gated = (view) => ({ ...view, contacts: () => (gate.open ? view.contacts() : []) });
-  const alice = await tcpNode('alice', { wrapView: gated });
-  const bob = await tcpNode('bob', { wrapView: gated });
+  const connect = (opts) => net.connect(gate.open ? opts : { host: '127.0.0.1', port: dead });
+  const [pa, pb] = [await freePort(), await freePort()];
+  const opts = { connect, schedule: clock.schedule, now: clock.now };
+  const alice = await netNode('alice', { ...opts, listen: { port: pa }, connections: [`127.0.0.1:${pb}`] });
+  const bob = await netNode('bob', { ...opts, listen: { port: pb }, connections: [`127.0.0.1:${pa}`] });
   t.after(async () => { await alice.close(); await bob.close(); });
+  await waitFor(() => alice.transport.stats().connections[0].state === 'waiting' && bob.transport.stats().connections[0].state === 'waiting', 'both connections to fail once');
   await bob.engine.importCard(alice.card());
   await alice.engine.importCard(bob.card());
-  await Promise.all([alice.transport.sync(), bob.transport.sync()]);
-  assert.equal(alice.transport.stats().connections + bob.transport.stats().connections, 0);
   gate.open = true;
   let peak = 0;
   let racing = true;
-  const watch = () => { if (!racing) return; peak = Math.max(peak, alice.transport.stats().connections); setImmediate(watch); };
-  watch();
-  await Promise.all([alice.engine.sync(), bob.engine.sync()]);
+  const sample = () => { if (!racing) return; peak = Math.max(peak, alice.transport.stats().sessionCount); setImmediate(sample); };
+  sample();
+  clock.advance(TCP_REDIAL_MIN_MS);
+  await waitFor(() => peak === 2, 'both sides dialed');
+  await waitFor(() => alice.transport.stats().sessionCount === 1 && bob.transport.stats().sessionCount === 1, 'one session each');
   racing = false;
-  assert.equal(peak, 2, 'both sides dialed');
-  await waitFor(() => alice.transport.stats().connections === 1 && bob.transport.stats().connections === 1, 'one connection each');
   const inbox = await personal(alice, bob);
   await alice.engine.sendMessage(inbox, 'from alice');
   await bob.engine.sendMessage(inbox, 'from bob');
@@ -488,88 +532,96 @@ test('simultaneous dials leave one session and lose nothing', async (t) => {
   assert.equal(bob.transport.stats().sessions.length, 1);
 });
 
-test('redials back off and reset after a successful handshake', async (t) => {
+// Invariant (D5): a connection reconnects on its own timer: the delay doubles from TCP_REDIAL_MIN_MS up to the
+// maximum, and a handshake that completes resets it.
+test('a connection reconnects with backoff, doubling to the maximum, and resets after a handshake', async (t) => {
   const clock = fakeClock();
   let dead = await countingListener();
-  const port = dead.port;
-  const bob = await newIdentity();
-  const a = await stubEndpoint(t, { now: clock.now, schedule: clock.schedule, view: stubView({ contacts: [bob.fp], addrs: { [bob.fp]: [dead.addr] } }) });
-  const attempts = async (ms) => { clock.advance(ms); await a.transport.sync(); return dead.count; };
-  assert.equal(await attempts(0), 1); // start's own maintain dialed once
-  assert.equal(await attempts(TCP_REDIAL_MIN_MS - 1), 1);
-  assert.equal(await attempts(1), 2);
-  assert.equal(await attempts(2 * TCP_REDIAL_MIN_MS - 1), 2);
-  assert.equal(await attempts(1), 3);
-  // bob comes up on that port: the next dial (once its backoff ends) succeeds.
+  const { port } = dead;
+  const a = await stubEndpoint(t, { listen: null, connections: [dead.addr], now: clock.now, schedule: clock.schedule, limits: { redialMaxMs: 4 * TCP_REDIAL_MIN_MS } });
+  const attempts = async (ms, expect) => {
+    clock.advance(ms);
+    if (expect !== dead.count) await waitFor(() => dead.count === expect && a.endpoint.stats().connections[0].state === 'waiting', `attempt ${expect}`);
+    await new Promise((r) => setTimeout(r, 10));
+    return dead.count;
+  };
+  assert.equal(await attempts(0, 1), 1); // start's own attempt
+  assert.equal(await attempts(TCP_REDIAL_MIN_MS - 1, 1), 1);
+  assert.equal(await attempts(1, 2), 2);
+  assert.equal(await attempts(2 * TCP_REDIAL_MIN_MS - 1, 2), 2);
+  assert.equal(await attempts(1, 3), 3);
+  assert.equal(await attempts(4 * TCP_REDIAL_MIN_MS, 4), 4);
+  // The maximum: the next wait is 4 × MIN again, not 8 ×.
+  assert.equal(await attempts(4 * TCP_REDIAL_MIN_MS - 1, 4), 4);
+  assert.equal(await attempts(1, 5), 5);
+  // bob comes up on that port: the next attempt (once its backoff ends) succeeds.
   await dead.close();
-  const b = createTcpEndpoint({ port, syncMs: 3_600_000, log: silentLog });
+  const bob = await newIdentity();
+  const b = createNetworkEndpoint({ listen: { port }, syncMs: 3_600_000, log: silentLog });
   await b.attach({ identity: proofSigner(bob), view: stubView(), cursors: memCursors() }).start(stubSink());
-  await attempts(4 * TCP_REDIAL_MIN_MS);
-  assert.equal(a.endpoint.stats().sessions.length, 1);
+  clock.advance(4 * TCP_REDIAL_MIN_MS);
+  await waitFor(() => a.endpoint.stats().sessions.length === 1, 'the session');
+  assert.equal(a.endpoint.stats().connections[0].state, 'up');
   // bob goes away again: the spacing starts over from the minimum.
   b.close();
-  await waitFor(() => a.endpoint.stats().sessions.length === 0, 'the session to end');
+  await waitFor(() => a.endpoint.stats().sessions.length === 0 && a.endpoint.stats().connections[0].state === 'waiting', 'the session to end');
   dead = await countingListener(port);
   t.after(() => dead.close());
-  assert.equal(await attempts(0), 1);
-  assert.equal(await attempts(TCP_REDIAL_MIN_MS - 1), 1);
-  assert.equal(await attempts(1), 2);
+  assert.equal(await attempts(TCP_REDIAL_MIN_MS - 1, 0), 0);
+  assert.equal(await attempts(1, 1), 1);
+  assert.equal(await attempts(TCP_REDIAL_MIN_MS - 1, 1), 1);
+  assert.equal(await attempts(1, 2), 2);
 });
 
-test('TCP listens on loopback unless a host is given', async (t) => {
-  const alice = await tcpNode('alice');
+test('the listener binds loopback unless a host is given', async (t) => {
+  const alice = await netNode('alice', { configure: false });
   closeAll(t, alice);
+  const saved = await alice.engine.setNetwork({ listen: { port: 0 } });
+  assert.equal(saved.listening.host, '127.0.0.1');
+  assert.deepEqual(saved.listen, { host: '127.0.0.1', port: 0 });
+  assert.deepEqual(saved.connections, []);
   assert.equal(alice.transport.stats().listening.host, '127.0.0.1');
-  assert.match(alice.engine.state().transport.addresses[0], /^tcp:\/\/127\.0\.0\.1:\d+$/);
-  await assert.rejects(alice.engine.setTcp({ host: '0.0.0.0', port: 0 }), { code: 'TCP_INVALID' });
-  // Every spelling of the unspecified address is a wildcard, as a host and as an advertised host.
-  for (const host of ['::', '::0', '0:0:0:0:0:0:0:0', '0000::', '::ffff:0.0.0.0']) {
-    await assert.rejects(alice.engine.setTcp({ host, port: 0 }), { code: 'TCP_INVALID' }, host);
-    await assert.rejects(alice.engine.setTcp({ advertise: host, port: 0 }), { code: 'TCP_INVALID' }, `advertise ${host}`);
-  }
-  assert.equal(alice.engine.state().transport.configured, true);
+  assert.equal(alice.engine.state().transport.listening.host, '127.0.0.1');
 });
 
-test('re-saving TCP settings on the same port rebinds', async (t) => {
+test('re-saving network settings on the same port rebinds', async (t) => {
   const port = await freePort();
-  const alice = await tcpNode('alice', { port });
-  const bob = await tcpNode('bob');
+  const alice = await netNode('alice', { listen: { port } });
+  const bob = await netNode('bob', { listen: null, connections: [`127.0.0.1:${port}`] });
   t.after(async () => { await alice.close(); await bob.close(); });
-  await bob.engine.importCard(alice.card());
-  await settle([alice, bob]);
-  assert.equal(bob.transport.stats().sessions.length, 1);
+  await waitFor(() => bob.transport.stats().sessions.length === 1, 'the session');
   // Under the engine lock, with a live session: the old listener must be gone before the new one binds.
-  assert.deepEqual((await alice.engine.setTcp({ port })).addresses, [`tcp://127.0.0.1:${port}`]);
-  assert.deepEqual((await alice.engine.setTcp({ port })).addresses, [`tcp://127.0.0.1:${port}`]);
+  assert.deepEqual((await alice.engine.setNetwork({ listen: { port } })).listening, { host: '127.0.0.1', port });
+  assert.deepEqual((await alice.engine.setNetwork({ listen: { port } })).listening, { host: '127.0.0.1', port });
   await waitFor(() => bob.transport.stats().sessions.length === 0, 'the old session to end');
   await bob.engine.sync();
-  assert.equal(bob.transport.stats().sessions.length, 1);
+  await waitFor(() => bob.transport.stats().sessions.length === 1, 'bob\'s connection back');
 });
 
-test('a port in use refuses TCP_LISTEN_FAILED and leaves the transport unconfigured', async (t) => {
+test('a port in use refuses LISTEN_FAILED and leaves the transport unconfigured', async (t) => {
   const busy = net.createServer();
   await new Promise((r) => busy.listen(0, '127.0.0.1', r));
   const { port } = busy.address();
-  const alice = await tcpNode(null, { configure: false });
+  const alice = await netNode(null, { configure: false });
   t.after(async () => { await alice.close(); if (busy.listening) busy.close(); });
-  await assert.rejects(alice.engine.setTcp({ port }), { code: 'TCP_LISTEN_FAILED' });
+  await assert.rejects(alice.engine.setNetwork({ listen: { port } }), { code: 'LISTEN_FAILED' });
   const st = alice.engine.state().transport;
   assert.equal(st.configured, false);
-  assert.equal(st.error.code, 'TCP_LISTEN_FAILED');
+  assert.equal(st.error.code, 'LISTEN_FAILED');
   await assert.rejects(alice.engine.announce(), { code: 'TRANSPORT_UNCONFIGURED' });
   // Once the port is free, saving again listens and clears the error.
   await new Promise((r) => busy.close(r));
-  await alice.engine.setTcp({ port });
+  await alice.engine.setNetwork({ listen: { port } });
   assert.equal(alice.engine.state().transport.configured, true);
   assert.equal(alice.engine.state().transport.error, null);
 });
 
 // Invariant: an admission owed when no transport could start (the port was taken at boot) is written as soon as a
 // transport starts, without another restart.
-test('an owed admission completes after a boot listen failure followed by setTcp', async (t) => {
+test('an owed admission completes after a boot listen failure followed by setNetwork', async (t) => {
   const port = await freePort();
-  let alice = await tcpNode('alice', { port });
-  const bob = await tcpNode('bob');
+  let alice = await netNode('alice', { listen: { port } });
+  const bob = await netNode('bob', { listen: null, connections: [`127.0.0.1:${port}`] });
   const aliceDir = alice.dataDir;
   const busy = net.createServer();
   t.after(async () => { await alice.close(); await bob.close(); if (busy.listening) busy.close(); });
@@ -584,31 +636,42 @@ test('an owed admission completes after a boot listen failure followed by setTcp
   const response = (await bob.store.load()).accepted.find((e) => decodeRecord(e.bytes).payload.type === 'invite-response');
   await alice.store.appendAccepted({ id: response.id, route: response.route, bytes: response.bytes });
   await new Promise((r) => busy.listen(port, '127.0.0.1', r));
-  alice = await tcpNode('alice', { dataDir: aliceDir, configure: false });
-  assert.equal(alice.engine.state().transport.error.code, 'TCP_LISTEN_FAILED');
+  alice = await netNode('alice', { dataDir: aliceDir, configure: false });
+  assert.equal(alice.engine.state().transport.error.code, 'LISTEN_FAILED');
   assert.deepEqual(alice.engine.listInboxes()[0].members.map((m) => m.fp), [alice.fp]);
   await new Promise((r) => busy.close(r));
-  await alice.engine.setTcp({ port });
+  await alice.engine.setNetwork({ listen: { port } });
   assert.deepEqual(alice.engine.listInboxes()[0].members.map((m) => m.fp).sort(), [alice.fp, bob.fp].sort());
 });
 
-// Invariant (D7): a listen or advertised host that resolves to every interface is refused like 0.0.0.0, however it
-// is spelt; a listen host that does not resolve is refused, an advertised one need not resolve here.
-test('a host that resolves to an unspecified address is refused TCP_INVALID', async (t) => {
+// Invariant: a connection host that is, or resolves to, every interface is refused like 0.0.0.0, however it is
+// spelt; a listener may bind every interface (nothing is advertised). An unresolvable connection host is refused
+// on a save and accepted at boot; a listen host must resolve.
+test('a connection host that is, or resolves to, every interface is refused NETWORK_INVALID; a listener may bind every interface', async (t) => {
   // What a resolver answers for these spellings (inet_aton reads each as 0.0.0.0); injected, so no resolver is needed.
-  const lookup = async (name) => (['0', '00.0.0.0', '0x0.0.0.0'].includes(name) ? [{ address: '0.0.0.0', family: 4 }] : [{ address: '127.0.0.1', family: 4 }]);
-  const alice = await tcpNode('alice', { lookup });
+  const lookup = async (name) => {
+    if (['0', '00.0.0.0', '0x0.0.0.0'].includes(name)) return [{ address: '0.0.0.0', family: 4 }];
+    if (name === 'multi.example') return [{ address: '10.0.0.1', family: 4 }, { address: '::', family: 6 }];
+    if (name.endsWith('.local')) return [{ address: '127.0.0.1', family: 4 }];
+    throw Object.assign(new Error('not found'), { code: 'ENOTFOUND' });
+  };
+  const alice = await netNode('alice', { lookup });
   closeAll(t, alice);
-  for (const name of ['0', '00.0.0.0', '0x0.0.0.0']) {
-    await assert.rejects(alice.engine.setTcp({ host: name, port: 0, advertise: '127.0.0.1' }), { code: 'TCP_INVALID' }, `host ${name}`);
-    await assert.rejects(alice.engine.setTcp({ advertise: name, port: 0 }), { code: 'TCP_INVALID' }, `advertise ${name}`);
+  for (const a of ['0.0.0.0:5', '[::]:5', '[::0]:5', '[0:0:0:0:0:0:0:0]:5', '[::ffff:0.0.0.0]:5']) {
+    await assert.rejects(alice.engine.setNetwork({ listen: null, connections: [a] }), { code: 'NETWORK_INVALID' }, a);
+  }
+  for (const name of ['0', '00.0.0.0', '0x0.0.0.0', 'multi.example']) {
+    await assert.rejects(alice.engine.setNetwork({ listen: null, connections: [`${name}:5`] }), { code: 'NETWORK_INVALID' }, name);
+    await assert.rejects(resolveNetworkConfig({ connections: [`${name}:5`] }, { lookup, mustResolve: false }), { code: 'NETWORK_INVALID' }, `${name} at boot`);
   }
   assert.equal(alice.engine.state().transport.configured, true);
-  const nowhere = async () => { throw Object.assign(new Error('not found'), { code: 'ENOTFOUND' }); };
-  await assert.rejects(resolveTcpConfig({ host: 'nowhere.example', advertise: '127.0.0.1' }, { lookup: nowhere }), { code: 'TCP_INVALID' });
-  assert.equal((await resolveTcpConfig({ advertise: 'peer.example' }, { lookup: nowhere })).advertise, 'peer.example');
-  const everywhere = async () => [{ address: '10.0.0.1', family: 4 }, { address: '::', family: 6 }];
-  await assert.rejects(resolveTcpConfig({ host: 'multi.example', advertise: '127.0.0.1' }, { lookup: everywhere }), { code: 'TCP_INVALID' });
+  for (const host of ['0.0.0.0', '::', 'every.local']) {
+    assert.deepEqual((await resolveNetworkConfig({ listen: { host, port: 0 } }, { lookup })).listen, { host, port: 0 });
+  }
+  await assert.rejects(resolveNetworkConfig({ listen: { host: 'nowhere.example' } }, { lookup }), { code: 'NETWORK_INVALID' });
+  await assert.rejects(resolveNetworkConfig({ listen: { host: 'nowhere.example' } }, { lookup, mustResolve: false }), { code: 'NETWORK_INVALID' });
+  await assert.rejects(resolveNetworkConfig({ connections: ['nowhere.example:5'] }, { lookup }), { code: 'NETWORK_INVALID' });
+  assert.deepEqual((await resolveNetworkConfig({ connections: ['nowhere.example:5'] }, { lookup, mustResolve: false })).connections, ['nowhere.example:5']);
 });
 
 // Invariant (C3): a listener that fails after it is up is closed and forgotten: its port is free to bind again and
@@ -616,7 +679,7 @@ test('a host that resolves to an unspecified address is refused TCP_INVALID', as
 test('a listener that fails after it is up frees its port and keeps its sessions', async (t) => {
   let srv;
   const identity = await newIdentity();
-  const endpoint = createTcpEndpoint({ port: 0, syncMs: 3_600_000, log: silentLog, createServer: (onConnection) => { srv = net.createServer(onConnection); return srv; } });
+  const endpoint = createNetworkEndpoint({ listen: { port: 0 }, syncMs: 3_600_000, log: silentLog, createServer: (onConnection) => { srv = net.createServer(onConnection); return srv; } });
   const transport = endpoint.attach({ identity: proofSigner(identity), view: stubView(), cursors: memCursors() });
   await transport.start(stubSink());
   t.after(() => endpoint.close());
@@ -626,7 +689,6 @@ test('a listener that fails after it is up frees its port and keeps its sessions
   await waitFor(() => endpoint.stats().sessions.length === 1, 'the session');
   srv.emit('error', Object.assign(new Error('accept failed'), { code: 'EMFILE' }));
   assert.equal(endpoint.stats().listening, null);
-  assert.deepEqual(transport.addresses(), []);
   const again = net.createServer();
   await new Promise((resolve, reject) => { again.once('error', reject); again.listen(port, '127.0.0.1', resolve); });
   await new Promise((r) => again.close(r));
@@ -635,31 +697,32 @@ test('a listener that fails after it is up frees its port and keeps its sessions
   assert.equal(endpoint.stats().sessions.length, 1);
 });
 
-// Invariant (T4): a host's DNS lookup runs before the engine lock is taken (a slow resolver blocks no other action)
-// and is bounded: a lookup that does not answer in time is refused TCP_INVALID.
-test('TCP settings are resolved outside the engine lock, with a timeout', async (t) => {
+// Invariant (T4): DNS lookups run before the engine lock is taken (a slow resolver blocks no other action) and are
+// bounded: a lookup that does not answer in time is refused NETWORK_INVALID.
+test('network settings are resolved outside the engine lock, with a timeout', async (t) => {
   let release;
   const gate = new Promise((r) => { release = r; });
-  const lookup = async (name) => { if (name === 'slow.example') await gate; return [{ address: '10.0.0.7', family: 4 }]; };
-  const alice = await tcpNode('alice', { lookup });
+  const lookup = async (name) => { if (name === 'slow.example') await gate; return [{ address: '127.0.0.1', family: 4 }]; };
+  const dead = await freePort();
+  const alice = await netNode('alice', { lookup, connect: () => net.connect({ host: '127.0.0.1', port: dead }) });
   closeAll(t, alice);
-  const saving = alice.engine.setTcp({ port: 0, advertise: 'slow.example' });
+  const saving = alice.engine.setNetwork({ listen: { port: 0 }, connections: ['slow.example:9'] });
   assert.deepEqual(await alice.engine.setName('alice2'), { name: 'alice2' }, 'another action ran while the lookup waited');
   release();
-  assert.equal((await saving).advertise, 'slow.example');
+  assert.deepEqual((await saving).connections, ['slow.example:9']);
   const never = () => new Promise(() => {});
-  await assert.rejects(resolveTcpConfig({ host: 'hang.example', advertise: '127.0.0.1' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
-  await assert.rejects(resolveTcpConfig({ advertise: 'hang.example' }, { lookup: never, lookupMs: 20 }), { code: 'TCP_INVALID' });
+  await assert.rejects(resolveNetworkConfig({ listen: { host: 'hang.example' } }, { lookup: never, lookupMs: 20 }), { code: 'NETWORK_INVALID' });
+  await assert.rejects(resolveNetworkConfig({ connections: ['hang.example:5'] }, { lookup: never, lookupMs: 20 }), { code: 'NETWORK_INVALID' });
 });
 
-// Invariant (U3): an install built by wire takes its clock for the TCP endpoint too: a fake clock decides when a
+// Invariant (U3): an install built by wire takes its clock for the network endpoint too: a fake clock decides when a
 // silent connection's handshake deadline passes.
-test('wire threads the injected clock through to the TCP endpoint', async (t) => {
+test('wire threads the injected clock through to the network endpoint', async (t) => {
   const clock = fakeClock();
   const a = await makeInstall(null, { schedule: clock.schedule, now: clock.now });
   t.after(() => a.close());
-  await a.engine.setTcp({ port: 0 });
-  const port = Number(a.engine.state().transport.addresses[0].split(':').at(-1));
+  await a.engine.setNetwork({ listen: { port: 0 } });
+  const { port } = a.engine.state().transport.listening;
   const raw = await rawConnect(port);
   closeAll(t, raw);
   assert.equal((await raw.next()).t, 'hello');

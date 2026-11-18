@@ -28,6 +28,7 @@ export function IdentityPanel({ state, refresh }: { state: State; refresh: () =>
       <div className="row">
         <button type="button" data-variant="primary" disabled={busy || !transport.configured || !identity.name} onClick={() => void run(() => api.announce())}>Announce</button>
       </div>
+      <p className="muted">Your announcement is presented on every connection and hub, and again at every start.</p>
       {error && <p role="alert" className="error">{error}</p>}
     </Panel>
   );

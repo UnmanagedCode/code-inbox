@@ -1,19 +1,15 @@
 import net from 'node:net';
-import { transportFactory } from '../server.js';
-import { createEngine } from '../src/engine.js';
 import { createHub } from '../src/hub/hub.js';
-import { loadIdentity } from '../src/identity.js';
-import { createStore } from '../src/store.js';
+import { decodeRecord } from '../src/records.js';
 import { TCP_FRAME_MAX, createDecoder, encodeFrame } from '../src/transport/frames.js';
-import { makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
+import { dialBound, makeProofs, newHandshakeNonce, proofSigner } from '../src/transport/handshake.js';
 import { createHubConn } from '../src/transport/hubConn.js';
-import { createHubEndpoint } from '../src/transport/hubClient.js';
 import { SESSION_LIMITS } from '../src/transport/tcpSession.js';
-import { silentLog, tmpDir } from './helpers.mjs';
-import { rawConnect } from './tcpHelpers.mjs';
+import { helloFrame, rawConnect } from './tcpHelpers.mjs';
 
-// Helpers for the hub tests: a real hub on a loopback ephemeral port, engines over the hub client, raw hub links,
-// raw endpoints tunneled through a stream, and a test-only hub that lies. Everything is closed by the test.
+// Helpers for the hub tests: a real hub on a loopback ephemeral port, raw hub links, raw endpoints tunneled through
+// a stream, and a test-only hub that lies. Engines reach a hub through a connection (netHelpers.mjs → netNode).
+// Everything is closed by the test.
 
 const b64 = (bytes) => Buffer.from(bytes).toString('base64url');
 
@@ -22,49 +18,7 @@ export async function startHub(t, { limits, schedule, createServer, port = 0 } =
   const hub = createHub({ port, limits, ...(schedule ? { schedule } : {}), ...(createServer ? { createServer } : {}) });
   const bound = await hub.listen();
   t?.after(() => hub.close());
-  return { hub, port: bound.port, url: `hub://127.0.0.1:${bound.port}` };
-}
-
-// A whole engine over the hub client with its own data dir, in the mould of tcpNode. `limits`, `connect` or
-// `endpoint` build the client from createHubEndpoint (else server.js's transportFactory, as in production);
-// `schedule` and `now` reach the engine's outbox timer and the client. `node.online` keeps every peerOnline the
-// transport reports, `node.offered` every record it offers. Booting a data dir whose settings already configure a
-// hub reuses them.
-export async function hubNode(name, { url, dataDir = tmpDir('code-inbox-hub-'), limits, connect, endpoint, schedule, now, lookup, configure = true } = {}) {
-  const store = createStore(dataDir, { log: silentLog });
-  await store.load();
-  const identity = await loadIdentity(dataDir);
-  const cursors = { load: store.loadPeerCursors, save: store.savePeerCursors };
-  const base = transportFactory({ identity, store, tcpSyncMs: 3_600_000, now, schedule, log: silentLog });
-  const node = { name, dataDir, fp: identity.fp, identity, store, transport: null, view: null, offered: [], online: [] };
-  const own = (config) => (endpoint ?? createHubEndpoint({
-    url: config.url, limits, syncMs: 3_600_000, log: silentLog, ...(connect ? { connect } : {}), ...(now ? { now } : {}), ...(schedule ? { schedule } : {}),
-  }));
-  node.engine = createEngine({
-    store, identity, log: silentLog, ...(schedule ? { schedule } : {}), ...(lookup ? { lookup } : {}),
-    makeTransport: (config, view) => {
-      node.view = view;
-      const custom = endpoint || limits || connect;
-      const t = config.kind === 'hub' && custom ? own(config).attach({ identity: proofSigner(identity), view, cursors }) : base(config, view);
-      const start = t.start;
-      t.start = (sink) => start({
-        record: (i) => { node.offered.push(i); return sink.record(i); },
-        peerOnline: (fp) => { node.online.push(fp); sink.peerOnline(fp); },
-      });
-      node.transport = t;
-      return t;
-    },
-  });
-  await node.engine.boot();
-  if (configure && url && !node.engine.state().transport.configured) await node.engine.setHub({ url });
-  if (name && !node.engine.settings().name) {
-    await node.engine.setName(name);
-    if (node.engine.state().transport.configured) await node.engine.announce();
-  }
-  node.card = () => node.engine.state().transport.card;
-  node.connected = () => !!node.transport?.stats().hub.connected;
-  node.close = () => node.engine.stop();
-  return node;
+  return { hub, port: bound.port, addr: `127.0.0.1:${bound.port}` };
 }
 
 // A raw hub link: hello, then (with identities) `register` proofs and `ok`. Collects every frame (decoded JSON,
@@ -73,7 +27,7 @@ export async function rawHubLink(port, identities = [], { register = true } = {}
   const conn = await rawConnect(port);
   const theirs = await conn.nextOf('hello');
   const nonce = newHandshakeNonce();
-  conn.send({ t: 'hello', v: 1, nonce });
+  conn.send(helloFrame(nonce));
   conn.hubNonce = theirs.nonce;
   conn.myNonce = nonce;
   if (register && identities.length) {
@@ -114,16 +68,16 @@ function tunnelOf(link, s) {
 }
 
 // Through a raw hub link registered as `identity`: opens stream `s` to `target` and runs the dialer's side of the
-// endpoint handshake. Answers like a minimal peer (every pull denied, no cards, pongs) unless `onFrame(f, tun)`
-// returns true. Resolves the tunnel once ready.
+// endpoint handshake. Answers like a minimal peer (every pull denied, pongs) unless `onFrame(f, tun)` returns true.
+// Resolves the tunnel once ready.
 export async function tunnelPeer(link, identity, target, { s = 1, onFrame } = {}) {
   link.send({ t: 'open', s, to: target });
   const tun = tunnelOf(link, s);
   const theirs = await tun.nextOf('hello');
   if (!theirs) throw new Error(`the stream closed: ${tun.closed}`);
   const nonce = newHandshakeNonce();
-  tun.send({ t: 'hello', v: 1, nonce });
-  tun.send({ t: 'prove', target, ids: makeProofs([proofSigner(identity)], 'dial', nonce, theirs.nonce, target) });
+  tun.send(helloFrame(nonce));
+  tun.send({ t: 'prove', target, ids: makeProofs([proofSigner(identity)], 'dial', nonce, theirs.nonce, dialBound(target)) });
   if (!(await tun.nextOf('prove'))) throw new Error('the handshake was refused');
   tun.send({ t: 'ok' });
   let answered = tun.read;
@@ -133,7 +87,6 @@ export async function tunnelPeer(link, identity, target, { s = 1, onFrame } = {}
       const f = tun.frames[answered];
       if (onFrame?.(f, tun)) continue;
       if (f.t === 'pull') tun.send({ t: 'recs', id: f.id, from: f.to, to: f.from, routes: f.routes.map(({ route }) => ({ route, status: 'denied' })) });
-      if (f.t === 'whois') tun.send({ t: 'cards', id: f.id, from: f.to, to: f.from, recs: [] });
       if (f.t === 'ping') tun.send({ t: 'pong' });
     }
     if (tun.closed || link.closed) clearInterval(answer);
@@ -143,13 +96,15 @@ export async function tunnelPeer(link, identity, target, { s = 1, onFrame } = {}
   return tun;
 }
 
-// A test-only hub that lies, built on hubConn (role `hub`). It verifies registrations like the real one, answers a
-// watch with every registered fp in it, relays streams faithfully by default and records what each link sent.
+// A test-only hub that lies, built on hubConn (role `hub`, so its hello says kind `hub` and a connection detects it
+// as a hub). It verifies registrations like the real one, keeps every link told of the others like the real roster
+// (`peer` on registration and on `announce`, `gone` on close; no back-pressure), relays streams faithfully by default
+// and records what each link sent.
 //   refuse: answer every registration `bye PROOF`; `accepted` counts the connections made
 //   route(to, from) → the link an `open` goes to (default: the one that registered `to`), or null for ABSENT
 //   onOpen(link, f) → true when the test handled the open itself
 //   inject(link, s, frame) writes an endpoint frame into stream `s` of `link`; notify(link, frame) a hub frame
-//   linkOf(fp), received(link) → the frames that link sent
+//   linkOf(fp), received(link) → the frames that link sent (decoded hub frames; `announce` rec as bytes)
 export async function lyingHub(t, { route, onOpen, refuse = false } = {}) {
   const links = new Set();
   const byFp = new Map();
@@ -160,7 +115,11 @@ export async function lyingHub(t, { route, onOpen, refuse = false } = {}) {
     const link = createHubConn({
       socket, role: 'hub', limits, schedule: (fn, ms) => { const x = setTimeout(fn, ms); x.unref(); return () => clearTimeout(x); },
       onRegistered: (c, fps) => { if (refuse) c.close('PROOF'); else for (const fp of fps) byFp.set(fp, c); },
-      onReady: () => {},
+      onReady: (c) => {
+        const peer = (fp) => ({ t: 'peer', fp, rec: byFp.get(fp).anns.get(fp) ?? null });
+        for (const other of links) if (other !== c && other.ready) for (const fp of c.fps) other.send(peer(fp));
+        for (const fp of byFp.keys()) if (byFp.get(fp) !== c && byFp.get(fp).ready) c.send(peer(fp));
+      },
       onFrame: (c, f) => {
         c.got.push(f);
         if (f.t === 'open') {
@@ -178,17 +137,24 @@ export async function lyingHub(t, { route, onOpen, refuse = false } = {}) {
         } else if (f.t === 'close') {
           const p = c.pairs.get(f.s);
           if (p) { c.pairs.delete(f.s); p[0].pairs.delete(p[1]); p[0].send({ t: 'close', s: p[1], reason: 'CLOSED' }); }
-        } else if (f.t === 'watch') {
-          c.send({ t: 'present', id: f.id, fps: f.fps.filter((fp) => byFp.has(fp)) });
+        } else if (f.t === 'announce') {
+          const signer = decodeRecord(f.rec).payload?.signer;
+          c.anns.set(signer, b64(f.rec));
+          for (const other of links) if (other !== c && other.ready) other.send({ t: 'peer', fp: signer, rec: b64(f.rec) });
         }
       },
       onClose: (c) => {
         links.delete(c);
-        for (const [fp, x] of byFp) if (x === c) byFp.delete(fp);
+        for (const [fp, x] of byFp) {
+          if (x !== c) continue;
+          byFp.delete(fp);
+          for (const other of links) if (other.ready) other.send({ t: 'gone', fp });
+        }
         for (const [peer, s2] of c.pairs.values()) { peer.pairs.delete(s2); peer.send({ t: 'close', s: s2, reason: 'GONE' }); }
       },
     });
     link.got = [];
+    link.anns = new Map();
     link.pairs = new Map();
     link.nextS = 2;
     links.add(link);
@@ -197,7 +163,7 @@ export async function lyingHub(t, { route, onOpen, refuse = false } = {}) {
   const { port } = srv.address();
   const lying = {
     port,
-    url: `hub://127.0.0.1:${port}`,
+    addr: `127.0.0.1:${port}`,
     get accepted() { return accepted; },
     linkOf: (fp) => byFp.get(fp) ?? null,
     received: (link) => link.got,
