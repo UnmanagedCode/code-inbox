@@ -80,8 +80,8 @@ export function TransportPanel({ state, refresh }: { state: State; refresh: () =
       )}
       <fieldset>
         <legend>Transport</legend>
-        <label><input type="radio" name="transport" checked={kind === 'file-share'} onChange={() => setKind('file-share')} /> File share</label>
-        <label><input type="radio" name="transport" checked={kind === 'network'} onChange={() => setKind('network')} /> Network</label>
+        <label className="check"><input type="radio" name="transport" checked={kind === 'file-share'} onChange={() => setKind('file-share')} /> File share</label>
+        <label className="check"><input type="radio" name="transport" checked={kind === 'network'} onChange={() => setKind('network')} /> Network</label>
       </fieldset>
       {kind === 'file-share' && (
         <form className="row" onSubmit={(e) => { e.preventDefault(); void run(() => api.setShare(dir)); }}>
@@ -94,7 +94,7 @@ export function TransportPanel({ state, refresh }: { state: State; refresh: () =
         <>
           <h3>Listener</h3>
           <form onSubmit={(e) => { e.preventDefault(); void run(() => api.setNetwork({ listen: listen(), connections: saved })); }}>
-            <label><input type="checkbox" checked={listenOn} onChange={(e) => setListenOn(e.target.checked)} /> Accept direct connections</label>
+            <label className="check"><input type="checkbox" checked={listenOn} onChange={(e) => setListenOn(e.target.checked)} /> Accept direct connections</label>
             {listenOn && (
               <div className="row">
                 <label className="grow stack"><span>Listen host</span><input value={host} onChange={(e) => setHost(e.target.value)} placeholder="127.0.0.1" /></label>
