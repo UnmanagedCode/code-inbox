@@ -5,8 +5,8 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayPull, mayRead, removePending, currentEpoch, currentMembers, directory,
-  inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes,
+  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayPull, mayRead, mayRelay, removePending, currentEpoch, currentMembers,
+  directory, inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharedOwner,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { checkStoredShareDir, ensureShareRoot, validateShareDir } from './transport/fileShare.js';
@@ -61,7 +61,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   const known = createDirectory();
   let identities = {};
   let ownAnnounce = null; // this install's current signed announce (re-signed at boot from settings.announced)
-  const ownLog = new Map(); // routeKey → [{seq, bytes}] of records signed by self, seq ascending
+  // routeKey → [{seq, bytes, signer}], seq ascending: what this install serves on a route. Its own records, plus, on a
+  // shared inbox it owns, every record it accepted there (the owner relays its members' records).
+  const serveLog = new Map();
 
   function noteReject(reason, detail, id) {
     rejected.count += 1;
@@ -126,21 +128,27 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
 
   // ---- ingest ----
 
-  function remember(seq, id, payload, route, bytes) {
-    if (payload.signer !== self) return;
+  // Decidable at acceptance and at boot replay alike: an inbox's inbox-create is always accepted before anything on it
+  // (msg and member records pend INBOX_UNSEEN without it), and its owner never changes.
+  function remember(seq, payload, route, bytes) {
+    if (payload.signer !== self && !(route.kind === 'inbox' && sharedOwner(index, route.id) === self)) return;
     const key = routeKey(route);
-    const list = ownLog.get(key);
-    if (list) list.push({ seq, bytes }); else ownLog.set(key, [{ seq, bytes }]);
+    const e = { seq, bytes, signer: payload.signer };
+    const list = serveLog.get(key);
+    if (list) list.push(e); else serveLog.set(key, [e]);
   }
 
-  async function acceptRecord(rec, reactions) {
+  // `after` collects what an acceptance owes once the index settles: `reactions` (acceptances of this install's
+  // shared invites, which admit) and `relays` (a co-member's message on a shared inbox this install owns).
+  async function acceptRecord(rec, after) {
     const seq = await store.appendAccepted({ id: rec.id, route: rec.route, bytes: rec.bytes });
     const entry = { seq, id: rec.id, payload: rec.payload, route: rec.route };
     addRecord(index, entry);
-    remember(seq, rec.id, rec.payload, rec.route, rec.bytes);
+    remember(seq, rec.payload, rec.route, rec.bytes);
     const p = rec.payload;
     if (p.type === 'msg') events.emit('message', { seq, id: rec.id, inbox: p.inbox, signer: p.signer });
-    if (p.type === 'invite-response' && p.accept && p.to === self) reactions.push(rec);
+    if (p.type === 'invite-response' && p.accept && p.to === self) after.reactions.push(rec);
+    if (p.type === 'msg' && p.signer !== self && sharedOwner(index, p.inbox) === self) after.relays.push(rec);
   }
 
   // An accepted response to this install's shared invite admits the invitee (an admission is a member record), but
@@ -150,6 +158,22 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       const inv = index.invites.get(rec.payload.invite);
       if (!inv || inv.payload.signer !== self || !admissionDue(index, inv)) continue;
       await writeMember(inv.payload.inbox, 'add', inv.payload.to);
+    }
+  }
+
+  // The owner's live relay: a member's message it just accepted goes on to every other current member at once.
+  // Best-effort: a member without a session gets it on its next pull from this install's served log, so nothing goes
+  // into the outbox. Only where peers pull (capabilities.pull); never at boot, before a transport runs.
+  async function relayOut(relays) {
+    if (!transport?.capabilities.pull) return;
+    for (const rec of relays) {
+      const to = [...(currentMembers(index, rec.payload.inbox) ?? [])].filter((fp) => fp !== self && fp !== rec.payload.signer);
+      if (!to.length) continue;
+      try {
+        await transport.send(rec.bytes, { route: rec.route, to });
+      } catch (err) {
+        log.warn(`code-inbox: relaying on ${routeKey(rec.route)} failed (${err.code ?? 'ERROR'}); members pull it instead: ${err.message}`);
+      }
     }
   }
 
@@ -173,22 +197,23 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   async function admit(rec) {
     if (index.byId.has(rec.id) || index.pending.has(rec.id) || index.rejected.has(rec.id)) return;
     const c = classify(index, rec);
-    const reactions = [];
+    const after = { reactions: [], relays: [] };
     if (c.verdict === 'reject') await rejectRecord(rec, c.reason);
     else if (c.verdict === 'pending') {
       addPending(index, rec);
       await store.savePending([...index.pending.values()]);
-    } else await acceptRecord(rec, reactions);
+    } else await acceptRecord(rec, after);
     // Even a pending record can settle others: a removal's kept chain is walked through pending records.
-    await drainPending(reactions);
+    await drainPending(after);
     await persistNewPins();
     await syncIdentities();
     refreshInterest();
-    await react(reactions);
+    await react(after.reactions);
+    await relayOut(after.relays);
   }
 
   // Re-classifies every pending record until a round settles none; settled ones leave the pending set.
-  async function drainPending(reactions) {
+  async function drainPending(after) {
     let changed = false;
     for (let progress = true; progress;) {
       progress = false;
@@ -198,13 +223,14 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         removePending(index, id);
         changed = true;
         progress = true;
-        if (pc.verdict === 'reject') await rejectRecord(p, pc.reason); else await acceptRecord(p, reactions);
+        if (pc.verdict === 'reject') await rejectRecord(p, pc.reason); else await acceptRecord(p, after);
       }
     }
     if (changed) await store.savePending([...index.pending.values()]);
   }
 
-  // The transport's sink: `retry` only while the bytes may still be arriving.
+  // The transport's sink: `retry` only while the bytes may still be arriving. The writer must be the record's signer,
+  // except for the owner relaying a member's message on its shared inbox (mayRelay); the route must be the record's.
   function ingest({ route, writer, bytes }) {
     return locked(async () => {
       const d = decodeRecord(bytes);
@@ -213,7 +239,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         noteReject(d.reason, d.detail);
         return { retry: false };
       }
-      if (!isRoute(route) || d.payload.signer !== writer || !sameRoute(routeFor(d.payload), route)) {
+      if (!isRoute(route) || !sameRoute(routeFor(d.payload), route) || (d.payload.signer !== writer && !mayRelay(index, writer, route, d.payload))) {
         noteReject('ROUTE_MISMATCH', `${d.payload.type} arrived on ${isRoute(route) ? routeKey(route) : 'an invalid route'}`, d.id);
         return { retry: false };
       }
@@ -283,11 +309,21 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     }
   }
 
-  // An entry stays in the outbox while it has recipients left, or while its write is owed (`to` may then be []).
-  async function deliver(bytes, route, to) {
+  // An entry stays in the outbox while it has recipients left that it must reach (`keep`), or while its write is owed
+  // (`to` may then be []). Recipients outside `keep` are sent to once and never retried.
+  async function deliver(bytes, route, to, keep = to) {
     // A share this install must not write to is permanent: the action is refused, nothing is admitted locally.
     const { left, owed } = await trySend(bytes, route, to, { refuseUnsafe: true });
-    if (left.length || owed) { outbox.push({ route, to: left, bytes }); await saveOutbox(); }
+    const kept = left.filter((fp) => keep.includes(fp));
+    if (kept.length || owed) { outbox.push({ route, to: kept, bytes }); await saveOutbox(); }
+  }
+
+  // The recipients a write must reach. Where peers pull, a member's message on a shared inbox someone else owns must
+  // reach only the owner: the owner relays it, and co-members pull it from the owner.
+  function mustReach(payload, to) {
+    if (!transport.capabilities.pull || payload.type !== 'msg') return to;
+    const owner = sharedOwner(index, payload.inbox);
+    return owner && owner !== self ? to.filter((fp) => fp === owner) : to;
   }
 
   // Re-sends outbox entries: every one (a full flush), or only those addressed to `fp`. Only a full flush re-sends
@@ -316,7 +352,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     const payload = { ...fields, signer: self, ts: now() };
     const { bytes, id } = encodeRecord(identity, payload);
     const route = routeFor(payload);
-    await deliver(bytes, route, recipientsOf(payload));
+    const to = recipientsOf(payload);
+    await deliver(bytes, route, to, mustReach(payload, to));
     await admit({ id, payload, route, bytes });
     return id;
   }
@@ -383,18 +420,25 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
 
   // ---- what a transport may read (docs/transport.md → The engine view). Synchronous, in memory, lock-free. ----
 
-  // This install's own records on `route` with an acceptance seq past `since`, as many as fit in `budget` bytes,
-  // if `reader` may read the route. A denial says nothing else, not even how many records this install holds.
+  // What this install serves on `route` (serveLog: its own records, and on a shared inbox it owns every record it
+  // accepted there) with an acceptance seq past `since`, never the reader's own, as many as fit in `budget` bytes, if
+  // `reader` may read the route. A denial says nothing else, not even how many records this install holds.
   function serve(reader, route, since, budget) {
     if (!isRoute(route) || !mayRead(index, reader, route)) return { status: 'denied' };
     const head = index.maxSeq;
-    const list = ownLog.get(routeKey(route)) ?? [];
+    const list = serveLog.get(routeKey(route)) ?? [];
     let lo = 0;
     let hi = list.length;
     while (lo < hi) { const mid = (lo + hi) >> 1; if (list[mid].seq <= since) lo = mid + 1; else hi = mid; }
     const recs = [];
     let used = 0;
-    for (; lo < list.length && used + list[lo].bytes.length <= budget; lo += 1) { recs.push(list[lo]); used += list[lo].bytes.length; }
+    for (; lo < list.length; lo += 1) {
+      const e = list[lo];
+      if (e.signer === reader) continue;
+      if (used + e.bytes.length > budget) break;
+      recs.push(e);
+      used += e.bytes.length;
+    }
     return { status: 'ok', recs, more: lo < list.length, head };
   }
 
@@ -475,7 +519,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         if (!d.ok) { log.warn(`code-inbox: accepted record seq ${e.seq} no longer decodes (${d.reason}): skipped`); continue; }
         if (d.payload.type === 'announce') { log.warn(`code-inbox: accepted record seq ${e.seq} is an announce, which the log no longer holds: skipped`); continue; }
         addRecord(index, { seq: e.seq, id: d.id, payload: d.payload, route: e.route });
-        remember(e.seq, d.id, d.payload, e.route, e.bytes);
+        remember(e.seq, d.payload, e.route, e.bytes);
       }
       for (const { id, ...info } of loaded.rejected) addRejected(index, id, info);
       for (const e of loaded.pending) {
@@ -483,8 +527,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         if (d.ok && d.payload.type !== 'announce' && !index.byId.has(d.id) && !index.rejected.has(d.id)) addPending(index, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
       }
       // Close the crash windows: pending records whose dependency was settled, and admissions not yet written.
-      const reactions = [];
-      await drainPending(reactions);
+      // Reactions and relays wait: admissions are reconciled once a transport runs, and members pull what is relayed.
+      await drainPending({ reactions: [], relays: [] });
       if (index.pending.size !== loaded.pending.length) await store.savePending([...index.pending.values()]);
       await persistNewPins();
       if (settings.transport) {

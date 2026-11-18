@@ -5,9 +5,10 @@ import { SESSION_LIMITS, createSession } from './tcpSession.js';
 // The network endpoint core (docs/transport.md → Network endpoint). Peers are addressed by fingerprint; one endpoint
 // serves every identity attached to it, and one session between two endpoints carries all of their identities, over
 // whatever route it formed on: a direct TCP connection (the listener, or a configured connection that reached a
-// peer) or a stream through a hub (a configured connection that reached a hub). A peer pushes and serves only
-// records it signed itself (the writer is the proven `from`); a pull resumes from a per-(peer, route) cursor. How
-// byte pipes are obtained is the links': `makeLinks(core)` → the listener and one link per configured connection.
+// peer) or a stream through a hub (a configured connection that reached a hub). The writer of every record is the
+// proven `from`: a peer pushes and serves what its view serves (its own records, and on a shared inbox it owns its
+// members' records too); a pull resumes from a per-(peer, route) cursor over the peer's acceptance seqs. How byte
+// pipes are obtained is the links': `makeLinks(core)` → the listener and one link per configured connection.
 
 export const TCP_SYNC_MS = 30_000; // maintain: connect, dial, pull
 export const TCP_MAX_CONNECTIONS = 64;
@@ -153,7 +154,8 @@ export function createEndpoint({ makeLinks, limits = {}, now = Date.now, schedul
   const cursorOf = (b, fp, key) => b.cursorData[fp]?.[key] ?? 0;
   const setCursor = (b, fp, key, seq) => { b.cursorData = { ...b.cursorData, [fp]: { ...b.cursorData[fp], [key]: seq } }; };
 
-  // Pulls `routes` from `fp` on `s`, records signed by `fp` past this binding's cursor, until no route has more.
+  // Pulls `routes` from `fp` on `s`: the records `fp` serves there (view.serve on its side) past this binding's
+  // cursor, until no route has more. Each is offered with writer `fp`.
   // Only routes `fp` could serve by this install's own state are named (view.mayPull), so a peer learns no route
   // key it has no part in. A cursor moves only once its batch has been offered; a denied route keeps its cursor.
   async function pullFrom(b, s, fp, routes) {
@@ -285,7 +287,7 @@ export function createEndpoint({ makeLinks, limits = {}, now = Date.now, schedul
 
     /** @type {import('./index.js').Transport} */
     const transport = {
-      capabilities: { directory: false, push: true },
+      capabilities: { directory: false, push: true, pull: true },
       stats,
       // This identity's signed announce (bytes, or null): pushed on every ready session now and on every one that
       // becomes ready, and given to every hub.

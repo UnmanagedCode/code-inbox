@@ -418,7 +418,7 @@ test('a late joiner pulls the history from the per-peer cursor', async (t) => {
   assert.deepEqual(bob.engine.messages(team).map((m) => m.body), ['m1', 'm2', 'm3']);
   // The cursor is alice's acceptance seq of her last record on that route.
   const aliceLast = (await alice.store.load()).accepted.filter((e) => routeKey(e.route) === `inbox:${team}`).at(-1).seq;
-  const cursors = JSON.parse(fs.readFileSync(path.join(bobDir, FILES.peerCursors), 'utf8'));
+  const cursors = JSON.parse(fs.readFileSync(path.join(bobDir, FILES.pullCursors), 'utf8'));
   assert.equal(cursors[alice.fp][`inbox:${team}`], aliceLast);
   served = 0;
   await bob.engine.sync();
@@ -445,7 +445,7 @@ test('a denied pull keeps its cursor', async (t) => {
   await settle([alice, bob]);
   // bob wants the inbox (he is invited) but is not a member yet: refused, and his cursor stays where it was.
   assert.ok(denied.includes(`inbox:${team}`));
-  const cursors = await bob.store.loadPeerCursors();
+  const cursors = await bob.store.loadPullCursors();
   assert.equal(cursors[alice.fp]?.[`inbox:${team}`], undefined);
   await bob.engine.respondInvite(bob.engine.state().invites.incoming[0].id, true);
   await settle([alice, bob], 3);

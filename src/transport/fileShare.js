@@ -270,7 +270,7 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
   }
 
   return {
-    capabilities: { directory: true, push: false },
+    capabilities: { directory: true, push: false, pull: false },
     root,
     async start(s) {
       sink = s;

@@ -13,7 +13,8 @@ import { FP_RE, ID_RE } from '../records.js';
  *  its own signer, into memory only. */
 /**
  * @typedef {object} Transport
- * @property {{directory: boolean, push: boolean}} capabilities
+ * @property {{directory: boolean, push: boolean, pull: boolean}} capabilities  `pull`: peers pull from each other's
+ *                                                         served logs (view.serve), so a record a send misses still arrives
  * @property {(sink: Sink) => Promise<void>} start
  * @property {(routes: Route[]) => void} setInterest       the routes this install wants delivered
  * @property {(bytes: Uint8Array|null) => void} setAnnounce   this install's current signed announce: a network
@@ -32,7 +33,7 @@ export function assertTransport(t) {
   if (!t || typeof t !== 'object') throw new Error('a transport must be an object');
   for (const m of TRANSPORT_METHODS) if (typeof t[m] !== 'function') throw new Error(`a transport lacks ${m}()`);
   const c = t.capabilities;
-  if (!c || typeof c.directory !== 'boolean' || typeof c.push !== 'boolean') throw new Error('a transport must declare capabilities {directory, push}');
+  if (!c || typeof c.directory !== 'boolean' || typeof c.push !== 'boolean' || typeof c.pull !== 'boolean') throw new Error('a transport must declare capabilities {directory, push, pull}');
   return t;
 }
 

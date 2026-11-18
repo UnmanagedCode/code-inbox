@@ -28,7 +28,7 @@ export async function netNode(name, {
   const store = createStore(dataDir, { log: silentLog });
   await store.load();
   const identity = await loadIdentity(dataDir);
-  const cursors = { load: store.loadPeerCursors, save: store.savePeerCursors };
+  const cursors = { load: store.loadPullCursors, save: store.savePullCursors };
   const base = transportFactory({ identity, store, tcpSyncMs: 3_600_000, now, schedule, log: silentLog });
   const custom = limits || connect || createServer;
   const own = (config) => createNetworkEndpoint({

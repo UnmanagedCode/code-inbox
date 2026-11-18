@@ -124,7 +124,7 @@ The owner's install writes the `member add` itself when it accepts the invitee's
 
 A route says where a record travels: `{kind:'directory'}`, `{kind:'mailbox', fp}`, `{kind:'inbox', id}`. `routeFor(payload)` (`src/records.js`) gives each type's route (table above).
 
-**Route binding** (the engine, for every transport): the record arrived on `routeFor(payload)`, and from writer `payload.signer`. With the signature covering `inbox` and `to`, this is what rejects a record replayed into another inbox, mailbox, writer subdir or session.
+**Route binding** (the engine, for every transport): the record arrived on `routeFor(payload)`, and from writer `payload.signer`, except for the owner relay (table below). With the signature covering `inbox` and `to`, this is what rejects a record replayed into another inbox, mailbox, writer subdir or session.
 
 | Transport | `writer` is |
 |---|---|
@@ -133,6 +133,7 @@ A route says where a record travels: `{kind:'directory'}`, `{kind:'mailbox', fp}
 | Hub stream | the same: the frame's `from`, proven by the remote **endpoint** in the handshake tunneled through the hub stream. The hub attests nothing |
 | Contact-card import | the announce's own signer. Only an `announce` is accepted this way (`CARD_INVALID` otherwise); into memory and `identities.json` only |
 | Hub roster (`peer.rec`) | the announce's own signer, which must be the fp the roster names. Announces only, into memory only |
+| Owner relay | the proven `from` (as above), which may differ from `payload.signer` only for a `msg` on a shared inbox whose owner, by the reader's own state, is `writer` (`mayRelay`, `src/state.js`). Any other mismatch is `ROUTE_MISMATCH` |
 
 ### File share (`<shareDir>/code-inbox/v1/`, `SHARE_ROOT`)
 
@@ -209,13 +210,13 @@ proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise. On session ready (and on every Announce) each side pushes its announces this way, on the `directory` route |
-| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since`. Names only routes `to` could serve by the asker's own state ([transport.md → Announces, pulls and cursors](transport.md#announces-pulls-and-cursors)) |
-| `recs` | `id, from, to, routes:[{route, status:'ok', recs:[{seq, rec}], more, head} \| {route, status:'denied'}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route is exactly `{route, status:'denied'}`: no `head`, so it reveals nothing of what the server holds. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq. The `directory` route serves `inbox-create` records only |
+| `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise. On session ready (and on every Announce) each side pushes its announces this way, on the `directory` route. On a shared inbox, its owner pushes a co-member's `msg` this way with `from` = the owner ([transport.md → Owner relay](transport.md#owner-relay)) |
+| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for the records **`to` serves** on these routes with seq > `since`: its own, plus, on a shared inbox `to` owns, every record it accepted there, except the asker's own. Names only routes `to` could serve by the asker's own state ([transport.md → Announces, pulls and cursors](transport.md#announces-pulls-and-cursors)) |
+| `recs` | `id, from, to, routes:[{route, status:'ok', recs:[{seq, rec}], more, head} \| {route, status:'denied'}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending: the server's acceptance seqs over what it serves on that route. A denied route is exactly `{route, status:'denied'}`: no `head`, so it reveals nothing of what the server holds. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq. The `directory` route serves `inbox-create` records only |
 | `ping` / `pong` | — | Keepalive every `TCP_PING_MS` |
 | `bye` | `reason`: `PROOF`, `PROTOCOL`, `DUPLICATE`, `LIMIT`, `STOP` | Sent before a deliberate close |
 
-No frame asks about, or answers with, any identity other than the session's two proven parties: any other `t` is `bye PROTOCOL`.
+No frame asks about, or names, any identity other than the session's two proven parties: any other `t` is `bye PROTOCOL`. The records served on a shared inbox may be co-members' records, but only to a current member, who already sees the member list.
 
 ### Addresses
 
