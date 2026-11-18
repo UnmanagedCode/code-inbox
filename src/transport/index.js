@@ -19,7 +19,7 @@ import { FP_RE, ID_RE } from '../records.js';
  * @property {(routes: Route[]) => void} setInterest       the routes this install wants delivered. A route that leaves
  *                                                         the interest loses its delivery position: if it returns, the
  *                                                         transport delivers it from the start. A transport never
- *                                                         learns why a route left and never decodes a payload
+ *                                                         learns why a route left and never decodes a record
  * @property {(bytes: Uint8Array|null) => void} setAnnounce   this install's current signed announce: a network
  *                                                         transport presents it to every peer and hub
  * @property {(bytes: Uint8Array, opts: {route: Route, to: string[]}) => Promise<{delivered: string[], pending: string[]}>} send

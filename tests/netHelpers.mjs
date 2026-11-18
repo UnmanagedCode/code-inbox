@@ -1,3 +1,4 @@
+import assert from 'node:assert/strict';
 import net from 'node:net';
 import { transportFactory } from '../server.js';
 import { createEngine } from '../src/engine.js';
@@ -7,6 +8,7 @@ import { TCP_FRAME_MAX, createDecoder } from '../src/transport/frames.js';
 import { proofSigner } from '../src/transport/handshake.js';
 import { createNetworkEndpoint } from '../src/transport/network.js';
 import { silentLog, tmpDir } from './helpers.mjs';
+import { settle } from './tcpHelpers.mjs';
 
 // Helpers for network-mode tests: whole engines over the network endpoint (a listener and connections), and a TCP
 // relay standing between a connection and a listener. Real loopback sockets on ephemeral ports; everything closed by
@@ -106,4 +108,37 @@ export async function relay(t, targetPort, { port: listenPort = 0 } = {}) {
   };
   t.after(() => r.close());
   return r;
+}
+
+// netNode, closed after the test (a node closed earlier, e.g. for a restart, closes again harmlessly).
+export const opener = (t) => async (name, opts) => {
+  const n = await netNode(name, opts);
+  t.after(() => n.close());
+  return n;
+};
+
+// An owner that listens (`ownerOpts`) and `names` members that connect only to it (each with `memberOpts(name)`
+// added), every member admitted to one shared inbox. → {owner, members, all, id, route}.
+export async function star(t, names, { ownerOpts = {}, memberOpts = () => ({}) } = {}) {
+  const open = opener(t);
+  const owner = await open('owner', ownerOpts);
+  const members = [];
+  for (const name of names) members.push(await open(name, { listen: null, connections: [owner.addr()], ...memberOpts(name) }));
+  const all = [owner, ...members];
+  for (const m of members) await m.engine.importCard(owner.card());
+  await settle(all);
+  const { id } = await owner.engine.createSharedInbox('team');
+  for (const m of members) await owner.engine.inviteMember(id, m.fp);
+  await settle(all);
+  for (const m of members) await m.engine.respondInvite(m.engine.state().invites.incoming[0].id, true);
+  await settle(all, 3);
+  const team = owner.engine.listInboxes().find((b) => b.id === id);
+  assert.equal(team.members.length, names.length + 1, 'every member is admitted');
+  return { owner, members, all, id, route: { kind: 'inbox', id } };
+}
+
+// Restarts `node` from its data dir (its stored network settings), with `opts`.
+export async function restart(t, node, opts = {}) {
+  await node.close();
+  return opener(t)(node.name, { dataDir: node.dataDir, ...opts });
 }

@@ -393,8 +393,9 @@ test('leaveDue: due while a member; not after a removal; not after a re-add newe
 });
 
 // Invariant: a record is dropped on arrival exactly when it was purged here (by id), belongs to a dead shared inbox
-// (a purged create or the owner's own kept delete), or answers a purged invite or join request; nothing else is.
-test('dropOnArrival: a purged id, a dead shared inbox (purged create or the owner\'s own delete), an answer to a purged invite or request; nothing else', () => {
+// (a purged create or the owner's own kept delete), answers a purged invite or join request, or revokes a personal
+// invite already purged here (the other party's simultaneous revoke); nothing else is.
+test('dropOnArrival: a purged id, a dead shared inbox (purged create or the owner\'s own delete), an answer to a purged invite or request, a revoke citing a purged invite; nothing else', () => {
   const OTHER = 'b'.repeat(32);
   const PERSONAL = 'a'.repeat(32);
   const inv = rec({ type: 'invite', signer: A, to: B, kind: 'shared', inbox: OTHER, nonce: '1'.repeat(32) });
@@ -408,6 +409,10 @@ test('dropOnArrival: a purged id, a dead shared inbox (purged create or the owne
   assert.equal(dropOnArrival(empty, purged, resp), 'PURGED_DEPENDENCY');
   const jresp = rec({ type: 'join-response', signer: A, to: B, request: req.id, inbox: OTHER, accept: false });
   assert.equal(dropOnArrival(empty, purged, jresp), 'PURGED_DEPENDENCY');
+  const PI = 'e'.repeat(32);
+  const revoked = { ids: new Map([[PI, PERSONAL]]), dead: new Set() };
+  assert.equal(dropOnArrival(empty, revoked, personalDel(B, A, PI, PERSONAL)), 'PURGED_DEPENDENCY', 'a revoke citing a purged personal invite');
+  assert.equal(dropOnArrival(empty, noPurge(), personalDel(B, A, PI, PERSONAL)), null, 'a revoke citing a live invite');
   // The owner's own kept delete marks its inbox dead with nothing on the purge list.
   const owner = buildIndex([sharedDel(A, OTHER)]);
   assert.equal(dropOnArrival(owner, noPurge(), rec({ type: 'invite-response', signer: B, to: A, invite: 'f'.repeat(32), inbox: OTHER, accept: true })), 'DEAD_INBOX');

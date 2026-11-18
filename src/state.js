@@ -302,13 +302,16 @@ export function leaveDue(index, leave) {
 // Why a record arriving now is dropped silently (never accepted, pending or refused), or null. `purged` is what this
 // install purged ({ids: Map id → inbox, dead: Set inbox}, docs/protocol.md → Closing an inbox):
 // 'PURGED' — this very record was removed here; 'DEAD_INBOX' — its inbox is a deleted shared inbox (a purged create,
-// or this owner's own kept delete); 'PURGED_DEPENDENCY' — it answers a purged invite or join request.
+// or this owner's own kept delete); 'PURGED_DEPENDENCY' — it answers a purged invite or join request, or revokes a
+// personal invite purged here.
 export function dropOnArrival(index, purged, rec) {
   const p = rec.payload;
   if (purged.ids.has(rec.id)) return 'PURGED';
   if (typeof p.inbox === 'string' && (purged.dead.has(p.inbox) || (index.deletes.get(p.inbox) ?? []).some((d) => d.payload.kind === 'shared'))) return 'DEAD_INBOX';
   if (p.type === 'invite-response' && purged.ids.has(p.invite)) return 'PURGED_DEPENDENCY';
   if (p.type === 'join-response' && purged.ids.has(p.request)) return 'PURGED_DEPENDENCY';
+  // The other party's revoke of a personal inbox this install already revoked (or learned was revoked).
+  if (p.type === 'inbox-delete' && p.kind === 'personal' && purged.ids.has(p.invite)) return 'PURGED_DEPENDENCY';
   return null;
 }
 
