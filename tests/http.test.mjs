@@ -265,3 +265,43 @@ test('POST api/network and POST api/contacts answer their codes', async (t) => {
   assert.equal(imported.status, 200);
   assert.deepEqual(imported.json, { fp: b.fp, name: 'bob', shown: true });
 });
+
+// Invariant: Delete, Revoke and Leave are REST routes behind the request guard, answering {id} or the engine's codes
+// with their statuses (403 NOT_OWNER, 404 INBOX_UNKNOWN, 409 NOT_MEMBER and OWNER_CANNOT_LEAVE, 400 BAD_REQUEST).
+test('POST api/inboxes/:id/delete and /leave answer their codes', async () => {
+  const { installs } = await makeNetwork(['alice', 'bob', 'carol']);
+  const [a, b, c] = installs;
+  const { id: team } = await a.engine.createSharedInbox('team');
+  await syncAll(installs);
+  await b.engine.requestJoin(team);
+  await syncAll(installs);
+  await a.engine.respondJoin(a.engine.state().joinRequests.incoming[0].id, true);
+  await syncAll(installs);
+  const { id: inv, inbox: personal } = await a.engine.invite(b.fp);
+  await syncAll(installs);
+  await b.engine.respondInvite(inv, true);
+  await syncAll(installs);
+  const post = (x, p, body = {}, headers) => x.rest('POST', p, body, headers);
+  const code = (r) => [r.status, r.json?.code];
+  assert.deepEqual(code(await post(b, `/api/inboxes/${team}/delete`)), [403, 'NOT_OWNER']);
+  assert.deepEqual(code(await post(a, `/api/inboxes/${'f'.repeat(32)}/delete`)), [404, 'INBOX_UNKNOWN']);
+  assert.deepEqual(code(await post(c, `/api/inboxes/${personal}/delete`)), [404, 'INBOX_UNKNOWN'], 'carol never saw the personal inbox');
+  assert.deepEqual(code(await post(a, `/api/inboxes/${team}/leave`)), [409, 'OWNER_CANNOT_LEAVE']);
+  assert.deepEqual(code(await post(c, `/api/inboxes/${team}/leave`)), [409, 'NOT_MEMBER']);
+  assert.deepEqual(code(await post(a, `/api/inboxes/${personal}/leave`)), [400, 'BAD_REQUEST']);
+  assert.equal((await post(b, `/api/inboxes/${team}/leave`, {}, { 'content-type': 'text/plain', 'sec-fetch-site': 'same-origin' })).status, 415);
+  assert.equal((await post(b, `/api/inboxes/${team}/leave`, {}, { ...PAGE_HEADERS, 'sec-fetch-site': 'cross-site' })).status, 403);
+  assert.equal((await post(a, `/api/inboxes/${team}/delete`, {}, { ...PAGE_HEADERS, 'sec-fetch-site': 'cross-site' })).status, 403);
+  assert.ok(b.engine.listInboxes().some((x) => x.id === team), 'a refused request changed nothing');
+  const left = await post(b, `/api/inboxes/${team}/leave`);
+  assert.equal(left.status, 200);
+  assert.match(left.json.id, /^[0-9a-f]{32}$/);
+  const revoked = await post(b, `/api/inboxes/${personal}/delete`);
+  assert.equal(revoked.status, 200);
+  assert.match(revoked.json.id, /^[0-9a-f]{32}$/);
+  const deleted = await post(a, `/api/inboxes/${team}/delete`);
+  assert.equal(deleted.status, 200);
+  assert.match(deleted.json.id, /^[0-9a-f]{32}$/);
+  assert.ok(!a.engine.listInboxes().some((x) => x.id === team));
+  for (const x of installs) await x.close();
+});

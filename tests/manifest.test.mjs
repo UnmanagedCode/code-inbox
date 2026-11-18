@@ -37,6 +37,12 @@ test('every tool declares an outputSchema within cc\'s validated subset', () => 
   }
 });
 
+// Invariant: agents get exactly the three inbox tools; closing an inbox (Delete, Revoke, Leave) and every other
+// human-only operation is not one.
+test('the tool names are exactly list_inboxes, read_messages, send_message', () => {
+  assert.deepEqual(MANIFEST.mcp.tools.map((t) => t.name).sort(), ['list_inboxes', 'read_messages', 'send_message']);
+});
+
 // Invariant: every agent of the install may use the inboxes.
 test('every tool is offered to every session', () => {
   for (const tool of MANIFEST.mcp.tools) assert.equal(tool.audience ?? 'all', 'all', tool.name);
