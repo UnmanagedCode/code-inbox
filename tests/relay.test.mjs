@@ -71,7 +71,15 @@ async function refusedRouteMismatch(node, { route, writer, bytes }, what) {
 }
 
 // A msg of `identity`'s on shared inbox `inbox`, signed but never sent.
-const unsentMsg = (identity, inbox, body, epoch) => encodeRecord(identity, { type: 'msg', signer: identity.fp, ts: Date.now(), inbox, body, epoch, prev: null }).bytes;
+const unsentMsg = (identity, inbox, body, epoch, prev = null) => encodeRecord(identity, { type: 'msg', signer: identity.fp, ts: Date.now(), inbox, body, epoch, prev }).bytes;
+
+// Records every `send` the engine makes through `node`'s transport: the record id and the recipients.
+function spySends(node) {
+  const calls = [];
+  const send = node.transport.send;
+  node.transport.send = (bytes, opts) => { calls.push({ id: decodeRecord(bytes).id, to: [...opts.to].sort() }); return send(bytes, opts); };
+  return calls;
+}
 
 // Invariant (store-and-forward through the owner): a member that was offline when a message was sent gets it from the
 // owner later, while its author is offline too; it never needs a session with the author.
@@ -339,4 +347,61 @@ test('the file share relays nothing: the owner writes only its own records', asy
   assert.ok(files.length > 0);
   for (const f of files) assert.equal(decodeRecord(fs.readFileSync(path.join(ownerDir, f))).payload.signer, owner.fp, f);
   for (const x of installs) await x.close();
+});
+
+// Invariant (rule 1, producer side): only the owner relays. A member that accepts a co-member's message sends it on
+// to nobody, so no install is offered a third-party record from a non-owner and nothing is refused anywhere.
+test('a member that accepts a co-member\'s message relays nothing: only the owner relays', async (t) => {
+  const { owner, members: [m1, m2, m3], all, id } = await star(t, ['m1', 'm2', 'm3']);
+  const sends = new Map([m2, m3].map((m) => [m.fp, spySends(m)]));
+  await m1.engine.sendMessage(id, 'from m1');
+  const msgId = m1.engine.messages(id).at(-1).id;
+  await waitFor(() => bodies(m2, id).includes('from m1') && bodies(m3, id).includes('from m1'), 'the owner\'s relay');
+  await settle(all);
+  for (const m of [m2, m3]) assert.deepEqual(sends.get(m.fp).filter((c) => c.id === msgId), [], `${m.name} sends m1's message to nobody`);
+  const fromMembers = (n) => n.offered.filter((i) => decoded(i).id === msgId && i.writer !== m1.fp && i.writer !== owner.fp);
+  for (const n of all) assert.deepEqual(fromMembers(n), [], `${n.name} is offered it only by its author or the owner`);
+  for (const n of all) assert.equal(n.engine.state().diagnostics.rejected, 0, n.name);
+});
+
+// Invariant (D6): the owner never relays its own messages: its message is sent once, to every member, by the send
+// that publishes it, and no second send follows.
+test('the owner sends its own message once per member and never relays it', async (t) => {
+  const { owner, members: [m1, m2], id } = await star(t, ['m1', 'm2']);
+  const sends = spySends(owner);
+  await owner.engine.sendMessage(id, 'from the owner');
+  const msgId = owner.engine.messages(id).at(-1).id;
+  assert.deepEqual(sends.filter((c) => c.id === msgId), [{ id: msgId, to: [m1.fp, m2.fp].sort() }]);
+  await waitFor(() => bodies(m1, id).includes('from the owner') && bodies(m2, id).includes('from the owner'), 'the owner\'s message');
+  for (const m of [m1, m2]) assert.equal(m.offered.filter((i) => decoded(i).id === msgId).length, 1, `${m.name} is offered it once`);
+});
+
+// Invariant (D7): the outbox keep-set narrows only a member's message to the owner; the owner's own message keeps
+// every member it could not reach, as for any other write.
+test('the owner\'s own message keeps an offline member in its outbox', async (t) => {
+  const { owner, members: [m1, m2], id } = await star(t, ['m1', 'm2']);
+  await m2.close();
+  await waitFor(() => owner.sessionsWith(m2.fp).length === 0, 'the owner\'s session with m2 to close');
+  await owner.engine.sendMessage(id, 'for everyone');
+  const { outbox } = await owner.store.load();
+  assert.deepEqual(outbox.map((e) => e.to), [[m2.fp]]);
+  assert.equal(owner.engine.state().diagnostics.outbox, 1);
+  await waitFor(() => bodies(m1, id).includes('for everyone'), 'the message at m1');
+});
+
+// Invariant (D6): a co-member's message the owner accepts by draining pending (its prev arrived after it) is relayed
+// like one accepted on arrival: pushed live, with no sync or pull.
+test('a member\'s message that pended at the owner is pushed on once it settles', async (t) => {
+  const { owner, members: [m1, m2], id, route } = await star(t, ['m1', 'm2']);
+  const epoch = 2; // the two member records
+  const first = unsentMsg(m1.identity, id, 'first', epoch);
+  const second = unsentMsg(m1.identity, id, 'second', epoch, decodeRecord(first).id);
+  await owner.engine.ingest({ route, writer: m1.fp, bytes: second });
+  assert.equal(owner.engine.state().diagnostics.pending, 1, 'the second waits for its prev');
+  await owner.engine.ingest({ route, writer: m1.fp, bytes: first });
+  assert.equal(owner.engine.state().diagnostics.pending, 0);
+  await waitFor(() => bodies(m2, id).includes('second'), 'the drained message at m2');
+  assert.deepEqual(bodies(m2, id), ['first', 'second']);
+  const offer = m2.offered.find((i) => decoded(i).id === decodeRecord(second).id);
+  assert.equal(offer.writer, owner.fp);
 });
