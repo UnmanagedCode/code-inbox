@@ -152,7 +152,23 @@ export function createEndpoint({ makeLinks, limits = {}, now = Date.now, schedul
   // ---- pulling ----
 
   const cursorOf = (b, fp, key) => b.cursorData[fp]?.[key] ?? 0;
-  const setCursor = (b, fp, key, seq) => { b.cursorData = { ...b.cursorData, [fp]: { ...b.cursorData[fp], [key]: seq } }; };
+  // A route outside the interest keeps no cursor: a pull still in flight when it left cannot bring one back.
+  const setCursor = (b, fp, key, seq) => {
+    if (!b.interest.has(key)) return;
+    b.cursorData = { ...b.cursorData, [fp]: { ...b.cursorData[fp], [key]: seq } };
+  };
+  // Drops every cursor of a route outside the interest; resolves whether any went.
+  function pruneCursors(b) {
+    let changed = false;
+    const next = {};
+    for (const [fp, routes] of Object.entries(b.cursorData)) {
+      const kept = Object.fromEntries(Object.entries(routes).filter(([key]) => b.interest.has(key)));
+      if (Object.keys(kept).length !== Object.keys(routes).length) changed = true;
+      next[fp] = kept;
+    }
+    if (changed) b.cursorData = next;
+    return changed;
+  }
 
   // Pulls `routes` from `fp` on `s`: the records `fp` serves there (view.serve on its side) past this binding's
   // cursor, until no route has more. Each is offered with writer `fp`.
@@ -306,6 +322,7 @@ export function createEndpoint({ makeLinks, limits = {}, now = Date.now, schedul
         try {
           // Cursors first: a connection opened here may be ready (and pulling) before anything else is awaited.
           b.cursorData = await cursors.load();
+          if (pruneCursors(b)) await cursors.save(b.cursorData);
           for (const l of links) await l.open();
         } catch (err) {
           detach();
@@ -313,12 +330,13 @@ export function createEndpoint({ makeLinks, limits = {}, now = Date.now, schedul
         }
         if (!b.stopped) loop();
       },
-      // Newly added routes are pulled from every session at once (scheduled, never awaited: this runs under the
-      // engine lock).
+      // Newly added routes are pulled from every session at once; a route that left loses its cursors, so it is
+      // pulled from the start if it returns (both scheduled, never awaited: this runs under the engine lock).
       setInterest(routes) {
         const next = new Map(routes.map((r) => [routeKey(r), r]));
         const added = [...next].filter(([k]) => !b.interest.has(k)).map(([, r]) => r);
         b.interest = next;
+        if (pruneCursors(b)) void queue(b, () => b.cursors.save(b.cursorData));
         if (added.length && b.sink) void queue(b, () => pullAll(b, added));
       },
       // Delivered: the frame was written to a ready session under its write-buffer cap. Recipients without one

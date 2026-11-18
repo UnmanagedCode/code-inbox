@@ -113,10 +113,17 @@ async function network(impl, names) {
     const store = createStore(dataDir, { log: silentLog });
     await store.load();
     const identity = await loadIdentity(dataDir);
-    const node = { name, fp: identity.fp, store, transport: null };
+    // `offered`: every record the transport hands the engine's sink, before the engine judges it.
+    const node = { name, fp: identity.fp, store, transport: null, offered: [] };
     node.engine = createEngine({
       store, identity, log: silentLog,
-      makeTransport: (config, view) => { node.transport = net.makeTransport(identity, shareDir, view, store, config); return node.transport; },
+      makeTransport: (config, view) => {
+        const t = net.makeTransport(identity, shareDir, view, store, config);
+        const start = t.start;
+        t.start = (sink) => start.call(t, { ...sink, record: (i) => { node.offered.push(i); return sink.record(i); } });
+        node.transport = t;
+        return t;
+      },
     });
     await node.engine.boot();
     await net.configure(node.engine, shareDir, nodes.length, nodes);
@@ -202,6 +209,38 @@ for (const impl of Object.keys(IMPLEMENTATIONS)) {
       await b.engine.sendMessage(id, 'to the team');
       await net.settle();
       for (const n of net.nodes) assert.deepEqual(n.engine.messages(id).map((m) => m.body), ['to the team'], n.name);
+    } finally {
+      await net.close();
+    }
+  });
+
+  // Invariant (the delivery-position contract, docs/transport.md → Interface): a route that leaves the interest loses
+  // its delivery position, so when it returns the transport delivers it from the start again; a route that stays is
+  // never delivered again. Not on memoryPush: it keeps no history to deliver from.
+  if (impl !== 'memoryPush') test(`${impl}: a route that leaves the interest and returns is delivered from the start`, async () => {
+    const net = await network(impl, ['alice', 'bob']);
+    try {
+      const [a, b] = net.nodes;
+      const { id, inbox } = await a.engine.invite(b.fp);
+      await net.settle();
+      await b.engine.respondInvite(id, true);
+      await net.settle();
+      await a.engine.sendMessage(inbox, 'from the start');
+      await net.settle();
+      assert.deepEqual(b.engine.messages(inbox).map((m) => m.body), ['from the start']);
+      const route = { kind: 'inbox', id: inbox };
+      const msgBytes = Buffer.from((await a.store.load()).accepted.at(-1).bytes);
+      const offersOfMsg = () => b.offered.filter((i) => routeKey(i.route) === routeKey(route) && Buffer.from(i.bytes).equals(msgBytes)).length;
+      const before = offersOfMsg();
+      assert.ok(before >= 1);
+      const routes = [{ kind: 'directory' }, { kind: 'mailbox', fp: b.fp }, route];
+      b.transport.setInterest(routes);
+      await net.settle();
+      assert.equal(offersOfMsg(), before, 'a route that stays keeps its position');
+      b.transport.setInterest(routes.slice(0, 2));
+      b.transport.setInterest(routes);
+      await net.settle();
+      assert.ok(offersOfMsg() > before, 'the returning route is delivered from the start');
     } finally {
       await net.close();
     }

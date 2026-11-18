@@ -16,7 +16,10 @@ import { FP_RE, ID_RE } from '../records.js';
  * @property {{directory: boolean, push: boolean, pull: boolean}} capabilities  `pull`: peers pull from each other's
  *                                                         served logs (view.serve), so a record a send misses still arrives
  * @property {(sink: Sink) => Promise<void>} start
- * @property {(routes: Route[]) => void} setInterest       the routes this install wants delivered
+ * @property {(routes: Route[]) => void} setInterest       the routes this install wants delivered. A route that leaves
+ *                                                         the interest loses its delivery position: if it returns, the
+ *                                                         transport delivers it from the start. A transport never
+ *                                                         learns why a route left and never decodes a payload
  * @property {(bytes: Uint8Array|null) => void} setAnnounce   this install's current signed announce: a network
  *                                                         transport presents it to every peer and hub
  * @property {(bytes: Uint8Array, opts: {route: Route, to: string[]}) => Promise<{delivered: string[], pending: string[]}>} send

@@ -5,7 +5,7 @@ import path from 'node:path';
 import { CodedError } from '../errors.js';
 import { TMP_PREFIX, writeFileAtomic } from '../fsAtomic.js';
 import { FP_RE, RECORD_MAX_BYTES } from '../records.js';
-import { isRoute } from './index.js';
+import { isRoute, routeKey } from './index.js';
 
 // The v1 transport: a directory every install can reach (Dropbox, SMB, NFS). Layout under <shareDir>/code-inbox/v1/
 // (docs/protocol.md → Share layout); every writer writes only below its own fingerprint subdir and never rewrites
@@ -278,7 +278,17 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
     },
     // The engine writes the announce file itself (a directory-route send), so the share needs nothing here.
     setAnnounce() {},
-    setInterest(routes) { interest = [...routes]; },
+    // A route that leaves the interest loses its delivery position: its files are offered afresh if it returns.
+    setInterest(routes) {
+      const next = new Set(routes.map(routeKey));
+      for (const route of interest) {
+        if (next.has(routeKey(route))) continue;
+        const prefix = routeDir(root, route) + path.sep;
+        for (const file of offered) if (file.startsWith(prefix)) offered.delete(file);
+        for (const file of retry.keys()) if (file.startsWith(prefix)) retry.delete(file);
+      }
+      interest = [...routes];
+    },
     // The share stores everything, so every recipient counts as delivered.
     // Refused SHARE_UNAVAILABLE (retryable, nothing created) while the share's root does not exist: a share whose
     // mount is not up must not be recreated on the local disk, where the mount would later hide it.
