@@ -47,7 +47,7 @@ Ids and nonces are 32 lowercase hex (`ID_RE`); fingerprints 64 (`FP_RE`); `ts` i
 - Personal: `hex(sha256("code-inbox/personal\0" + inviterFp + "\0" + inviteeFp + "\0" + nonce))[0..32]`
 - Shared: `hex(sha256("code-inbox/shared\0" + ownerFp + "\0" + nonce))[0..32]`
 
-Verification recomputes the id from the record's own fields (`inbox-create`, and `invite` of both kinds), so nobody can mint a record claiming another's inbox. A shared `invite` carries the inbox's nonce, which also proves the inviter is its owner.
+Verification recomputes the id from the record's own fields (`inbox-create`, `invite` of both kinds, and `inbox-delete` of both kinds), so nobody can mint a record claiming another's inbox. A shared `invite` or `inbox-delete` carries the inbox's nonce, which also proves its signer is the owner; a personal `inbox-delete` recomputes with its signer and `to` in either order, which proves its signer is a party.
 
 ### Record types
 
@@ -63,6 +63,8 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 | `join-response` | `to`, `request` (record id), `inbox`, `accept: false` | mailbox(requester) | the signer is the request's `to`, `to` its signer (`RESPONSE_MISMATCH`). A decline only: an admission is a `member` record | the request is unseen |
 | `member` | `inbox`, `seq ≥ 1`, `op: add\|remove`, `member`, `keepHead: msgId\|null` (on every remove, never on an add) | inbox(id) | the signer is the owner (`NOT_OWNER`), `member` is not the owner (`BAD_MEMBER_OP`) | the `inbox-create` is unseen |
 | `msg` | `inbox`, `body`, and on a shared inbox both `epoch` and `prev: msgId\|null` (the same sender's previous message in that inbox; null for its first) | inbox(id) | see below | see below |
+| `inbox-delete` | `kind: shared\|personal`, `inbox`, `nonce`; a personal one also `to` (the other party) and `invite` (the personal invite's record id), a shared one neither (`BAD_PAYLOAD`) | shared: directory; personal: mailbox(`to`) | always: the id recomputes from the signer (`INBOX_ID_MISMATCH` at decode) | — (never pends) |
+| `inbox-leave` | `to` (the owner), `inbox`, `epoch` (the leaver's current epoch) | mailbox(`to`) | `to` is the inbox's owner (`NOT_OWNER`), the signer is a member at `epoch` (`NOT_MEMBER`). An owner's own leave is `SELF_ADDRESSED` | the `inbox-create` (`INBOX_UNSEEN`) or the epoch (`EPOCH_UNSEEN`) is unseen |
 
 **A message to a personal inbox** is valid when its signer is the inviter or invitee (`NOT_PARTY`), it carries no `epoch` (`BAD_EPOCH`), and the invite's response accepts (`INVITE_DECLINED`). Pending while no response is seen.
 
@@ -109,6 +111,60 @@ The owner's install writes the `member add` itself when it accepts the invitee's
 - the invite's effective response (the lowest record id among its responses) accepts;
 - the invitee is not a current member;
 - the invite was accepted on the owner's install after the invitee's last `member` record (acceptance seqs, both written by the owner). A re-signed or replayed acceptance of an invite that predates a removal admits nobody; a fresh invite does.
+
+### Closing an inbox
+
+Three human actions close an inbox for an install; none is an agent tool.
+
+| Action | Who | Record | Effect |
+|---|---|---|---|
+| **Delete** | the owner of a shared inbox | `inbox-delete` `kind: shared` | the inbox closes on every install |
+| **Revoke** | either party of an accepted personal inbox | `inbox-delete` `kind: personal` | the inbox is unregistered for both; a fresh personal invite (a new nonce, so a new inbox id) works afterwards |
+| **Leave** | a member of a shared inbox, not its owner | `inbox-leave` to the owner | the owner writes the leaver's removal; the leaver may rejoin later like a first-time joiner |
+
+**Recipients:** a shared delete goes to every fp the inbox's accepted and pending records name (`signer`, `to`, `member`: members past and present, invitees, requesters), and is served on the owner's directory route to anyone who pulls it. A revoke and a leave go to `to`.
+
+**The owner's answer to a leave** (`leaveDue`, `src/state.js`): while the leaver is a current member and no `member` record naming it has `seq` > the leave's `epoch`, the owner writes exactly `removeMember`'s record (`keepHead`: the leaver's last message valid on the owner's install). A newer member record wins: a removal written first, or a re-admission written before a stale leave arrived. Written as the leave is accepted, and again at every transport start for a leave accepted before a crash.
+
+**The purge** (`purgeInbox`, `src/engine.js`): every install that accepts a closing removes the inbox's records:
+
+| Closing | Install | Removes (records with that `inbox`) | Keeps |
+|---|---|---|---|
+| shared delete | the owner | every one accepted before it, plus pending and refused ids | its own delete |
+| shared delete | anyone else | all of them, the delete included | nothing |
+| personal revoke | the revoker | every one accepted before it, plus pending and refused ids | its own revoke |
+| personal revoke | the other party | all of them, the revoke included | nothing |
+| own leave | the leaver | every one accepted before it, plus pending and refused ids | every `inbox-create` of the inbox (its directory row, so **Request to join** is offered again) and its own leaves |
+
+- The purge also drops the inbox's outbox entries (the closing's own entry stays), its read cursor and served-log entries, and takes its route out of the interest, so the transport forgets its delivery position there ([transport.md → Interface](transport.md#interface)).
+- **Purge list** (`purged.ndjson`): the ids of removed records whose route is not the inbox route (directory and mailbox records: creates, invites and answers, join requests and answers, leaves, deletes), plus the invite a revoke cites. `msg` and `member` records never go on it, so a rejoin can fetch them again.
+- **Dead ids:** a shared delete's own entry and the `inbox-create` it removes are marked `dead`. A dead id blocks only that inbox id, which nobody can create again: a new shared inbox draws a fresh nonce, even with the same name. No other per-inbox marker exists.
+- The install that signed a closing keeps it, so offline parties can still fetch it; nothing checks it, so it blocks nothing.
+- **Afterwards:** after a Delete or Revoke, `read_messages`, `send_message` and `GET messages` refuse `INBOX_UNKNOWN` and `list_inboxes` omits the inbox; after a Leave the inbox is still known, so they refuse `NOT_MEMBER`, like a removed member.
+
+**Records for a closed inbox are dropped on arrival**, silently (never accepted, pending or refused, nothing counted), by the first rule that holds:
+
+1. it arrives on an inbox route no longer in this install's interest (the interest rule: `engine.ingest` admits a record only on a route of `interestOf`);
+2. its id is on the purge list (`PURGED`);
+3. its inbox is a dead shared inbox, or this owner's own kept delete names it (`DEAD_INBOX`);
+4. it answers a purged invite or join request, or revokes a personal invite already purged here (`PURGED_DEPENDENCY`).
+
+Rules 2–4 are `dropOnArrival` (`src/state.js`); rule 1 runs in `engine.ingest` only, never on this install's own records.
+
+**Races and edges:**
+
+- **Shared Delete on the file share:** an invite, join request, invite answer or leave the sync client delivers after the delete hits rule 3, so it never waits.
+- **A message in flight during a Delete:** the owner drops it (rule 3) and relays nothing; the sender's outbox entry goes when the sender purges on the delete.
+- **During a Leave:** the leaver drops its own owed messages for the inbox with its purge. A message already written or delivered is judged by the owner's removal `keepHead` ([Removal](#removal)).
+- **During a Revoke:** dropped on arrival (rule 1); the sender purges its outbox entry on the revoke.
+- **Leave vs member removal:** whichever member record the owner holds as newer wins (`leaveDue`). A removal before the leave arrives: the leave is accepted and no second removal is written. A re-admission written before a stale leave arrives: the member stays.
+- **An open invite or join request for a deleted inbox:** the owner purges it; the invitee or requester drops it when the delete arrives. Accepting such an invite first sends an answer the owner drops (rule 3): nobody is admitted. **Request to join** is offered nowhere: the `inbox-create` is purged and dead.
+- **A revoke that arrives before its invite** puts the cited invite on the purge list, so the invite is dropped by id when it arrives.
+- **The owner leaving** is refused `OWNER_CANNOT_LEAVE`: it deletes instead.
+- **Both parties revoke at once:** each purges on its own revoke and drops the other's (rule 4, through the cited invite).
+- **Re-creation:** a new shared inbox, even with the same name, gets a new id; a new personal invite gets a new id; a leaver rejoins the **same** id through an ordinary join request or invite (`admissionDue` unchanged).
+- **How an offline party learns of a closing:** on the file share at its next scan; on the network when it next has a session with the signer (its outbox on `peerOnline`, or a pull of the signer's directory route, which serves a kept shared delete). An invitee or requester with no session to the owner learns of a delete when it next meets the owner.
+- **Seqs survive a purge:** an acceptance seq is never reused (`seq.json` keeps the highest one assigned), and the head a peer pulls against never moves back.
 
 ### Names
 
@@ -284,6 +340,8 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | `POST api/inboxes/:id/join` | `{}` | `{id}` |
 | `POST api/join-requests/:id/respond` | `{accept: boolean}` | `{id}` (a `member` record or a `join-response`) |
 | `POST api/inboxes/:id/members/:fp/remove` | `{}` | `{id}` |
+| `POST api/inboxes/:id/delete` | `{}` | `{id}`: the owner's Delete of a shared inbox, or a party's Revoke of an accepted personal one. `TRANSPORT_UNCONFIGURED` 409, `INBOX_UNKNOWN` 404, `NOT_OWNER` 403 (shared, not the owner), `NOT_MEMBER` 409 (personal, not a party of an accepted inbox) |
+| `POST api/inboxes/:id/leave` | `{}` | `{id}`: a member leaves a shared inbox. `TRANSPORT_UNCONFIGURED` 409, `INBOX_UNKNOWN` 404, `NOT_MEMBER` 409, `BAD_REQUEST` 400 (a personal inbox is revoked, not left), `OWNER_CANNOT_LEAVE` 409 |
 | `POST api/inboxes/:id/messages` | `{body}` | `{id, inbox}`. Refusals as `send_message`: `NOT_MEMBER` 409, `INBOX_UNKNOWN` 404, `TRANSPORT_UNCONFIGURED` 409, `SHARE_UNSAFE` 409, `BAD_REQUEST` 400 (not a non-empty string), `BODY_TOO_LARGE` 413 |
 | `POST api/notify` | `{sessionId}` or `{sessionId: null}` | `{target, autoStart}`; `SESSION_UNKNOWN` unless a top-level conductor |
 | `POST api/mcp` | cc's tool call | below |
@@ -303,6 +361,8 @@ cc POSTs `{tool, arguments, caller, format}` to `api/mcp`; every well-formed cal
 | `list_inboxes` | — | `{inboxes: [{id, kind, name, members: [{fp, name}], unread}]}` |
 | `read_messages` | `inbox` (required), `after`, `limit` (1–`READ_LIMIT_MAX`, default `READ_LIMIT_DEFAULT`), `markRead` (default true) | `{inbox, notice, messages: [{id, seq, sender: {fp, name}, ts, body, untrusted: true}], cursor}` |
 | `send_message` | `inbox`, `body` | `{id, inbox}` |
+
+- **Refusals of `read_messages` and `send_message`:** `INBOX_UNKNOWN` for an inbox this install does not know, a deleted or revoked one included; `NOT_MEMBER` for one it knows but is not a party or member of, a removed member's or a leaver's included.
 
 - **`read_messages` without `after`:** messages from others with an acceptance seq above the read cursor. **With `after`:** every message above it, own included. `markRead` advances the cursor to the last one returned.
 - **Untrusted framing (text):** a fixed notice line (`UNTRUSTED_NOTICE`, `src/mcp.js`), then each body between `<<<UNTRUSTED-<nonce>` and `UNTRUSTED-<nonce>>>>`. The nonce is random for each response and redrawn if any body contains it, so a body cannot close its frame.

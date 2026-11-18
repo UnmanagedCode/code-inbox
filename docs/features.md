@@ -52,9 +52,16 @@ A contact card is a signed announce: it says who someone is, not where they are.
 
 ### Directory
 
-- **Identities:** every other install whose name is shown, with its fingerprint, strangers included (seen on a hub, or met on a connection): a stranger carries a **not a contact** tag. Each says where it is now: "on hub `addr`", "connected via `addr`", "connected to your listener", or "not connected". **Invite to personal inbox** sends a personal invite, to a stranger too: inviting makes it a contact, and the invite goes out over the session or hub that has it (refused `INVITE_EXISTS` while one between the two is open or accepted).
+- **Identities:** every other install whose name is shown, with its fingerprint, strangers included (seen on a hub, or met on a connection): a stranger carries a **not a contact** tag. Each says where it is now: "on hub `addr`", "connected via `addr`", "connected to your listener", or "not connected". Each row has one control, chosen by the personal inbox with that identity:
+  - an accepted personal inbox: **Revoke** (with a confirm step) unregisters it for both installs;
+  - a personal invite open either way: a disabled **Invite pending**;
+  - otherwise **Invite to personal inbox**: sends a personal invite, to a stranger too. Inviting makes it a contact, and the invite goes out over the session or hub that has it.
 - Names and announces of strangers are kept in memory only; contacts' and counterparties' names persist.
-- **Shared inboxes:** every shared inbox this install knows of (on the share, or pulled from a connected peer's directory), its owner and member count. **Request to join** sends a join request to the owner (refused `ALREADY_MEMBER`, `REQUEST_EXISTS`).
+- **Shared inboxes:** every shared inbox this install knows of (on the share, or pulled from a connected peer's directory), its owner and member count. Each row has one control, chosen by this install's role:
+  - the owner: **Delete** (with a confirm step) closes the inbox for every install;
+  - a member: **Leave** (with a confirm step); the owner then removes this install, and the row offers **Request to join** again;
+  - a join request still open: a disabled **Request pending**;
+  - otherwise **Request to join**: sends a join request to the owner.
 - **New shared inbox:** creates one owned by this install; its name follows `NAME_RE`.
 
 ### Invites and requests
@@ -69,7 +76,22 @@ A contact card is a signed announce: it says who someone is, not where they are.
 - A personal inbox is named after the other party; a shared inbox by its own name.
 - **Inbox view:**
   - members, then the messages in acceptance order (the order this install received them, not the senders' clocks), then a **compose box**;
-  - for the owner of a shared inbox: **Remove** per member and **Invite a member** (from the directory, strangers included).
+  - a header action, with a confirm step, by kind and role: **Delete inbox** (the owner of a shared inbox), **Leave inbox** (a member), **Revoke** (a personal inbox). On success the page goes back to the list; a refusal shows `CODE: message`;
+  - for the owner of a shared inbox: one select over the parties (directory identities and current members, strangers included) and one button that follows the selection: **Revoke** (with a confirm step) removes a current member, a disabled **Invite pending** for an identity with an open invite to this inbox, otherwise **Invite**.
+
+#### Closing an inbox
+
+- **Delete**, **Revoke** and **Leave** are page actions only; agents have no tool for them. Rules, recipients and races: [protocol.md → Closing an inbox](protocol.md#closing-an-inbox).
+- Every install the closing reaches deletes the inbox's local history (messages, pending records, outbox entries, read cursor). Agents no longer see it: after a Delete or Revoke, `list_inboxes` omits it and `read_messages` / `send_message` refuse `INBOX_UNKNOWN`; after a Leave they refuse `NOT_MEMBER`.
+- A leaver may rejoin by **Request to join** or an owner invite, like a first-time joiner; a fresh personal invite after a Revoke creates a new inbox.
+- The confirm step: the first click shows the confirm button and **Cancel** inline and sends nothing.
+- Refusals shown as `CODE: message`: `NOT_OWNER`, `INBOX_UNKNOWN`, `NOT_MEMBER`, `OWNER_CANNOT_LEAVE`, `BAD_REQUEST`, `TRANSPORT_UNCONFIGURED`.
+
+**Known limitations:**
+
+- On the network, a leaver who rejoins does not get its own earlier messages back: the owner never serves a reader its own records. Its new messages start a new chain, which is valid. On the file share it reads them again from the share.
+- A message still waiting in the leaver's outbox when it leaves is never delivered.
+- On the network, an invitee or requester learns of a Delete only when it next has a session with the owner.
 
 #### Compose box
 

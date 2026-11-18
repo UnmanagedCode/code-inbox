@@ -11,7 +11,7 @@ The engine talks to the network only through the `Transport` interface (`src/tra
  *  Transport {
  *    capabilities: { directory: boolean, push: boolean, pull: boolean }
  *    start(sink): Promise<void>
- *    setInterest(routes: Route[]): void    // the routes this install wants delivered
+ *    setInterest(routes: Route[]): void    // the routes this install wants delivered (see the delivery-position contract)
  *    setAnnounce(bytes | null): void       // this install's current signed announce
  *    send(bytes, {route, to: fp[]}): Promise<{delivered: fp[], pending: fp[]}>
  *    sync(): Promise<void>                 // pull now / ask online peers to catch up
@@ -20,9 +20,10 @@ The engine talks to the network only through the `Transport` interface (`src/tra
  *  } */
 ```
 
-- The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (an `inbox-create`: the contacts).
+- The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (an `inbox-create`: the contacts; a shared `inbox-delete`: every fp the inbox's records name).
 - `capabilities.pull`: peers pull from each other's served logs (`view.serve`), so a record a `send` misses still arrives by pull. The engine relies on it for the owner relay and the outbox keep-set ([Owner relay](#owner-relay)); a transport without it gets neither.
 - Recipients in `pending` (or all of them, if `send` throws) go to the outbox, except where the keep-set narrows it ([Owner relay](#owner-relay)); a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
+- **Delivery-position contract:** a route that leaves the interest loses its delivery position; if it returns, the transport delivers it from the start. A transport never learns why a route left and never decodes a record. The engine relies on this when a closed inbox is joined again ([protocol.md → Closing an inbox](protocol.md#closing-an-inbox)); the engine itself admits records only on routes of its current interest, so whatever a transport passes just before a route leaves is dropped. Pinned by the contract test "a route that leaves the interest and returns is delivered from the start".
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
 - `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share; in network mode the frame's `from`, an identity the remote endpoint proved on that session, directly or in the handshake tunneled through a hub stream (never the hub's word).
 - `announce(bytes)` takes a **hub-relayed announce**: no proven session carried it, so the engine accepts it as an announce only, with writer = its own signer, into its memory directory only (the same narrow exception as a card import).
@@ -64,7 +65,7 @@ One transport at a time, set on the page (`POST api/share` or `POST api/network`
 | `capabilities` | `{directory: true, push: false, pull: false}`: the share already stores and forwards, so the owner never relays there |
 | `setAnnounce` | Nothing: the engine writes the announce file itself (a directory-route send) |
 | `send` | Atomic write under the route's dir in this install's own fingerprint subdir; every `to` is `delivered`. Before each write (`checkWritable`): the share's root `<dir>/SHARE_ROOT` must already exist, else the retryable `SHARE_UNAVAILABLE` and nothing is created; neither the share dir nor its root may resolve into or above the data dir (real paths, re-checked on every write), else `SHARE_UNSAFE`. The route and writer subdirs under the root are created as needed, after a check that their path stays inside the root (`SHARE_UNSAFE` otherwise) |
-| Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once. Announce files go to the engine's memory directory, never its log |
+| Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once. Announce files go to the engine's memory directory, never its log. A route that leaves the interest is forgotten (its files handed over or awaiting a retry, by path prefix), so its next scan after it returns offers every file again |
 | `peerOnline` | Never fires |
 
 Layout and filename rules: [protocol.md → Routes and the share layout](protocol.md#routes-and-the-share-layout).
@@ -154,10 +155,10 @@ Each attempt:
 ### Announces, pulls and cursors
 
 - **On session ready:** each side pushes each binding's announce to each remote fp (`rec` on the `directory` route; `from` is proven, so the writer is bound), then `peerOnline(fp)` for every remote fingerprint and local binding, then a (scoped) pull of that binding's interest from it. **Announce** pushes the new announce on every ready session.
-- **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A pull names no route key the peer has no part in. The directory carries this install's `inbox-create` records (shared inbox ids and names) to any peer that pulls it (personal inbox ids are never in the directory).
+- **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A pull names no route key the peer has no part in. The directory carries this install's `inbox-create` and shared `inbox-delete` records (shared inbox ids and names) to any peer that pulls it (personal inbox ids are never in the directory).
 - **New routes:** `setInterest` schedules (never awaits; it runs under the engine lock) a pull of each newly added route from every session.
 - **A pull** asks for the records the remote identity serves on each route (`view.serve` on its side: its own records, and on a shared inbox it owns every record it accepted there, except the asker's own) with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress. Each record is offered with writer = that remote identity.
-- **Cursors** are per (peer fp, route key), over the peer's acceptance seqs of what it serves on that route, persisted in `pull-cursors.json`. No frame names a signer: a member keeps one cursor on (owner, `inbox:<id>`) covering every signer, plus its own cursors on (co-member, `inbox:<id>`) for direct pulls of that co-member's records. A file under any other name is never read. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
+- **Cursors** are per (peer fp, route key), over the peer's acceptance seqs of what it serves on that route, persisted in `pull-cursors.json`. No frame names a signer: a member keeps one cursor on (owner, `inbox:<id>`) covering every signer, plus its own cursors on (co-member, `inbox:<id>`) for direct pulls of that co-member's records. A file under any other name is never read. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0. **A route that leaves the interest loses its cursors** (for every peer): dropped in memory and in `pull-cursors.json` at `setInterest`, pruned from the file at start, and never set again by a pull answer still in flight, so it is pulled from 0 if it returns.
 - **Delivered** means written to a ready session under the write-buffer cap; `send` never waits for the flush because it runs under the engine lock. A frame lost on a dying socket is recovered by the pull on reconnect and by the periodic pull.
 
 ### Owner relay
@@ -169,6 +170,7 @@ The group of a shared inbox is a star around its owner: members connected only t
 - **Keep-set:** a non-owner's shared `msg` is still sent to every current member (direct pushes stay live), but the outbox keeps only the **owner** if it is pending (plus an owed write). A co-member a member never meets is never retried.
 - Both apply only where `capabilities.pull` is true (network mode). The file share stores everything and does not relay; a push transport without pulls keeps "send to all, outbox to all".
 - **Who receives what** (`mayRead`): a current member gets pushes and pulls the whole served log from its cursor; a new member pulls the inbox's full history, a removed member's kept messages included; a re-added member gets everything after its kept cursor; a removed or not-yet-admitted member is `denied` (its cursor kept) and gets no relay pushes.
+- **A purge** of a closed inbox removes its records from the served log too ([protocol.md → Closing an inbox](protocol.md#closing-an-inbox)): what is servable is fixed at acceptance except for a purge.
 - The owner serves every record it accepted on the route, including ones no longer valid (a removed member's off-chain messages accepted before the removal), so readers hold the same records and reach the same verdicts.
 
 ### Route binding
