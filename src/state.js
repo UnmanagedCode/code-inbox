@@ -25,6 +25,8 @@ export function createIndex() {
     joinResponses: new Map(), // join-request record id → [rec]
     members: new Map(), // inbox id → [rec]
     msgs: new Map(), // inbox id → [rec], in acceptance order
+    deletes: new Map(), // inbox id → [rec]: accepted inbox-deletes (shared Delete, personal Revoke)
+    leaves: new Map(), // inbox id → [rec]: accepted inbox-leaves
     pending: new Map(), // record id → {id, payload, …}: verified, route-bound, waiting for a dependency
     rejected: new Map(), // record id → {reason, type, inbox, signer}: refused for good
     // Settled message verdicts (accept/reject; never pending) and completed kept-chain walks. A settled verdict changes
@@ -64,6 +66,8 @@ export function addRecord(index, rec) {
     case 'join-response': push(index.joinResponses, p.request, rec); break;
     case 'member': push(index.members, p.inbox, rec); break;
     case 'msg': push(index.msgs, p.inbox, rec); break;
+    case 'inbox-delete': push(index.deletes, p.inbox, rec); break;
+    case 'inbox-leave': push(index.leaves, p.inbox, rec); break;
     default: throw new Error(`unknown record type ${p.type}`);
   }
 }
@@ -72,6 +76,16 @@ export function buildIndex(records) {
   const index = createIndex();
   for (const r of records) addRecord(index, r);
   return index;
+}
+
+// A fresh index without the records `ids` (accepted, pending or refused): rebuilt from what remains, so no map or
+// cache can keep a removed record. The acceptance head (`maxSeq`) never moves back: seqs are never reused.
+export function withoutRecords(index, ids) {
+  const next = buildIndex([...index.byId.values()].filter((r) => !ids.has(r.id)).sort((a, b) => a.seq - b.seq));
+  next.maxSeq = Math.max(next.maxSeq, index.maxSeq);
+  for (const [id, r] of index.pending) if (!ids.has(id)) addPending(next, r);
+  for (const [id, info] of index.rejected) if (!ids.has(id)) addRejected(next, id, info);
+  return next;
 }
 
 // ---- inboxes and membership ----
@@ -249,6 +263,17 @@ export function classify(index, rec) {
     }
     case 'msg':
       return classifyMsg(index, rec);
+    // Self-certifying (records.js recomputes its inbox id from the signer): it never waits.
+    case 'inbox-delete':
+      return accept;
+    case 'inbox-leave': {
+      const create = sharedCreate(index, p.inbox);
+      if (!create) return pending('INBOX_UNSEEN');
+      if (create.payload.signer !== p.to) return reject('NOT_OWNER');
+      const members = membersAt(index, p.inbox, p.epoch);
+      if (!members) return pending('EPOCH_UNSEEN');
+      return members.has(p.signer) ? accept : reject('NOT_MEMBER');
+    }
     default:
       return reject('BAD_PAYLOAD');
   }
@@ -263,6 +288,31 @@ export function admissionDue(index, inv) {
   if (currentMembers(index, p.inbox)?.has(p.to)) return false;
   const last = (index.members.get(p.inbox) ?? []).filter((m) => m.payload.member === p.to).reduce((mx, m) => Math.max(mx, m.seq), 0);
   return inv.seq > last;
+}
+
+// Whether the owner still owes `leave`'s signer its removal: the signer is a current member and no member record
+// naming it is newer (member seq) than the epoch the leave cites. A removal written first, or a re-admission written
+// before a stale leave arrived, wins.
+export function leaveDue(index, leave) {
+  const { inbox, signer, epoch } = leave.payload;
+  if (!currentMembers(index, inbox)?.has(signer)) return false;
+  return !(index.members.get(inbox) ?? []).some((m) => m.payload.member === signer && m.payload.seq > epoch);
+}
+
+// Why a record arriving now is dropped silently (never accepted, pending or refused), or null. `purged` is what this
+// install purged ({ids: Map id → inbox, dead: Set inbox}, docs/protocol.md → Closing an inbox):
+// 'PURGED' — this very record was removed here; 'DEAD_INBOX' — its inbox is a deleted shared inbox (a purged create,
+// or this owner's own kept delete); 'PURGED_DEPENDENCY' — it answers a purged invite or join request, or revokes a
+// personal invite purged here.
+export function dropOnArrival(index, purged, rec) {
+  const p = rec.payload;
+  if (purged.ids.has(rec.id)) return 'PURGED';
+  if (typeof p.inbox === 'string' && (purged.dead.has(p.inbox) || (index.deletes.get(p.inbox) ?? []).some((d) => d.payload.kind === 'shared'))) return 'DEAD_INBOX';
+  if (p.type === 'invite-response' && purged.ids.has(p.invite)) return 'PURGED_DEPENDENCY';
+  if (p.type === 'join-response' && purged.ids.has(p.request)) return 'PURGED_DEPENDENCY';
+  // The other party's revoke of a personal inbox this install already revoked (or learned was revoked).
+  if (p.type === 'inbox-delete' && p.kind === 'personal' && purged.ids.has(p.invite)) return 'PURGED_DEPENDENCY';
+  return null;
 }
 
 // A message is valid when it would still be accepted against everything known now (a later decline, removal or

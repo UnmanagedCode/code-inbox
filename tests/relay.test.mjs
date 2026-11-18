@@ -8,7 +8,7 @@ import { FILES } from '../src/store.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { routeKey } from '../src/transport/index.js';
 import { makeNetwork, syncAll, tmpDir } from './helpers.mjs';
-import { netNode } from './netHelpers.mjs';
+import { opener, restart, star } from './netHelpers.mjs';
 import { freePort, rawPeer, settle, waitFor } from './tcpHelpers.mjs';
 
 // The owner of a shared inbox relays its members' records (docs/transport.md → Owner relay): it serves every record
@@ -27,39 +27,6 @@ const bounded = (promise, what, ms = 3000) => Promise.race([
   promise,
   new Promise((_, reject) => { setTimeout(() => reject(new Error(`timed out waiting for ${what}`)), ms).unref(); }),
 ]);
-
-// netNode, closed after the test (a node closed earlier, e.g. for a restart, closes again harmlessly).
-const opener = (t) => async (name, opts) => {
-  const n = await netNode(name, opts);
-  t.after(() => n.close());
-  return n;
-};
-
-// An owner that listens (`ownerOpts`) and `names` members that connect only to it (each with `memberOpts(name)`
-// added), every member admitted to one shared inbox. → {owner, members, all, id, route}.
-async function star(t, names, { ownerOpts = {}, memberOpts = () => ({}) } = {}) {
-  const open = opener(t);
-  const owner = await open('owner', ownerOpts);
-  const members = [];
-  for (const name of names) members.push(await open(name, { listen: null, connections: [owner.addr()], ...memberOpts(name) }));
-  const all = [owner, ...members];
-  for (const m of members) await m.engine.importCard(owner.card());
-  await settle(all);
-  const { id } = await owner.engine.createSharedInbox('team');
-  for (const m of members) await owner.engine.inviteMember(id, m.fp);
-  await settle(all);
-  for (const m of members) await m.engine.respondInvite(m.engine.state().invites.incoming[0].id, true);
-  await settle(all, 3);
-  const team = owner.engine.listInboxes().find((b) => b.id === id);
-  assert.equal(team.members.length, names.length + 1, 'every member is admitted');
-  return { owner, members, all, id, route: { kind: 'inbox', id } };
-}
-
-// Restarts `node` from its data dir (its stored network settings), with `opts`.
-async function restart(t, node, opts = {}) {
-  await node.close();
-  return opener(t)(node.name, { dataDir: node.dataDir, ...opts });
-}
 
 // Ingests `bytes` with `writer` on `route` straight into `node`'s engine and asserts it was refused ROUTE_MISMATCH.
 async function refusedRouteMismatch(node, { route, writer, bytes }, what) {

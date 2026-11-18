@@ -5,8 +5,8 @@ import { formatFingerprint } from './identity.js';
 import { withLock } from './mutex.js';
 import { BODY_MAX_BYTES, FP_RE, ID_RE, NAME_RE, RECORD_MAX_BYTES, decodeCard, decodeRecord, encodeCard, encodeRecord, newNonce, personalInboxId, routeFor, sharedInboxId } from './records.js';
 import {
-  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, inboxVerdicts, isValidMessage, mayPull, mayRead, mayRelay, removePending, currentEpoch, currentMembers,
-  directory, inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharedOwner,
+  addPending, addRecord, addRejected, admissionDue, classify, contactsOf, createIndex, dropOnArrival, inboxVerdicts, isValidMessage, leaveDue, mayPull, mayRead, mayRelay, removePending, currentEpoch,
+  currentMembers, directory, inboxesOf, interestOf, invalidMessages, messagesOf, nameRefusal, pendingActions, personalInvite, responseOf, sharedCreate, sharedInboxes, sharedOwner, withoutRecords,
 } from './state.js';
 import { assertTransport, isRoute, routeKey, sameRoute } from './transport/index.js';
 import { checkStoredShareDir, ensureShareRoot, validateShareDir } from './transport/fileShare.js';
@@ -56,6 +56,11 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   let retryTimer = null; // cancel function of the armed outbox retry
   let stopped = false;
   let interestKey = '';
+  // The route keys of this install's current interest, kept whether or not a transport runs: ingest admits nothing
+  // on any other route.
+  let interestKeys = new Set();
+  // What this install purged (docs/protocol.md → Closing an inbox): ids → inbox, and the dead shared inbox ids.
+  let purged = { ids: new Map(), dead: new Set() };
   // The announces this install knows, in memory only (src/directory.js); `identities` is what of them persists
   // (identities.json): {fp: {announce: base64url, imported}} for card imports and every fp the log names.
   const known = createDirectory();
@@ -117,8 +122,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   }
 
   function refreshInterest() {
-    if (!transport) return false;
     const routes = interestOf(index, self);
+    interestKeys = new Set(routes.map(routeKey));
+    if (!transport) return false;
     const key = routes.map(routeKey).join(' ');
     if (key === interestKey) return false;
     interestKey = key;
@@ -130,35 +136,49 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
 
   // Decidable at acceptance and at boot replay alike: an inbox's inbox-create is always accepted before anything on it
   // (msg and member records pend INBOX_UNSEEN without it), and its owner never changes.
-  function remember(seq, payload, route, bytes) {
+  function remember(seq, id, payload, route, bytes) {
     if (payload.signer !== self && !(route.kind === 'inbox' && sharedOwner(index, route.id) === self)) return;
     const key = routeKey(route);
-    const e = { seq, bytes, signer: payload.signer };
+    const e = { seq, id, bytes, signer: payload.signer };
     const list = serveLog.get(key);
     if (list) list.push(e); else serveLog.set(key, [e]);
   }
 
   // `after` collects what an acceptance owes once the index settles: `reactions` (acceptances of this install's
-  // shared invites, which admit) and `relays` (a co-member's message on a shared inbox this install owns).
+  // shared invites, which admit), `relays` (a co-member's message on a shared inbox this install owns), `closings`
+  // (an inbox-delete, or this install's own inbox-leave: each purges its inbox) and `leaves` (a member leaving a
+  // shared inbox this install owns, which removes it).
   async function acceptRecord(rec, after) {
     const seq = await store.appendAccepted({ id: rec.id, route: rec.route, bytes: rec.bytes });
     const entry = { seq, id: rec.id, payload: rec.payload, route: rec.route };
     addRecord(index, entry);
-    remember(seq, rec.payload, rec.route, rec.bytes);
+    remember(seq, rec.id, rec.payload, rec.route, rec.bytes);
     const p = rec.payload;
     if (p.type === 'msg') events.emit('message', { seq, id: rec.id, inbox: p.inbox, signer: p.signer });
     if (p.type === 'invite-response' && p.accept && p.to === self) after.reactions.push(rec);
     if (p.type === 'msg' && p.signer !== self && sharedOwner(index, p.inbox) === self) after.relays.push(rec);
+    if (p.type === 'inbox-delete' || (p.type === 'inbox-leave' && p.signer === self)) after.closings.push(entry);
+    if (p.type === 'inbox-leave' && p.to === self) after.leaves.push(entry);
   }
 
+  const owes = () => ({ reactions: [], relays: [], closings: [], leaves: [] });
+
   // An accepted response to this install's shared invite admits the invitee (an admission is a member record), but
-  // only while admissionDue holds: a replayed acceptance of an invite older than a removal admits nobody.
-  async function react(reactions) {
+  // only while admissionDue holds: a replayed acceptance of an invite older than a removal admits nobody. An accepted
+  // leave removes its member, exactly as removeMember would, while leaveDue holds: a newer member record wins.
+  async function react({ reactions, leaves }) {
     for (const rec of reactions) {
       const inv = index.invites.get(rec.payload.invite);
       if (!inv || inv.payload.signer !== self || !admissionDue(index, inv)) continue;
       await writeMember(inv.payload.inbox, 'add', inv.payload.to);
     }
+    for (const leave of leaves) await removeLeaver(leave);
+  }
+
+  async function removeLeaver(leave) {
+    if (!leaveDue(index, leave)) return;
+    const { inbox, signer } = leave.payload;
+    await writeMember(inbox, 'remove', signer, { keepHead: lastValidOf(inbox, signer) });
   }
 
   // The owner's live relay: a member's message it just accepted goes on to every other current member at once.
@@ -177,11 +197,13 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     }
   }
 
-  // Admissions owed for acceptances accepted before a crash or restart (react runs only as a record arrives).
-  async function reconcileAdmissions() {
+  // Admissions and leave removals owed for records accepted before a crash or restart (react runs only as a record
+  // arrives).
+  async function reconcileOwed() {
     for (const inv of [...index.invites.values()]) {
       if (inv.payload.signer === self && admissionDue(index, inv)) await writeMember(inv.payload.inbox, 'add', inv.payload.to);
     }
+    for (const leave of [...index.leaves.values()].flat()) if (leave.payload.to === self) await removeLeaver(leave);
   }
 
   // Refuses a record for good: counted, and its id remembered (persisted) so what builds on it is refused too.
@@ -193,11 +215,14 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     await store.appendRejected({ id: rec.id, ...info });
   }
 
-  // Classifies a verified, route-bound record; any verdict may settle pending ones, so pending is drained after.
+  // Classifies a verified, route-bound record; any verdict may settle pending ones, so pending is drained after. A
+  // record of an inbox this install closed is dropped silently first (dropOnArrival): never accepted, pending or
+  // refused, so it cannot bring the inbox back.
   async function admit(rec) {
     if (index.byId.has(rec.id) || index.pending.has(rec.id) || index.rejected.has(rec.id)) return;
+    if (dropOnArrival(index, purged, rec)) return;
     const c = classify(index, rec);
-    const after = { reactions: [], relays: [] };
+    const after = owes();
     if (c.verdict === 'reject') await rejectRecord(rec, c.reason);
     else if (c.verdict === 'pending') {
       addPending(index, rec);
@@ -205,11 +230,89 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     } else await acceptRecord(rec, after);
     // Even a pending record can settle others: a removal's kept chain is walked through pending records.
     await drainPending(after);
+    for (const closing of after.closings) await purgeInbox(closing);
+    // What a purge removed owes nothing any more.
+    const live = (r) => index.byId.has(r.id);
     await persistNewPins();
     await syncIdentities();
     refreshInterest();
-    await react(after.reactions);
-    await relayOut(after.relays);
+    await react({ reactions: after.reactions.filter(live), leaves: after.leaves.filter(live) });
+    await relayOut(after.relays.filter(live));
+  }
+
+  // What a closing removes here: `records`, by id → {type, accepted}: every record of its inbox (accepted, pending,
+  // refused); `outbox`: the outbox entries of its inbox that go (those of removed records, and any whose record is
+  // not in the log); `cursor`: whether a read cursor of the inbox is held. The install that signed the closing keeps
+  // the closing itself (others fetch it from here) and only removes what it accepted before it; a leaver also keeps
+  // the inbox's create (its directory row) and its own leaves.
+  function purgeTargets(closing) {
+    const { inbox } = closing.payload;
+    const own = closing.payload.signer === self;
+    const keeps = (r) => own && (r.id === closing.id || r.seq > closing.seq || (closing.payload.type === 'inbox-leave'
+      && (r.payload.type === 'inbox-create' || (r.payload.type === 'inbox-leave' && r.payload.signer === self))));
+    const records = new Map();
+    for (const r of index.byId.values()) if (r.payload.inbox === inbox && !keeps(r)) records.set(r.id, { type: r.payload.type, accepted: true });
+    for (const r of index.pending.values()) if (r.payload.inbox === inbox) records.set(r.id, { type: r.payload.type, accepted: false });
+    for (const [id, info] of index.rejected) if (info.inbox === inbox) records.set(id, { type: info.type, accepted: false });
+    const outboxIds = new Set();
+    for (const e of outbox) {
+      const d = decodeRecord(e.bytes);
+      if (!d.ok || d.payload.inbox !== inbox) continue;
+      if (records.has(d.id) || (!index.byId.has(d.id) && d.id !== closing.id)) outboxIds.add(d.id);
+    }
+    return { records, outbox: outboxIds, cursor: Object.hasOwn(cursors, inbox) };
+  }
+
+  // Removes a closed inbox's records from this install (docs/protocol.md → Closing an inbox): the log, pending,
+  // refused ids, the served log, the outbox, the read cursor, and the route of interest (so the transport forgets
+  // where it was on it). The ids of removed records that do not travel on the inbox route go on the purge list, so a
+  // copy offered again is dropped; inbox-route records stay off it, so a rejoin can fetch them again.
+  // Crash order: every durable step comes before the one that takes the closing out of accepted.ndjson (the last
+  // write of store.dropRecords), so a crash at any point leaves either the closing in the log, for boot to purge
+  // again (finishPurges), or nothing left to purge.
+  async function purgeInbox(closing) {
+    const targets = purgeTargets(closing);
+    const removed = targets.records;
+    if (!removed.size && !targets.outbox.size && !targets.cursor) return;
+    const p = closing.payload;
+    const sharedDelete = p.type === 'inbox-delete' && p.kind === 'shared';
+    const entries = [];
+    for (const [id, { type }] of removed) {
+      if (routeFor({ type }).kind === 'inbox') continue;
+      entries.push({ id, inbox: p.inbox, dead: sharedDelete && (id === closing.id || type === 'inbox-create') });
+    }
+    if (p.type === 'inbox-delete' && p.kind === 'personal' && !purged.ids.has(p.invite) && !removed.has(p.invite)) entries.push({ id: p.invite, inbox: p.inbox, dead: false });
+    const fresh = entries.filter((e) => !purged.ids.has(e.id));
+    if (fresh.length) {
+      await store.appendPurged(fresh);
+      for (const e of fresh) notePurged(e);
+    }
+    const ids = new Set(removed.keys());
+    if ([...index.pending.keys()].some((id) => ids.has(id))) await store.savePending([...index.pending.values()].filter((r) => !ids.has(r.id)));
+    if (targets.outbox.size) {
+      outbox = outbox.filter((e) => !targets.outbox.has(decodeRecord(e.bytes).id));
+      await saveOutbox();
+    }
+    if (targets.cursor) {
+      const { [p.inbox]: _gone, ...rest } = cursors;
+      cursors = rest;
+      await store.saveCursors(cursors);
+    }
+    // Last: refused ids, then the log, the closing included on a receiver.
+    if (ids.size) await store.dropRecords(ids);
+    index = withoutRecords(index, ids);
+    for (const [key, list] of serveLog) {
+      const kept = list.filter((e) => !ids.has(e.id));
+      if (kept.length) serveLog.set(key, kept); else serveLog.delete(key);
+    }
+    await persistNewPins();
+    await syncIdentities();
+    refreshInterest();
+  }
+
+  function notePurged({ id, inbox, dead }) {
+    purged.ids.set(id, inbox);
+    if (dead) purged.dead.add(inbox);
   }
 
   // Re-classifies every pending record until a round settles none; settled ones leave the pending set.
@@ -229,6 +332,24 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     if (changed) await store.savePending([...index.pending.values()]);
   }
 
+  // At boot: every closing whose purge a crash interrupted. Another install's delete still in the log is always
+  // purged (a receiver's purge removes it last). An own closing is, when the purge would remove a record accepted
+  // before it, or when it is the inbox's last record and pending, refused, outbox or cursor leftovers of the inbox
+  // remain; once a later record of the inbox exists (a rejoin), those belong to it and are never touched.
+  async function finishPurges() {
+    const closings = [...index.deletes.values(), ...index.leaves.values()].flat()
+      .filter((r) => r.payload.type === 'inbox-delete' || r.payload.signer === self)
+      .sort((a, b) => a.seq - b.seq);
+    for (const closing of closings) {
+      if (!index.byId.has(closing.id)) continue;
+      if (closing.payload.signer !== self) { await purgeInbox(closing); continue; }
+      const t = purgeTargets(closing);
+      const later = [...index.byId.values()].some((r) => r.payload.inbox === closing.payload.inbox && r.seq > closing.seq);
+      const leftovers = t.records.size > 0 || t.outbox.size > 0 || t.cursor;
+      if ([...t.records.values()].some((x) => x.accepted) || (!later && leftovers)) await purgeInbox(closing);
+    }
+  }
+
   // The transport's sink: `retry` only while the bytes may still be arriving. The writer must be the record's signer,
   // except for the owner relaying a member's message on its shared inbox (mayRelay); the route must be the record's.
   function ingest({ route, writer, bytes }) {
@@ -243,6 +364,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         noteReject('ROUTE_MISMATCH', `${d.payload.type} arrived on ${isRoute(route) ? routeKey(route) : 'an invalid route'}`, d.id);
         return { retry: false };
       }
+      // Only routes this install wants now: a record offered just before its inbox was closed here is dropped.
+      if (!interestKeys.has(routeKey(route))) return { retry: false };
       if (d.payload.type === 'announce') await noteAnnounce(d, bytes);
       else await admit({ id: d.id, payload: d.payload, route, bytes: Buffer.from(bytes) });
       return { retry: false };
@@ -264,6 +387,16 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
   function recipientsOf(p) {
     // An inbox-create goes to the contacts; anyone else gets it from this install's directory route when it pulls.
     if (p.type === 'inbox-create') return contactsOf(index, self, imported());
+    // A shared delete goes to everyone the inbox's records name: members past and present, invitees, requesters.
+    if (p.type === 'inbox-delete' && p.kind === 'shared') {
+      const set = new Set();
+      for (const r of [...index.byId.values(), ...index.pending.values()]) {
+        if (r.payload.inbox !== p.inbox) continue;
+        for (const fp of [r.payload.signer, r.payload.to, r.payload.member]) if (typeof fp === 'string') set.add(fp);
+      }
+      set.delete(self);
+      return [...set];
+    }
     if ('to' in p) return [p.to];
     const inv = personalInvite(index, p.inbox);
     const set = new Set(inv ? [inv.payload.signer, inv.payload.to] : currentMembers(index, p.inbox) ?? []);
@@ -506,6 +639,8 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       identities = loaded.identities;
       cursors = loaded.cursors;
       outbox = loaded.outbox;
+      purged = { ids: new Map(), dead: new Set() };
+      for (const e of loaded.purged) notePurged(e);
       index = createIndex();
       // identities.json entries were verified as their fp's announces by the store.
       for (const { announce } of Object.values(identities)) {
@@ -519,18 +654,26 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         if (!d.ok) { log.warn(`code-inbox: accepted record seq ${e.seq} no longer decodes (${d.reason}): skipped`); continue; }
         if (d.payload.type === 'announce') { log.warn(`code-inbox: accepted record seq ${e.seq} is an announce, which the log no longer holds: skipped`); continue; }
         addRecord(index, { seq: e.seq, id: d.id, payload: d.payload, route: e.route });
-        remember(e.seq, d.payload, e.route, e.bytes);
+        remember(e.seq, d.id, d.payload, e.route, e.bytes);
       }
+      // Seqs of purged lines are never reused, and the head peers pull against never moves back.
+      index.maxSeq = Math.max(index.maxSeq, loaded.lastSeq);
       for (const { id, ...info } of loaded.rejected) addRejected(index, id, info);
       for (const e of loaded.pending) {
         const d = decodeRecord(e.bytes);
         if (d.ok && d.payload.type !== 'announce' && !index.byId.has(d.id) && !index.rejected.has(d.id)) addPending(index, { id: d.id, payload: d.payload, route: e.route, bytes: e.bytes });
       }
-      // Close the crash windows: pending records whose dependency was settled, and admissions not yet written.
-      // Reactions and relays wait: admissions are reconciled once a transport runs, and members pull what is relayed.
-      await drainPending({ reactions: [], relays: [] });
-      if (index.pending.size !== loaded.pending.length) await store.savePending([...index.pending.values()]);
+      // Close the crash windows: purges interrupted after their closing was accepted, pending records whose
+      // dependency was settled, and admissions or leave removals not yet written. Reactions and relays wait: what is
+      // owed is reconciled once a transport runs, and members pull what is relayed.
+      await finishPurges();
+      const pendingBefore = index.pending.size;
+      const after = owes();
+      await drainPending(after);
+      for (const closing of after.closings) await purgeInbox(closing);
+      if (index.pending.size !== pendingBefore || pendingBefore !== loaded.pending.length) await store.savePending([...index.pending.values()]);
       await persistNewPins();
+      refreshInterest();
       if (settings.transport) {
         // A stored config is checked like a saved one: an invalid one leaves no transport, with the reason shown.
         let config;
@@ -549,7 +692,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
           log.warn(`code-inbox: ${err.message}`);
           return;
         }
-        await locked(async () => { await reconcileAdmissions(); await flushOutbox(); });
+        await locked(async () => { await reconcileOwed(); await flushOutbox(); });
       }
     },
 
@@ -594,7 +737,7 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         settings = { ...settings, transport: { kind: 'file-share', dir: shareDir } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
-        await reconcileAdmissions();
+        await reconcileOwed();
         await flushOutbox();
         return { shareDir };
       });
@@ -610,8 +753,9 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         settings = { ...settings, transport: { kind: 'network', ...cfg } };
         await store.saveSettings(settings);
         await startTransport(settings.transport);
-        // Admissions owed since a boot that started no transport (e.g. the port was taken then), and the outbox.
-        await reconcileAdmissions();
+        // Admissions and removals owed since a boot that started no transport (e.g. the port was taken then), and the
+        // outbox.
+        await reconcileOwed();
         await flushOutbox();
         return { ...cfg, listening: transport.stats().listening };
       });
@@ -748,6 +892,38 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
         // Every reader keeps the member's messages on the prev chain back from the last one valid here
         // (docs/protocol.md → Removal): a fixed-size record however busy the member was.
         return { id: await writeMember(inbox, 'remove', member, { keepHead: lastValidOf(inbox, member) }) };
+      });
+    },
+
+    // Closes an inbox for every install: the owner's Delete of a shared inbox, or either party's Revoke of an accepted
+    // personal one. Refused TRANSPORT_UNCONFIGURED, INBOX_UNKNOWN, NOT_OWNER (shared, not the owner), NOT_MEMBER
+    // (personal, not a party of an accepted inbox: an open invite is not revoked).
+    deleteInbox(inbox) {
+      return locked(async () => {
+        requireTransport();
+        const valid = typeof inbox === 'string' && ID_RE.test(inbox);
+        const create = valid ? sharedCreate(index, inbox) : null;
+        const invite = valid ? personalInvite(index, inbox) : null;
+        if (!create && !invite) refuse('INBOX_UNKNOWN', `no inbox ${String(inbox).slice(0, 40)}`);
+        if (create) {
+          if (create.payload.signer !== self) refuse('NOT_OWNER', 'only the inbox owner can delete it');
+          return { id: await publish({ type: 'inbox-delete', kind: 'shared', inbox, nonce: create.payload.nonce }) };
+        }
+        const mine = inboxesOf(index, self).find((b) => b.id === inbox);
+        if (!mine) refuse('NOT_MEMBER', 'this install is not a party of that accepted personal inbox');
+        return { id: await publish({ type: 'inbox-delete', kind: 'personal', inbox, nonce: invite.payload.nonce, to: mine.peer, invite: invite.id }) };
+      });
+    },
+
+    // A member leaves a shared inbox; the owner answers with its removal. Refused TRANSPORT_UNCONFIGURED,
+    // INBOX_UNKNOWN, NOT_MEMBER, BAD_REQUEST (a personal inbox is revoked, not left), OWNER_CANNOT_LEAVE.
+    leaveInbox(inbox) {
+      return locked(async () => {
+        requireTransport();
+        const b = myInbox(inbox);
+        if (b.kind === 'personal') refuse('BAD_REQUEST', 'a personal inbox is revoked, not left');
+        if (b.owner === self) refuse('OWNER_CANNOT_LEAVE', 'the owner deletes its inbox');
+        return { id: await publish({ type: 'inbox-leave', to: b.owner, inbox, epoch: currentEpoch(index, inbox) }) };
       });
     },
 

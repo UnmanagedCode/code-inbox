@@ -107,3 +107,41 @@ test('identities.json entries that do not verify are dropped on load', async () 
   assert.equal(log.lines.filter((l) => l.includes('identities.json')).length, 5);
   assert.equal(FILES.contacts, undefined);
 });
+
+// Invariant: an acceptance seq is never reused. dropRecords rewrites accepted.ndjson and rejected.ndjson without the
+// ids, and the next seq, after a reload too, stays above every seq ever assigned even when the newest line was dropped.
+test('dropRecords rewrites accepted and rejected without the ids, and the next seq after a reload stays above the old maximum even when the newest line was dropped', async () => {
+  const dataDir = tmpDir();
+  const store = createStore(dataDir);
+  await store.load();
+  const route = { kind: 'directory' };
+  const [a, b, c] = ['a', 'b', 'c'].map((x) => x.repeat(32));
+  for (const id of [a, b, c]) await store.appendAccepted({ id, route, bytes: Buffer.from(id) });
+  await store.appendRejected({ id: 'd'.repeat(32), reason: 'NOT_MEMBER', type: 'msg', inbox: null, signer: 'e'.repeat(64) });
+  await store.appendRejected({ id: 'f'.repeat(32), reason: 'NOT_MEMBER', type: 'msg', inbox: null, signer: 'e'.repeat(64) });
+  await store.dropRecords(new Set([b, c, 'd'.repeat(32)]));
+  const loaded = await createStore(dataDir).load();
+  assert.deepEqual(loaded.accepted.map((e) => [e.seq, e.id]), [[1, a]]);
+  assert.deepEqual(loaded.rejected.map((e) => e.id), ['f'.repeat(32)]);
+  assert.equal(loaded.lastSeq, 3, 'load reports the highest seq ever assigned');
+  assert.equal(await store.appendAccepted({ id: 'g'.repeat(32), route, bytes: Buffer.from('g') }), 4, 'the same store');
+  await store.dropRecords(new Set(['g'.repeat(32)]));
+  const again = createStore(dataDir);
+  await again.load();
+  assert.equal(await again.appendAccepted({ id: 'h'.repeat(32), route, bytes: Buffer.from('h') }), 5, 'after a reload');
+});
+
+// Invariant: the purge list survives a restart; a torn last line (a crash mid-append) loses only that entry.
+test('appendPurged round-trips through load; a torn last line is skipped', async () => {
+  const dataDir = tmpDir();
+  const store = createStore(dataDir);
+  assert.deepEqual((await store.load()).purged, []);
+  const entries = [{ id: 'a'.repeat(32), inbox: 'c'.repeat(32), dead: true }, { id: 'b'.repeat(32), inbox: 'c'.repeat(32), dead: false }];
+  await store.appendPurged(entries.slice(0, 1));
+  await store.appendPurged(entries.slice(1));
+  fs.appendFileSync(path.join(dataDir, FILES.purged), '{"id":"ddd');
+  const log = captureLog();
+  const loaded = await createStore(dataDir, { log }).load();
+  assert.deepEqual(loaded.purged, entries);
+  assert.equal(log.lines.length, 1);
+});

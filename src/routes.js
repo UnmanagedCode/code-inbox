@@ -27,6 +27,7 @@ export const STATUS = {
   INVITE_ANSWERED: 409,
   REQUEST_EXISTS: 409,
   REQUEST_ANSWERED: 409,
+  OWNER_CANNOT_LEAVE: 409,
   BODY_TOO_LARGE: 413,
   RECORD_TOO_LARGE: 413,
   PAYLOAD_TOO_LARGE: 413,
@@ -73,6 +74,8 @@ export function buildRoutes({ engine, notifier, cc, mcp }) {
     post(new RegExp(`^/api/inboxes/${id}/join$`), ({ params }) => engine.requestJoin(params[0])),
     post(new RegExp(`^/api/join-requests/${id}/respond$`), ({ params, body }) => engine.respondJoin(params[0], field(body, 'accept'))),
     post(new RegExp(`^/api/inboxes/${id}/members/${id}/remove$`), ({ params }) => engine.removeMember(params[0], params[1])),
+    post(new RegExp(`^/api/inboxes/${id}/delete$`), ({ params }) => engine.deleteInbox(params[0])),
+    post(new RegExp(`^/api/inboxes/${id}/leave$`), ({ params }) => engine.leaveInbox(params[0])),
     post(new RegExp(`^/api/inboxes/${id}/messages$`), ({ params, body }) => engine.sendMessage(params[0], field(body, 'body'))),
     post(/^\/api\/notify$/, async ({ body }) => {
       const sessionId = field(body, 'sessionId');

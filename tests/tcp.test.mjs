@@ -757,3 +757,45 @@ test('wire threads the injected clock through to the network endpoint', async (t
   clock.advance(1);
   await waitFor(() => raw.closed, 'the handshake deadline on the fake clock', 2000);
 });
+
+// Invariant (the delivery-position contract): when a route leaves the interest its pull cursors are dropped, in
+// memory (it is pulled from 0 when it returns) and in pull-cursors.json; a cursor file loaded at the next start keeps
+// only the routes of interest.
+test('pull cursors of a route that leaves the interest are dropped in memory and in pull-cursors.json, and at the next start', async (t) => {
+  const peer = await newIdentity();
+  const team = { kind: 'inbox', id: 'c'.repeat(32) };
+  const directory = { kind: 'directory' };
+  const teamKey = routeKey(team);
+  const fileCursors = (data) => ({ saved: [], load: async () => structuredClone(data), async save(c) { this.saved.push(structuredClone(c)); } });
+  const cursors = fileCursors({ [peer.fp]: { [teamKey]: 5, directory: 2 } });
+  const identity = await newIdentity();
+  const endpoint = createNetworkEndpoint({ listen: { port: 0 }, connections: [], syncMs: 3_600_000, log: silentLog });
+  t.after(() => endpoint.close());
+  const transport = endpoint.attach({ identity: proofSigner(identity), view: stubView(), cursors });
+  transport.setInterest([directory, team]);
+  await transport.start(stubSink());
+  assert.deepEqual(cursors.saved, [], 'every cursor is of interest: nothing to save');
+  const pulls = [];
+  const raw = await rawPeer(endpoint.stats().listening.port, peer, identity.fp, { onFrame: (f) => { if (f.t === 'pull') pulls.push(f); } });
+  t.after(() => raw.destroy());
+  const sinceOf = (key) => pulls.flatMap((f) => f.routes).filter((r) => routeKey(r.route) === key).map((r) => r.since);
+  await waitFor(() => sinceOf(teamKey).length > 0, 'the first pull');
+  assert.deepEqual(sinceOf(teamKey), [5]);
+  transport.setInterest([directory]);
+  await transport.sync();
+  assert.deepEqual(cursors.saved.at(-1), { [peer.fp]: { directory: 2 } }, 'pull-cursors.json loses the route');
+  pulls.length = 0;
+  transport.setInterest([directory, team]);
+  await waitFor(() => sinceOf(teamKey).length > 0, 'the pull of the returning route');
+  assert.deepEqual(sinceOf(teamKey), [0], 'pulled from the start');
+
+  // The next start: a cursor file still holding a route outside the interest is pruned on load.
+  const later = fileCursors({ [peer.fp]: { [teamKey]: 5, directory: 2 } });
+  const endpoint2 = createNetworkEndpoint({ listen: null, connections: [], syncMs: 3_600_000, log: silentLog });
+  t.after(() => endpoint2.close());
+  const transport2 = endpoint2.attach({ identity: proofSigner(await newIdentity()), view: stubView(), cursors: later });
+  transport2.setInterest([directory]);
+  await transport2.start(stubSink());
+  await transport2.sync();
+  assert.deepEqual(later.saved.at(-1), { [peer.fp]: { directory: 2 } });
+});

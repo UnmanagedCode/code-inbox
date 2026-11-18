@@ -5,10 +5,11 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { createEngine } from '../src/engine.js';
 import { loadIdentity } from '../src/identity.js';
-import { encodeRecord, sharedInboxId as sharedId } from '../src/records.js';
+import { decodeRecord, encodeRecord, sharedInboxId as sharedId } from '../src/records.js';
 import { createStore } from '../src/store.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { makeInstall, makeNetwork, silentLog, syncAll, tmpDir } from './helpers.mjs';
+import { holdings } from './closeHarness.mjs';
 
 // The removal rule end to end: what a removed member signs is never accepted unless the owner held that exact
 // message when it removed them, and every reader that ends with the same records holds the same valid and refused sets.
@@ -133,17 +134,28 @@ function shareRecords(shareDir) {
   }).sort((x, y) => (x.rel < y.rel ? -1 : 1));
 }
 
-// A fresh install that only ingests what it is handed, in the order handed.
-async function reader(records) {
+// A fresh install that only ingests what it is handed, in the order handed. The engine admits only routes of its
+// interest, so a reader of a shared inbox first gets a fixed prefix (`admitted(fp)`: the inbox's create and an owner
+// invite to the reader); the order under test follows. The INBOX_UNSEEN ordering is pinned in tests/state.test.mjs.
+async function reader(records, admitted = () => []) {
   const dataDir = tmpDir('code-inbox-reader-');
   const store = createStore(dataDir, { log: silentLog });
   await store.load();
   const identity = await loadIdentity(dataDir);
   const engine = createEngine({ store, identity, log: silentLog, makeTransport: () => { throw new Error('a reader has no transport'); } });
   await engine.boot();
-  for (const r of records) await engine.ingest(r);
+  for (const r of [...admitted(identity.fp), ...records]) await engine.ingest(r);
   return { engine, dataDir };
 }
+
+// The prefix that puts `inbox` in a reader's interest: its create (from the share) and an invite to the reader signed
+// by `owner` (an identity).
+const invitedBy = (owner, records, inbox) => (fp) => {
+  const create = records.find((r) => r.route.kind === 'directory' && decodeRecord(r.bytes).payload.type === 'inbox-create' && decodeRecord(r.bytes).payload.inbox === inbox);
+  const { nonce } = decodeRecord(create.bytes).payload;
+  const invite = encodeRecord(owner, { type: 'invite', signer: owner.fp, ts: Date.now(), to: fp, kind: 'shared', inbox, nonce });
+  return [create, { route: { kind: 'mailbox', fp }, writer: owner.fp, bytes: invite.bytes }];
+};
 
 function seeded(seed) {
   let t = seed >>> 0;
@@ -193,6 +205,7 @@ test('readers fed the same records in any order reach the same valid and refused
   await syncAll(installs);
 
   const records = shareRecords(shareDir);
+  const admitted = invitedBy(await loadIdentity(a.dataDir), records, inbox);
   const owner = a.engine.verdicts(inbox);
   assert.deepEqual(bodiesOf(a, inbox).sort(), ['b1', 'b2', 'b3', 'd1', 'd2'].sort());
   assert.deepEqual(owner.pending, []);
@@ -207,7 +220,7 @@ test('readers fed the same records in any order reach the same valid and refused
     ...Array.from({ length: 12 }, (_, i) => [`seed ${i + 1}`, shuffle(records, i + 1)]),
   ];
   for (const [label, order] of orders) {
-    const r = await reader(order);
+    const r = await reader(order, admitted);
     const v = r.engine.verdicts(inbox);
     assert.deepEqual(v.pending, [], `${label}: nothing pending`);
     assert.deepEqual(v.valid, owner.valid, `${label}: the same valid messages as the owner`);
@@ -254,7 +267,8 @@ test('a refusal of a link a cached walk crossed invalidates the walk; verdicts m
     return engine;
   };
   const engine = await boot();
-  for (const x of [at(create, { kind: 'directory' }, owner.fp), at(add1, onInbox, owner.fp), at(P, onInbox, carol.fp), at(remove3, onInbox, owner.fp), at(H, onInbox, carol.fp)]) await engine.ingest(x);
+  const invite = encodeRecord(owner, { type: 'invite', signer: owner.fp, ts: 2, to: engine.fp, kind: 'shared', inbox, nonce });
+  for (const x of [at(create, { kind: 'directory' }, owner.fp), at(invite, { kind: 'mailbox', fp: engine.fp }, owner.fp), at(add1, onInbox, owner.fp), at(P, onInbox, carol.fp), at(remove3, onInbox, owner.fp), at(H, onInbox, carol.fp)]) await engine.ingest(x);
   assert.deepEqual(engine.verdicts(inbox).pending, [H.id], 'H waits for epoch 2');
   assert.deepEqual(engine.verdicts(inbox).valid, [P.id], 'the seq-3 walk through the pending H reaches P, and is cached');
   await engine.ingest(at(remove2, onInbox, owner.fp)); // epoch 2 removes carol: H is refused NOT_MEMBER
@@ -265,4 +279,32 @@ test('a refusal of a link a cached walk crossed invalidates the walk; verdicts m
   const fresh = (await boot()).verdicts(inbox);
   assert.deepEqual(running, fresh, 'the running reader agrees with a fresh boot of its data dir');
   assert.deepEqual(fresh.valid, [], 'P is off the seq-3 chain once H is refused');
+});
+
+// Invariant: a delete does not depend on arrival order: readers fed a shared inbox's whole record set and its
+// delete, in many seeded orders, end with nothing of the inbox (no record in any file, no row) and nothing pending.
+test('readers fed a shared inbox\'s records and its delete in any order end with nothing of it and nothing pending', { timeout: 120_000 }, async () => {
+  const { shareDir, installs, inbox } = await team(['alice', 'bob', 'dave']);
+  const [a, b, d] = installs;
+  await b.engine.sendMessage(inbox, 'b1');
+  await d.engine.sendMessage(inbox, 'd1');
+  await syncAll(installs);
+  await a.engine.removeMember(inbox, d.fp);
+  await b.engine.sendMessage(inbox, 'b2');
+  await a.engine.inviteMember(inbox, d.fp);
+  await syncAll(installs);
+  await a.engine.deleteInbox(inbox);
+  const records = shareRecords(shareDir);
+  const admitted = invitedBy(await loadIdentity(a.dataDir), records, inbox);
+  const orders = [['share order', records], ['reversed', [...records].reverse()], ...Array.from({ length: 10 }, (_, i) => [`seed ${i + 1}`, shuffle(records, i + 1)])];
+  for (const [label, order] of orders) {
+    const r = await reader(order, admitted);
+    const s = r.engine.state();
+    assert.equal(s.diagnostics.pending, 0, `${label}: nothing pending`);
+    assert.ok(!s.sharedInboxes.some((x) => x.id === inbox), `${label}: no directory row`);
+    assert.deepEqual(s.invites.incoming, [], `${label}: no invite`);
+    assert.deepEqual(r.engine.verdicts(inbox), { valid: [], invalid: [], pending: [], rejected: [] }, `${label}: no message`);
+    assert.deepEqual(await holdings(r.dataDir, inbox), [], `${label}: nothing in the data dir`);
+  }
+  for (const x of installs) await x.close();
 });

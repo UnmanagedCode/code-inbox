@@ -268,3 +268,25 @@ test('a share whose code-inbox is a link is refused at save time', async (t) => 
   await assert.rejects(a.engine.setShare(shareDir), { code: 'SHARE_UNSAFE' });
   assert.deepEqual(fs.readdirSync(outside), []);
 });
+
+// Invariant (the delivery-position contract): a route that leaves the interest is forgotten, so its files are offered
+// again when it returns; a route that stays in the interest never offers a handed-over file twice.
+test('a route that leaves the interest is scanned afresh when it returns; a route that stays is never offered again', async () => {
+  const { me, t, offers } = await recordingShare();
+  const directory = { kind: 'directory' };
+  const inbox = { kind: 'inbox', id: 'a'.repeat(32) };
+  await t.send(announceOf(me, 'alice'), { route: directory, to: [] });
+  await t.send(announceOf(me, 'alicia'), { route: inbox, to: [] });
+  t.setInterest([directory, inbox]);
+  await t.sync();
+  const count = (route) => offers.filter((i) => i.route.kind === route.kind).length;
+  assert.deepEqual([count(directory), count(inbox)], [1, 1]);
+  t.setInterest([directory, inbox]);
+  await t.sync();
+  assert.deepEqual([count(directory), count(inbox)], [1, 1], 'unchanged interest offers nothing again');
+  t.setInterest([directory]);
+  t.setInterest([directory, inbox]);
+  await t.sync();
+  assert.deepEqual([count(directory), count(inbox)], [1, 2]);
+  await t.stop();
+});
