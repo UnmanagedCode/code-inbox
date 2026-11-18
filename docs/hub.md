@@ -1,12 +1,12 @@
 # Hub
 
-A hub is a standalone router for installs that cannot reach each other directly (behind NAT, across networks). Every install dials out to the same hub, proves its fingerprints on that connection, and opens **streams** to other fingerprints through it. The unchanged endpoint handshake (`hello` / `prove` / `ok`, [protocol.md → Handshake](protocol.md#handshake)) and every session frame run inside a stream, so:
+A hub is a standalone router for installs that cannot reach each other directly (behind NAT, across networks). Installs add a connection to it; it proves their fingerprints on that link, keeps every link told who else is registered (the **roster**), and carries **streams** between fingerprints. The unchanged endpoint handshake (`hello` / `prove` / `ok`, [protocol.md → Handshake](protocol.md#handshake)) and every session frame run inside a stream, so:
 
 - the writer of a record is still the `from` the **remote endpoint** proved, never the hub's word;
-- the hub moves opaque bytes: it parses only its own link frames, never a tunneled byte;
-- the hub stores nothing, holds no key and signs nothing. It is never trusted for authenticity, but it **sees everything** it relays (see [Hub security](#hub-security)).
+- the hub moves opaque bytes: it parses only its own link frames (and checks the announces clients give it), never a tunneled byte;
+- the hub stores nothing on disk, holds no key and signs nothing. It is never trusted for authenticity, and it **sees everything** it relays ([Hub security](#hub-security)).
 
-Wire format: [protocol.md → Hub link wire format](protocol.md#hub-link-wire-format). The client shares the endpoint core with direct TCP: [transport.md → Endpoint and bindings](transport.md#endpoint-and-bindings).
+Wire format: [protocol.md → Hub link wire format](protocol.md#hub-link-wire-format). A connection detects a hub from its `hello` and becomes a hub link ([The hub mode of a connection](#the-hub-mode-of-a-connection)); the endpoint core is shared with direct sessions ([transport.md → Network endpoint](transport.md#network-endpoint-srctransportnetworkjs-endpointjs)).
 
 ## Running the hub
 
@@ -19,9 +19,9 @@ Wire format: [protocol.md → Hub link wire format](protocol.md#hub-link-wire-fo
 | Refusals | A bad or unknown flag (strict `util.parseArgs`), a host that is not a host, or a port outside 0–65535 (`validateHubListen`): the reason and usage on stderr, exit 2 |
 | Stop | SIGTERM / SIGINT → `hub.close()` → exit 0 |
 | State | None. A restart loses nothing: clients reconnect and re-register, and writes made meanwhile wait in their outboxes |
-| Imports | Nothing of the plugin host (`server.js`, the engine, store, state, routes, HTTP, MCP, notifier, cc client, config): `src/hub/hub.js` uses the transport's pure framing, proof and link modules (pinned by a test) |
+| Imports | Nothing of the plugin host (`server.js`, the engine, store, state, routes, HTTP, MCP, notifier, cc client, config): `src/hub/hub.js` uses the record codec (`src/records.js`, to check announces) and the transport's pure framing, proof and link modules (pinned by a test) |
 
-Exposure is deliberate: bind loopback and front the hub with an SSH tunnel or reverse proxy, or pass `--host`. Every install of a group must save the same hub; a contact on TCP or another hub is never reachable through it.
+Exposure is deliberate: bind loopback and front the hub with an SSH tunnel or reverse proxy, or pass `--host`. Installs reach it by adding a connection to its `host:port`; an install may use several hubs, and two installs reach each other through any hub both are connected to.
 
 ### Limits (`src/hub/hub.js`, `src/transport/frames.js`)
 
@@ -32,55 +32,70 @@ Exposure is deliberate: bind loopback and front the hub with an SSH tunnel or re
 | `HUB_MAX_STREAMS` | streams per link, opened or received; an `open` beyond it (the opener's or the target's) is answered `close LIMIT` |
 | `HUB_WRITE_BUFFER_MAX` | unflushed stream data the hub holds toward one **stream end**; a `data` that would pass it closes that stream on both ends (`LIMIT`) |
 | `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` | the link's **data total**: unflushed stream data toward one link, every end counted, closed streams' still-unflushed bytes included; a `data` that would pass it closes the stream it belongs to (`LIMIT`) |
-| `HUB_CONTROL_BUFFER_MAX` | how far the link's **whole total** (every unflushed byte toward it, data and control frames together) may go beyond the data total. It is not a reserve: a control frame (`incoming`, `close`, `present`, `presence`, `ping`, `pong`) is admitted while the whole total has room, so control frames may fill data room data does not use. Any frame that would pass the whole total is **dropped**, never the link; a `data` frame dropped this way closes its stream (`LIMIT`) |
-| `HUB_FRAME_MAX`, `HUB_CHUNK_BYTES`, `HUB_DATA_MAX`, `HUB_WATCH_MAX` | frame size after `ok`; raw bytes per `data`; its base64url length; fps per `watch` / `present` |
-| `TCP_HELLO_FRAME_MAX`, `TCP_HANDSHAKE_MS`, `TCP_FRAME_MS`, `TCP_IDLE_MS`, `TCP_PING_MS` | as on TCP: frame size before `ok`; registration deadline; a partial frame; silence; keepalive |
+| `HUB_CONTROL_BUFFER_MAX` | how far the link's **whole total** (every unflushed byte toward it, data and control frames together) may go beyond the data total. It is not a reserve: a control frame (`incoming`, `close`, `peer`, `gone`, `ping`, `pong`) is admitted while the whole total has room, so control frames may fill data room data does not use. A frame that would pass the whole total is **dropped**, never the link (a `data` frame dropped this way closes its stream, `LIMIT`), except a roster frame (`peer`, `gone`), which **waits** ([The roster](#the-roster)) |
+| `HUB_FRAME_MAX`, `HUB_CHUNK_BYTES`, `HUB_DATA_MAX` | frame size after `ok`; raw bytes per `data`; its base64url length |
+| `ANNOUNCE_MAX_BYTES` (`src/records.js`) | one announce: an `announce` frame's `rec`, a `peer` frame's |
+| `TCP_HELLO_FRAME_MAX`, `TCP_HANDSHAKE_MS`, `TCP_FRAME_MS`, `TCP_IDLE_MS`, `TCP_PING_MS` | as for endpoint sessions: frame size before `ok`; registration deadline; a partial frame; silence; keepalive |
 
-**Memory bound.** The hub holds at most the whole total, `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` + `HUB_CONTROL_BUFFER_MAX` unflushed bytes, toward one link (with the shipped constants, 256 MiB plus 64 KiB), so at most `HUB_MAX_LINKS` times that in all. The bound is reached only by links that stop reading while others send to them; a flooder can approach it (availability is out of scope, no per-IP fairness). An operator who wants less passes smaller `limits` to `createHub`.
+**Memory bound.** The hub holds at most the whole total, `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` + `HUB_CONTROL_BUFFER_MAX` unflushed bytes, toward one link (with the shipped constants, 256 MiB plus 64 KiB), so at most `HUB_MAX_LINKS` times that in all. The bound is reached only by links that stop reading while others send to them. Announces held: at most `HUB_MAX_LINKS` × `TCP_MAX_IDENTITIES` × `ANNOUNCE_MAX_BYTES` (16 MiB with the shipped constants), in memory only. An operator who wants less passes smaller `limits` to `createHub`.
 
-`createHub({host, port, limits, schedule, createServer})` → `{listen(): Promise<{host, port}>, close(), stats()}`; `limits` overrides any of `HUB_LIMITS` (tests). `stats()` → `{listening, links, handshaking, fps, streams, handshakeFailures, dropped}`; `dropped` counts `data` for an unknown stream and every frame a link could not take (data, control, the hub's own pings and pongs).
+`createHub({host, port, limits, schedule, createServer})` → `{listen(): Promise<{host, port}>, close(), stats()}`; `limits` overrides any of `HUB_LIMITS` (tests). `stats()` → `{listening, links, handshaking, fps, streams, announces, rosterPending, handshakeFailures, dropped}`; `announces` counts announces held, `rosterPending` the roster entries waiting for their links; `dropped` counts `data` for an unknown stream and every frame a link could not take (data, control, the hub's own pings and pongs), never a waiting roster entry.
 
 ## Hub server behaviour (`src/hub/hub.js`)
 
-- **Register:** `verifyProofs(ids, 'hub', clientNonce, hubNonce, '')`; a failure is `bye PROOF`. Then, in order: every other link holding one of those fps gets `bye DUPLICATE` and is torn down (**newest registration wins**); the fps map to this link; `ok`; every other link watching one of them gets `presence {fp, online: true}`.
+- **Register:** `verifyProofs(ids, 'hub', clientNonce, hubNonce, '')`; a failure is `bye PROOF`. Then, in order: every other link holding one of those fps gets `bye DUPLICATE` and is torn down (**newest registration wins**); the fps map to this link; `ok`; the roster is updated (below).
+- **`announce {rec}`:** checked: it decodes (`decodeRecord`: envelope, signature, schema), is an `announce`, and its signer is an fp this link registered and still holds. Anything else is `bye PROTOCOL`. Kept per link, latest wins; every other ready link is told (`peer`).
 - **`open {s, to}`:** an `s` already open on the link is `bye PROTOCOL`. `close {s, LIMIT}` when the opener or the target is at `HUB_MAX_STREAMS`; `close {s, ABSENT}` when no other link registered `to` (the opener's own fp included). Otherwise the target gets `incoming {s: s2}` (an even id of its own) and the two ends are paired. `incoming` names nobody.
 - **`data {s, b}`:** forwarded as `data {peerS, b}` unless it would pass the receiving end's `HUB_WRITE_BUFFER_MAX`, the receiving link's data total, or its whole total: then that stream closes `LIMIT` at both ends, and the receiver's link carries on. While the link is below both totals, its other streams carry on too. An unknown `s` (it raced a close) is dropped and counted in `dropped`.
-- **A link that cannot take a control frame** (it would pass the link's whole total) does not get it: the frame is dropped and counted in `dropped`, and the link stays up. A dropped `close` or `incoming` leaves the receiver's session on that stream to its own deadlines (handshake, idle); pulls on the next session recover anything lost. A dropped `presence` is a missed dial hint. The hub never destroys a link for its write buffer.
+- **A link that cannot take a control frame** (it would pass the link's whole total) does not get it: the frame is dropped and counted in `dropped`, and the link stays up. A dropped `close` or `incoming` leaves the receiver's session on that stream to its own deadlines (handshake, idle); pulls on the next session recover anything lost. The hub never destroys a link for its write buffer.
 - **`close {s}`:** the peer end gets `close {peerS, CLOSED}`; the pair is forgotten. An unknown `s` is ignored.
-- **`watch {id, fps}`:** replaces the link's watch set; answered `present {id, fps}` with the watched fps registered now on other links.
-- **Link close:** its fps still mapped to it are dropped and their watchers get `presence {fp, online: false}`; every stream's peer end gets `close GONE`; its watches are dropped.
+- **Link close:** its announces are dropped; its fps still mapped to it are dropped and every other ready link is told (`gone`); every stream's peer end gets `close GONE`.
 - Never pauses reading, never awaits, never logs per-connection failures (counted: `handshakeFailures`, `dropped`).
 - **`close()`:** closes the listener synchronously, then `bye STOP` to every link.
 
-## Hub client (`src/transport/hubClient.js`)
+### The roster
+
+Each link has a set of roster entries it is owed (`dirty`, one per fp). An entry is written as one frame built from the **current** state when it goes out: `peer {fp, rec}` while `fp` is registered on another ready link (`rec`: that link's announce for `fp`, or `null` while it gave none), else `gone {fp}`.
+
+| Event | Entries owed |
+|---|---|
+| A link becomes ready (`ok`) | the newcomer's fps, to every other ready link; every fp registered on another link, to the newcomer (**the newcomer burst**) |
+| `announce` from a link | its signer, to every other ready link |
+| A link closes | each fp it still held, to every other ready link (now absent: `gone`) |
+| Newest registration wins | covered by the new link's ready event: the fp is present again, so no `gone` goes out |
+
+- **Pumping:** after each event the hub pumps each affected link once (`setImmediate`, coalesced), so a registration that replaces another settles first. A pump writes owed entries while they fit the link's whole total; one that does not fit **waits** (not dropped, not counted), and every flush toward the link pumps again.
+- **What a slow reader sees:** each fp's latest state, late, never a stale or lost one. `peer` and `gone` are idempotent for the client (an unknown `gone` is ignored, a repeated `peer` overwrites). No resync and no reconnect.
+- **Bounds** (realistic load): owed entries ≤ the fps registered (ids only); one change fans out to at most `HUB_MAX_LINKS` − 1 links; a newcomer burst is one `peer` per fp registered elsewhere.
+
+## The hub mode of a connection
+
+A configured connection (`src/transport/connection.js`) whose far end says `hello` kind `hub` becomes a hub link (`src/transport/hubLink.js`). It has no settings of its own: its address is the connection's.
 
 | Concern | Answer |
 |---|---|
-| `capabilities` | `{directory: false, push: true}`: the hub keeps no listing |
-| `addresses()` | `[hub://host:port]`, the saved url normalized (`formatHubAddr`). It goes into `announce.addr`; a TCP client ignores the scheme |
-| `send` | The endpoint core's: a `rec` on a ready session is `delivered`; everyone else is `pending`, and pending recipients in the dial set are dialed. Never throws |
-| `sync()` | The core's maintain, awaited end to end: watch → dial present contacts → pull |
-| `peerOnline` | Only when an end-to-end session becomes ready. Hub presence is a dial hint |
+| Registration | `register` proving every attached identity (`proofSigner`, role `hub`), straight after the greeting |
+| On `ok` | backoff resets, `error` clears, `state: 'up'`; `announce` for each binding's announce (`core.announces()`), and again whenever one changes; every binding's maintain is queued |
+| On close | every stream ends (its session closes and leaves the pool), the roster is forgotten; reconnect as in [transport.md → Connections](transport.md#connections) |
+| `peerOnline` | Only when an end-to-end session becomes ready. The roster is a dial hint |
 | `Incoming.writer` | The `from` the remote endpoint proved in the tunneled handshake |
-| `stats().hub` | `{url, connected, error}`; the engine shows `{connected, error}` as `state().transport.hub` |
+| Status | the connection's row: `kind: 'hub'`, `state`, `remote` (the fps of ready sessions on this link), `error` |
 
-`createHubEndpoint({url, limits, now, schedule, syncMs, connect, log})` → `{attach, stats, close}` (`connect` opens the link socket; tests inject one). `createHubClient(opts)` = one endpoint, one binding: what `server.js` builds for `{kind:'hub', url}`.
-
-### The link
-
-- **Connect:** `net.connect(host, port)`, then the hub-link hello and a `register` proving every attached identity (`proofSigner`, role `hub`).
-- **On `ok`:** the reconnect backoff resets, `error` clears, the watch is sent and every binding's maintain is queued.
-- **On close:** every stream ends (its session closes and leaves the pool), presence is forgotten, and a reconnect is scheduled after `redialMinMs`, doubling to `redialMaxMs` (`TCP_REDIAL_MIN_MS`, `TCP_REDIAL_MAX_MS`).
-- **`error`**, shown on the page:
+- **Errors:**
 
   | Code | When | Then |
   |---|---|---|
   | the socket's (`ECONNREFUSED`, `ENOTFOUND`, …) | the connection failed | reconnects with backoff |
   | `HUB_REFUSED` | the hub answered `bye PROOF` | reconnects with backoff |
-  | `HUB_DUPLICATE` | the hub answered `bye DUPLICATE`: another endpoint registered one of these identities (a copied identity) | **no reconnect** until a binding is attached or detached (a transport start or save attaches one), so two copies do not knock each other off forever. Detaching re-registers the identities that remain: the detached one may have been the copy |
+  | `HUB_DUPLICATE` | the hub answered `bye DUPLICATE`: another endpoint registered one of these identities (a copied identity, or a second connection of this install to the same hub) | **no reconnect** (`state: 'stopped'`) until a binding is attached or detached (a transport start or a settings save attaches one), so two copies do not knock each other off forever. Detaching re-registers the identities that remain: the detached one may have been the copy |
 
-- **Self-supersession:** a client that reconnects on its own (a binding attached or detached on a shared endpoint, `open()` with other identities) first leaves its current connection (`bye STOP`). Whatever the left connection still hears, a `bye DUPLICATE` caused by its own new registration included, is ignored, and its close arms no reconnect: only the current connection records an error or schedules a reconnect. The same holds for `close()` with a binding still attached.
-- `discover` waits for a connect in progress, never for a backoff timer.
+- **Self-supersession:** a connection that re-registers on its own (a binding attached or detached on a shared endpoint) first leaves its current link (`bye STOP`). Whatever the left link still says, a `bye DUPLICATE` caused by its own new registration included, is ignored, and its close arms no reconnect: only the current link records an error or schedules a reconnect. The same holds for `shutdown()` with a binding still attached.
+
+### The roster on the client
+
+- **`peer {fp, rec}`** (ignored for a local fp), in order: `fp` joins this hub's `present` set; this hub's backoff for `fp` resets; `rec`, when set, is decoded and must be an `announce` signed by `fp`, then goes to every binding's engine (`sink.announce`: memory only); one that fails is not offered and counts in `dropped`; if `fp` is a contact without a session, `dialHubs(fp)`.
+- **`gone {fp}`:** `fp` leaves `present`.
+- `stats().presence` lists, per fp, every hub whose roster has it (`{via: 'hub', address}`) next to its sessions; the page's directory shows it.
 
 ### Streams
 
@@ -90,53 +105,37 @@ Exposure is deliberate: bind loopback and front the hub with an SSH tunnel or re
 - **A paused stream never pauses the link:** it holds inbound chunks; over `HUB_STREAM_BUFFER_MAX` held bytes it closes `LIMIT`, and pulls recover the lost frames on the next session.
 - An `incoming` stream goes to the core's `accept`; beyond the core's caps it is closed at once.
 
-### Dial policy and presence
+### Dial policy
 
-- **Watch set** = every binding's `view.contacts()` plus `wanted` (pending recipients that are not contacts, such as an invitee), minus local fps, sorted, at most `HUB_WATCH_MAX` (a truncation is logged once). Re-sent only when it changes. An fp leaves `wanted` once a session to it is ready.
-- **`dial(b, fp)`** does nothing when `fp` is local or has a session; returns the dial in flight to `fp` if any; otherwise does nothing when the link is not registered (`fp` joins `wanted`), `fp` is backing off, `fp` is watched and not present, or the core is at `maxConnections`. An fp not yet watched joins `wanted` and a watch refresh is sent (not awaited: `send` runs under the engine lock), and the dial goes ahead.
-- A dial opens a stream (`open {s, to: fp}`) and runs the dialer's handshake on it. Success resets `fp`'s backoff; failure (an `ABSENT` or `LIMIT` close, or a failed handshake) backs it off from `redialMinMs`, doubling to `redialMaxMs`; `ABSENT` also drops `fp` from `present`.
-- **Presence:** `presence {online: true}`, or an fp newly in a `present` answer, marks it present, resets its backoff and dials it if it is in the dial set with no session. `online: false` unmarks it. The hub's word only triggers a dial; the handshake decides.
+- **`dial(fp)`** does nothing when `fp` is local or has a session; returns the dial in flight to `fp` if any; otherwise does nothing unless the link is up, the roster shows `fp` present, and the core has a session slot, and `fp` is past its backoff on this hub.
+- A dial opens a stream (`open {s, to: fp}`) and runs the dialer's handshake on it, **targeted** at `fp`. Success resets `fp`'s backoff; failure (an `ABSENT` or `LIMIT` close, or a failed handshake) backs it off from `redialMinMs`, doubling to `redialMaxMs`; `ABSENT` also drops `fp` from `present`.
+- Which hub: the core's `dialHubs(fp)` tries the hub-mode connections in configured order, stopping once `fp` has a session ([transport.md → Dial policy](transport.md#dial-policy)). A direct session always wins the duplicate rule over a hub one.
 
 ### Discovery
 
-- A card import makes the identity a contact: it is watched, and dialed once present.
-- The directory pull at every handshake exchanges announces, as on TCP.
-- Members known only by fingerprint (from inbox records) are contacts too, so they are dialed by fingerprint. The client never sends `whois`; the core still answers one, gated by `view.announceFor`.
-- Other identities' `addr` entries are never used to dial. A contact on TCP or on another hub is never present here, so it is never dialed.
-
-### Settings
-
-- `validateHubConfig({url})` (pure): `hub://<host>:<port>`, host a hostname, IPv4 address or `[IPv6]` and not a wildcard (`isWildcardHost`), port 1–65535, at most `ADDR_MAX_CHARS` (it goes into `announce.addr`). Normalized by `formatHubAddr`. Anything else: `HUB_INVALID`.
-- `resolveHubConfig(input, {lookup, lookupMs, mustResolve})`: then a non-literal host is looked up (`lookupAll`, `TCP_LOOKUP_MS`): any wildcard answer is `HUB_INVALID`; no answer or a timeout is `HUB_INVALID` only with `mustResolve` (a save; at boot the hub may simply be unreachable for now).
+- Every client on a hub learns every other client's fingerprint and announce from the roster; the directory lists them with "on hub `addr`", strangers included.
+- A contact is dialed once a hub reports it; a stranger is never dialed until a human invites it, which makes it a counterparty and so a contact.
+- A client never sends the hub a contact list.
 
 ## Known limitations
 
 - **The hub reads everything it relays** and sees who talks to whom ([Hub security](#hub-security)).
-- **Peers must share the hub.** Hub, TCP and the file share are one transport at a time per install, never composed.
-- **Both ends must be online at once** (through the hub), as on TCP; until then the sender keeps the record in its outbox.
-- **No per-IP fairness or accounts:** any key holder can register its own fingerprints, and a flooder can exhaust the hub's link and handshake slots.
+- **Peers must share a hub** (or a direct route): a contact present on no hub this install is connected to is reached only over a connection.
+- **Two connections to one hub** register the same identities: the later wins and the other shows `HUB_DUPLICATE`.
+- **Both ends must be online at once** (through the hub); until then the sender keeps the record in its outbox.
 
 ## Hub security
 
-1. **Open port.**
+1. **Trust assumption (owner ruling).** Hubs and the clients on them are trusted parties: no defence is designed against their abuse (no rate limits, no presence anti-spoofing, no announce-forgery handling beyond the signature check). [transport.md → Network security](transport.md#network-security) lists what is kept.
+2. **Open port.**
    - The hub binds `127.0.0.1` unless the operator passes `--host`; exposing it is explicit (a wildcard, an interface IP, or an SSH tunnel or reverse proxy to loopback), and a non-loopback host logs a plaintext warning.
    - No TLS, no accounts, no allow-list: any key holder can register the fingerprints whose keys it holds.
-   - On the client, the hub url is saved through `POST api/hub` behind the mutating-request guard, as for TCP.
-2. **What an unauthenticated connection can make the hub do:** take one link slot and one handshake slot; generate one nonce and write one `hello`; buffer at most `TCP_HELLO_FRAME_MAX` and parse at most two small frames; run up to `TCP_MAX_IDENTITIES` Ed25519 verifies within `TCP_HANDSHAKE_MS`. It cannot open a stream, watch, learn any registered fingerprint, or cause any signing (the hub has no key) or log line.
-3. **Per-client limits.**
-   - Links: `HUB_MAX_LINKS`, `HUB_MAX_HANDSHAKING`, enforced at accept.
-   - Phase frame limits, checked from the 4-byte header before any body is buffered; exact schemas per role and phase; deadlines for the registration, a partial frame and silence.
-   - `HUB_MAX_STREAMS` per link; `HUB_WATCH_MAX` per watch.
-   - `HUB_WRITE_BUFFER_MAX` per stream end, the data total `HUB_MAX_STREAMS` × `HUB_WRITE_BUFFER_MAX` per link, and the whole total, `HUB_CONTROL_BUFFER_MAX` beyond it, for data and control frames together ([Memory bound](#limits-srchubhubjs-srctransportframesjs)): a receiver that does not keep up loses streams (`LIMIT`) and control notices (dropped), never its link. While its link is below both totals, a stream over its own cap costs no other stream.
-   - Client side: the core's `maxConnections` / `maxHandshaking` apply to streams; `HUB_STREAM_BUFFER_MAX` per paused stream; the session limits inside every stream.
-   - No per-IP fairness: availability against a flooder is out of scope.
-4. **A malicious hub can:**
-   - drop, delay or reorder frames; replay frames (records are deduplicated by id); misroute streams; lie about presence (costing failed dials: a presence notice resets that fp's backoff, so the bound is one dial in flight per fp);
-   - inject frames into a live session: there is no per-frame authentication, as for a TCP on-path attacker;
-   - **read everything any proven identity on a session it relays may read.** It sees every frame in plaintext, and an injected `pull` makes a server answer the session's proven remote into that stream, including history from before the hub was in use;
-   - suppress records by tampering with pull answers (the effect of a drop; a cursor pushed past the server's head resets to 0);
-   - register a client's fingerprints at another hub by relaying that client's registration live, which only lets it drop or relay again.
-
-   It **can never:** forge a record (signatures); forge `from` (the writer is proven end to end: a misrouted stream fails the target-bound handshake, and a frame whose `from` the remote did not prove closes the session); make a server answer as an identity other than the one proven on that session; turn presence into `peerOnline`; reuse a registration or handshake proof elsewhere (each is bound to both nonces, its role and its target).
-5. **A malicious client can:** register only fingerprints whose key it holds; replace its own fingerprint's older link (newest wins); open streams to any registered fingerprint (the target's acceptor proves second, so it learns nothing beyond presence until it proves a key that names an attached target); hold the target's handshake slots, as a TCP stranger can; watch any fingerprint it knows (a presence oracle, like probing a TCP address); make its watchers redial it by reconnecting. It cannot claim another's fingerprint, read others' streams, make the hub write to a link it opened no stream to (other than presence to watchers of its own fps), or get another client disconnected by flooding it: filling every stream it may open to a client that reads slowly or not at all closes those streams `LIMIT` and drops the control frames that would not fit, but never the victim's link. What it can do is close the victim's *other* streams once the victim's link is full, until the victim reads again: full means it holds its data total in stream data, or its whole total in data and control frames together (the flooder can make the hub queue control frames to it, e.g. `incoming` for streams it opens).
-6. **Plaintext metadata the hub sees:** each link's source address and timing; its registered fingerprints (so which identities share an endpoint); its watch set, which is its dial set (contacts, counterparties, co-members: the social graph); every stream open (who dials whom, when); every tunneled byte (records with bodies, names, membership and inbox ids; pulls with route keys and cursors; whois and cards; sizes and timing). The least-disclosure rules (scoped pulls, gated `whois`, head-less denials, [transport.md → TCP security](transport.md#tcp-security)) still bind **peers** end to end, because they run in the shared core inside the tunneled session. The hub sees the union of all traffic it relays.
+   - On the client, a connection is saved through `POST api/network` behind the mutating-request guard.
+3. **What an unauthenticated connection can make the hub do:** take one link slot and one handshake slot; generate one nonce and write one `hello`; buffer at most `TCP_HELLO_FRAME_MAX` and parse at most two small frames; run up to `TCP_MAX_IDENTITIES` Ed25519 verifies within `TCP_HANDSHAKE_MS`. It cannot open a stream, give an announce, receive the roster, or cause any signing (the hub has no key) or log line.
+4. **Kept limits** (realistic load): `HUB_MAX_LINKS`, `HUB_MAX_HANDSHAKING` at accept; phase frame limits checked from the header; exact schemas per role and phase; deadlines; `HUB_MAX_STREAMS` per link; `HUB_WRITE_BUFFER_MAX` per stream end, the data total and the whole total per link ([Memory bound](#limits-srchubhubjs-srctransportframesjs)): a receiver that does not keep up loses streams (`LIMIT`) and control notices (dropped), never its link, and its roster entries wait. Client side: the core's session caps apply to streams; `HUB_STREAM_BUFFER_MAX` per paused stream; the session limits inside every stream.
+5. **End to end, whatever the hub does:** the writer is the proven `from` (a misrouted stream fails the target-bound handshake, and a frame whose `from` the remote did not prove closes the session); records and announces are signature-checked; presence never fires `peerOnline`; a registration proof is bound to both nonces and the `hub` role.
+6. **What a hub and its clients see:**
+   - every client sees every other client's fingerprint, name (its announce) and online and offline times;
+   - the hub sees each link's source address and timing, its registered fingerprints (so which identities share an endpoint), every stream open (who dials whom, when) and every tunneled byte (records with bodies, names, membership and inbox ids; pulls with route keys and cursors; sizes and timing);
+   - **a hub never receives a contact list**: a client sends it only its registration, its own announces and stream frames;
+   - an injected `pull` in a relayed session makes a server answer the session's proven remote into that stream, history included. The least-disclosure rules (scoped pulls, head-less denials) still bind **peers** end to end inside the tunneled session.
