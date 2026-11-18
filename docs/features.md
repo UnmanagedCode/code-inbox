@@ -48,7 +48,7 @@ A contact card is a signed announce: it says who someone is, not where they are.
 | **Import** | Takes a pasted card: the identity appears in the directory and becomes a contact (kept across restarts), dialed through a hub that has it. Shows "Imported name (fingerprint)". The page says to add a connection to reach someone | `CARD_INVALID` (not a card, not a valid announce, or this install's own) |
 
 - A card is not needed to reach anyone: identities met on a connection or seen on a hub are in the directory already, and inviting one makes it a contact.
-- Importing the owner's card makes the owner a contact; members of a shared inbox reach each other over a common hub or a connection between them.
+- Importing the owner's card makes the owner a contact; members of a shared inbox need only a connection to the owner (or a common hub): the owner passes every member's messages on, also to members who were offline.
 
 ### Directory
 

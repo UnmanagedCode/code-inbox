@@ -22,8 +22,15 @@ import { silentLog, tmpDir } from './helpers.mjs';
 // An in-memory push transport: records reach online peers' sinks immediately; a send to an offline peer comes back
 // `pending`, and when the peer comes online every other transport's sink hears peerOnline(fp). Directory records
 // go to every online peer (it stands in for a directory-capable push transport).
+// A real push transport never waits for the recipient's ingest: its send only writes a frame. This fake awaits it, so
+// a test sees a record arrive as soon as its send returns, except toward an install that is itself inside a send:
+// that install holds its engine lock while it waits, so awaiting its ingest would deadlock (an owner admitting the
+// invitee whose acceptance it is ingesting writes a member record back to that invitee). Such a delivery is queued,
+// and sync() awaits every queued delivery.
 function memoryHub() {
   const nodes = new Map(); // fp → {sink, online, interest:Set<routeKey>}
+  const sending = new Map(); // fp → how many of its sends are in progress
+  const queued = new Set(); // deliveries not awaited by their send
   const deliver = (node, route, writer, bytes) => (node.online && node.sink && (route.kind === 'directory' || node.interest.has(routeKey(route)))
     ? node.sink.record({ route, writer, bytes }) : null);
   return {
@@ -35,7 +42,7 @@ function memoryHub() {
       const node = { sink: null, online: true, interest: new Set() };
       nodes.set(identity.fp, node);
       return {
-        capabilities: { directory: true, push: true },
+        capabilities: { directory: true, push: true, pull: false },
         async start(sink) { node.sink = sink; },
         setAnnounce() {},
         setInterest(routes) { node.interest = new Set(routes.map(routeKey)); },
@@ -43,13 +50,23 @@ function memoryHub() {
           const delivered = [];
           const pending = [];
           const targets = route.kind === 'directory' ? [...nodes.keys()].filter((fp) => fp !== identity.fp) : to;
-          for (const fp of targets) {
-            const n = nodes.get(fp);
-            if (n?.online) { await deliver(n, route, identity.fp, bytes); delivered.push(fp); } else pending.push(fp);
+          sending.set(identity.fp, (sending.get(identity.fp) ?? 0) + 1);
+          try {
+            for (const fp of targets) {
+              const n = nodes.get(fp);
+              if (!n?.online) { pending.push(fp); continue; }
+              if (sending.get(fp)) {
+                const p = Promise.resolve(deliver(n, route, identity.fp, bytes)).finally(() => queued.delete(p));
+                queued.add(p);
+              } else await deliver(n, route, identity.fp, bytes);
+              delivered.push(fp);
+            }
+          } finally {
+            sending.set(identity.fp, sending.get(identity.fp) - 1);
           }
           return { delivered: delivered.filter((fp) => to.includes(fp)), pending: pending.filter((fp) => to.includes(fp)) };
         },
-        async sync() {},
+        async sync() { while (queued.size) await Promise.allSettled([...queued]); },
         async stop() { node.online = false; },
       };
     },
@@ -59,7 +76,7 @@ function memoryHub() {
 const useShare = (engine, shareDir) => engine.setShare(shareDir);
 const networkTransport = (identity, _shareDir, view, store, config) => createNetwork({
   listen: config.listen ?? null, connections: config.connections ?? [], identity: proofSigner(identity), view,
-  cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: 3_600_000, log: silentLog,
+  cursors: { load: store.loadPullCursors, save: store.savePullCursors }, syncMs: 3_600_000, log: silentLog,
 });
 const listenerOf = (node) => `127.0.0.1:${node.transport.stats().listening.port}`;
 // A loopback hub around the network, for the implementations that use one.
@@ -166,6 +183,28 @@ for (const impl of Object.keys(IMPLEMENTATIONS)) {
     assert.deepEqual(b.engine.messages(inbox).map((m) => m.body), ['once']);
     assert.equal(b.engine.state().diagnostics.rejected, 0);
     await net.close();
+  });
+
+  // Invariant: a shared inbox member's message reaches every member through the interface alone. In `direct` the
+  // members connect only to node 0, the owner: a star, where the owner relays. Not on memoryPush: a push-only
+  // transport with no pull and no history never brings a member admitted later the member records sent before it
+  // joined, so it never becomes a member; no real transport is push-only (the network pulls, the share stores).
+  if (impl !== 'memoryPush') test(`${impl}: a shared inbox member's message reaches every member`, async () => {
+    const net = await network(impl, ['alice', 'bob', 'carol']);
+    try {
+      const [a, b, c] = net.nodes;
+      const { id } = await a.engine.createSharedInbox('team');
+      for (const m of [b, c]) await a.engine.inviteMember(id, m.fp);
+      await net.settle();
+      for (const m of [b, c]) await m.engine.respondInvite(m.engine.state().invites.incoming[0].id, true);
+      await net.settle();
+      await net.settle();
+      await b.engine.sendMessage(id, 'to the team');
+      await net.settle();
+      for (const n of net.nodes) assert.deepEqual(n.engine.messages(id).map((m) => m.body), ['to the team'], n.name);
+    } finally {
+      await net.close();
+    }
   });
 }
 

@@ -9,7 +9,7 @@ The engine talks to the network only through the `Transport` interface (`src/tra
  *  Incoming = {route, writer, bytes}   // writer: the fingerprint the transport attributes the record to
  *  Sink     = { record(i: Incoming): Promise<{retry: boolean}>, announce(bytes): void, peerOnline(fp): void }
  *  Transport {
- *    capabilities: { directory: boolean, push: boolean }
+ *    capabilities: { directory: boolean, push: boolean, pull: boolean }
  *    start(sink): Promise<void>
  *    setInterest(routes: Route[]): void    // the routes this install wants delivered
  *    setAnnounce(bytes | null): void       // this install's current signed announce
@@ -21,7 +21,8 @@ The engine talks to the network only through the `Transport` interface (`src/tra
 ```
 
 - The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (an `inbox-create`: the contacts).
-- Recipients in `pending` (or all of them, if `send` throws) go to the outbox; a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
+- `capabilities.pull`: peers pull from each other's served logs (`view.serve`), so a record a `send` misses still arrives by pull. The engine relies on it for the owner relay and the outbox keep-set ([Owner relay](#owner-relay)); a transport without it gets neither.
+- Recipients in `pending` (or all of them, if `send` throws) go to the outbox, except where the keep-set narrows it ([Owner relay](#owner-relay)); a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
 - `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share; in network mode the frame's `from`, an identity the remote endpoint proved on that session, directly or in the handshake tunneled through a hub stream (never the hub's word).
 - `announce(bytes)` takes a **hub-relayed announce**: no proven session carried it, so the engine accepts it as an announce only, with writer = its own signer, into its memory directory only (the same narrow exception as a card import).
@@ -40,7 +41,7 @@ The engine builds its transport with `makeTransport(config, view)` (`server.js` 
 |---|---|---|
 | `mayPull(peer, route)` | whether to name `route` in a pull from `peer`: the directory, this install's own mailbox, or an inbox `peer` is a party or current member of here | `mayPull` (`src/state.js`) |
 | `contacts()` | the dial set: card-imported identities (`identities.json` entries with `imported: true`), counterparties of records this install signed (`to`, `member`), parties and members of every inbox it belongs to | `contactsOf` (`src/state.js`) |
-| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied'}` (no `head`: a denial reveals nothing of what is held) | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq. The log never holds an announce, so the `directory` route serves `inbox-create` records only |
+| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied'}` (no `head`: a denial reveals nothing of what is held) | the engine's served log (`serveLog`), per route, by acceptance seq: the records **signed by this install**, plus, on a shared inbox **this install owns**, every record it accepted there, whoever signed it; **never the reader's own** records. Gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq. The log never holds an announce, so the `directory` route serves `inbox-create` records only |
 
 - `mayRead(index, reader, route)`: the directory to any proven identity; a mailbox to its owner; a personal inbox to its inviter and invitee; a shared inbox to its current members; nothing else.
 
@@ -60,7 +61,7 @@ One transport at a time, set on the page (`POST api/share` or `POST api/network`
 
 | Concern | Answer |
 |---|---|
-| `capabilities` | `{directory: true, push: false}` |
+| `capabilities` | `{directory: true, push: false, pull: false}`: the share already stores and forwards, so the owner never relays there |
 | `setAnnounce` | Nothing: the engine writes the announce file itself (a directory-route send) |
 | `send` | Atomic write under the route's dir in this install's own fingerprint subdir; every `to` is `delivered`. Before each write (`checkWritable`): the share's root `<dir>/SHARE_ROOT` must already exist, else the retryable `SHARE_UNAVAILABLE` and nothing is created; neither the share dir nor its root may resolve into or above the data dir (real paths, re-checked on every write), else `SHARE_UNSAFE`. The route and writer subdirs under the root are created as needed, after a check that their path stays inside the root (`SHARE_UNSAFE` otherwise) |
 | Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once. Announce files go to the engine's memory directory, never its log |
@@ -74,7 +75,7 @@ Network mode is the endpoint core (`endpoint.js`) with **links**: an optional li
 
 | Concern | Answer |
 |---|---|
-| `capabilities` | `{directory: false, push: true}` |
+| `capabilities` | `{directory: false, push: true, pull: true}` |
 | `send` | A `rec` frame to each recipient with a ready session whose write buffer is under `TCP_WRITE_BUFFER_MAX`: `delivered`. Everyone else is `pending`; a pending recipient in the dial set (contacts, plus a `mailbox` route's fp) is dialed through the hubs in the background |
 | `setAnnounce` | Stored per binding; pushed at once on every ready session, and to every hub-mode connection |
 | Push | Inbound `rec` frames call `sink.record` when the route is in the addressed identity's interest; otherwise they are dropped and counted |
@@ -155,20 +156,31 @@ Each attempt:
 - **On session ready:** each side pushes each binding's announce to each remote fp (`rec` on the `directory` route; `from` is proven, so the writer is bound), then `peerOnline(fp)` for every remote fingerprint and local binding, then a (scoped) pull of that binding's interest from it. **Announce** pushes the new announce on every ready session.
 - **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A pull names no route key the peer has no part in. The directory carries this install's `inbox-create` records (shared inbox ids and names) to any peer that pulls it (personal inbox ids are never in the directory).
 - **New routes:** `setInterest` schedules (never awaits; it runs under the engine lock) a pull of each newly added route from every session.
-- **A pull** asks for records signed by the remote identity on each route with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress.
-- **Cursors** are per (peer fp, route key), persisted in `peer-cursors.json`. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
+- **A pull** asks for the records the remote identity serves on each route (`view.serve` on its side: its own records, and on a shared inbox it owns every record it accepted there, except the asker's own) with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress. Each record is offered with writer = that remote identity.
+- **Cursors** are per (peer fp, route key), over the peer's acceptance seqs of what it serves on that route, persisted in `pull-cursors.json`. No frame names a signer: a member keeps one cursor on (owner, `inbox:<id>`) covering every signer, plus its own cursors on (co-member, `inbox:<id>`) for direct pulls of that co-member's records. A file under any other name is never read. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
 - **Delivered** means written to a ready session under the write-buffer cap; `send` never waits for the flush because it runs under the engine lock. A frame lost on a dying socket is recovered by the pull on reconnect and by the periodic pull.
+
+### Owner relay
+
+The group of a shared inbox is a star around its owner: members connected only to the owner receive each other's messages through it.
+
+- **Served log:** on a shared inbox it owns, the owner serves every record it accepted on that route (its own, and its members' `msg` records), never the reader's own (no echo to the author). Everywhere else an install serves only its own records.
+- **Live push:** when the owner accepts a co-member's `msg` on an inbox it owns (pushed, pulled or drained from pending), it `send`s it to every current member except itself and the author, with `from` = the owner. Best-effort: a member without a live session is not put in the outbox; its next pull (on session ready, on maintain) fetches the record from the owner's served log. Only a record newly accepted is relayed, so a second arrival triggers nothing.
+- **Keep-set:** a non-owner's shared `msg` is still sent to every current member (direct pushes stay live), but the outbox keeps only the **owner** if it is pending (plus an owed write). A co-member a member never meets is never retried.
+- Both apply only where `capabilities.pull` is true (network mode). The file share stores everything and does not relay; a push transport without pulls keeps "send to all, outbox to all".
+- **Who receives what** (`mayRead`): a current member gets pushes and pulls the whole served log from its cursor; a new member pulls the inbox's full history, a removed member's kept messages included; a re-added member gets everything after its kept cursor; a removed or not-yet-admitted member is `denied` (its cursor kept) and gets no relay pushes.
+- The owner serves every record it accepted on the route, including ones no longer valid (a removed member's off-chain messages accepted before the removal), so readers hold the same records and reach the same verdicts.
 
 ### Route binding
 
-- **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine still checks `payload.signer === writer` and `routeFor(payload) === route`. A peer therefore pushes and serves only records it signed itself; a relayed third-party record is refused `ROUTE_MISMATCH`.
+- **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine checks `routeFor(payload) === route` and `payload.signer === writer`, with one exception: **the owner relay**. A record signed by someone else is accepted only when `mayRelay(index, writer, route, payload)` holds: the payload is a `msg`, the route is a shared inbox, and that inbox's owner, by this install's own state, is `writer`. Every other third-party record is refused `ROUTE_MISMATCH`. The exception is not self-certifying: it needs a session-proven `from` that owns the inbox here, and it applies on any transport (the file share never exercises it).
 - **Two self-certifying exceptions, announces only, into memory only:** a contact-card import (`engine.importCard`) and a hub-relayed announce (`sink.announce`). The writer is the announce's own signer; anything but an announce is refused.
-- **Least disclosure:** no frame asks about, or answers with, any identity other than the session's two proven parties. A session serves only records its proven `from` may read (`mayRead`); pulls name only routes the peer could serve (`mayPull`); a denial carries no head.
+- **Least disclosure:** no *frame* asks about, or names, any identity other than the session's two proven parties. The *records* served on a shared inbox may be co-members' records, but only to a current member (`mayRead`), who already sees the member list. A session serves only records its proven `from` may read; pulls name only routes the peer could serve (`mayPull`); a denial carries no head.
 
 ### Known limitations
 
-- **A member's records come only from that member.** Two members of a shared inbox exchange records only over a session between them: a common hub (co-members are contacts, so each dials the other there) or a connection from one to the other's listener. Members with neither still exchange with the owner when connected to the owner, but never with each other. A removed member is no longer pulled from, so a member who joins after a removal never receives the removed member's earlier messages.
-- **Both ends must be online at once** (or the sender keeps the record in its outbox until the recipient reconnects).
+- **Both ends must be online at once** (or the sender keeps the record in its outbox until the recipient reconnects), except a shared inbox's members, whose records the owner relays: a member only needs to reach the owner.
+- **A shared inbox depends on its owner.** The owner can withhold records (skip, delay, or serve some members and not others); it can never forge, alter or re-route one.
 - **Plaintext, loopback by default** (below).
 
 ### Network security
@@ -176,7 +188,7 @@ Each attempt:
 1. **Trust assumption (owner ruling).** Peers, hubs, connection targets and strangers on a hub are trusted parties. No defence is designed against their abuse: no rate limits, no presence anti-spoofing, no announce-forgery handling beyond the signature check.
 2. **Kept:**
    - every record and announce is signature-verified (`decodeRecord` on every path; hubs and clients both decode announces);
-   - the writer is the proven `from`, end to end on every route; the two self-certifying exceptions (card import, hub-relayed announces) take announces only, into memory only;
+   - the writer is the proven `from`, end to end on every route, with one exception: the owner relay (`mayRelay`: a `msg` on a shared inbox whose owner here is the writer); the two self-certifying exceptions (card import, hub-relayed announces) take announces only, into memory only;
    - `mayRead` and `mayPull`, and head-less denials;
    - the handshake proofs (below), with direct dials untargeted;
    - every cap: sessions, handshakes, hub links, streams and buffers, per-stream back-pressure, frame sizes and deadlines;
@@ -187,6 +199,7 @@ Each attempt:
    - **Plaintext:** anyone on the path reads every record (bodies, names, membership, proven fingerprints) and timing, and can drop or inject frames; an injected frame cannot forge a record, and drops are recovered by the outbox and pulls.
    - **A listener reveals its fingerprints:** a direct dial is untargeted, so anyone who reaches a listener and proves any key gets the listener's accept proof: which fingerprints sit behind that address. That stranger is then a proven non-contact: it reads the public directory (`inbox-create` names and ids) and may push its announce and mailbox records to this install, as any reachable party can.
    - **A connection target can relay a session live** (a port forward does exactly that honestly): an on-path relay sees, drops or injects frames, and an injected `pull` reads whatever the far peer serves this install. It can never forge a record or a `from`.
+   - **The owner of a shared inbox** can withhold its members' records: skip, delay, or serve some members and not others. It can never forge or alter one (every record is signature-verified, its id is the hash of its payload, and `inbox`, `signer` and `prev` are signed) nor re-route one (`sameRoute`, and `mayRelay` only for an inbox the writer owns here). A gap shows: a member's later message whose `prev` was withheld stays pending (`PREV_UNSEEN`, `diagnostics.pending`), and validity is prefix-closed, so nothing built on the gap becomes valid. The owner already controlled membership; relaying grants it no power over which messages are valid.
    - **Hubs:** [hub.md → Hub security](hub.md#hub-security). Every client on a hub sees every other client's fingerprint, name and online times; a hub never receives a contact list.
    - **Invites:** anyone who can reach this install (on a common hub, or over a connection) can invite it. Invites are human-gated (Accept or Decline); there is no rate or volume limit.
 5. **In scope:** peer-supplied names (`NAME_RE`) and fingerprints render only as React text; presence addresses are the user's own saved strings. The REST guard covers `POST api/network` and every invite route. Realistic input: the caps above, the hub roster's coalescing, `ANNOUNCE_MAX_BYTES`.

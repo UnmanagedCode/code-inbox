@@ -16,7 +16,7 @@ export const FILES = {
   outbox: 'outbox.json',
   cursors: 'cursors.json',
   notify: 'notify.json',
-  peerCursors: 'peer-cursors.json',
+  pullCursors: 'pull-cursors.json',
   identities: 'identities.json',
 };
 
@@ -122,9 +122,10 @@ export function createStore(dataDir, { log = console } = {}) {
     saveNotify: (n) => locked(() => writeJson(file('notify'), n)),
     // {fp: {announce: base64url announce record bytes, imported: boolean}}: the identities this install keeps.
     saveIdentities: (obj) => locked(() => writeJson(file('identities'), obj)),
-    // {peerFp: {routeKey: seq}}: the TCP transport's pull cursors.
-    loadPeerCursors: () => readJson(file('peerCursors'), {}),
-    savePeerCursors: (c) => locked(() => writeJson(file('peerCursors'), c)),
+    // {peerFp: {routeKey: seq}}: the network transport's pull cursors, each over the peer's acceptance seqs of what it
+    // serves on that route.
+    loadPullCursors: () => readJson(file('pullCursors'), {}),
+    savePullCursors: (c) => locked(() => writeJson(file('pullCursors'), c)),
   };
 }
 

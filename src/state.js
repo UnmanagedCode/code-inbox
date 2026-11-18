@@ -77,6 +77,8 @@ export function buildIndex(records) {
 // ---- inboxes and membership ----
 
 export const sharedCreate = (index, inboxId) => lowestId(index.inboxCreates.get(inboxId) ?? []);
+// The owner of a shared inbox (its inbox-create's signer), or null: a personal or unknown inbox has none.
+export const sharedOwner = (index, inboxId) => sharedCreate(index, inboxId)?.payload.signer ?? null;
 export const personalInvite = (index, inboxId) => lowestId(index.personalInvites.get(inboxId) ?? []);
 // The response that counts for an invite: the lowest record id, so every reader picks the same one.
 export const responseOf = (index, inviteId) => lowestId(index.responses.get(inviteId) ?? []);
@@ -402,6 +404,13 @@ export function mayRead(index, reader, route) {
   const inv = personalInvite(index, route.id);
   if (inv) return reader === inv.payload.signer || reader === inv.payload.to;
   return !!currentMembers(index, route.id)?.has(reader);
+}
+
+// Whether `writer` (a proven fingerprint) may hand over `payload`, signed by someone else, on `route`: only a msg on a
+// shared inbox's route whose owner, by this install's own state, is `writer` (the owner relays its members' messages).
+// The caller still requires the payload's own route to be `route`.
+export function mayRelay(index, writer, route, payload) {
+  return payload.type === 'msg' && route.kind === 'inbox' && sharedOwner(index, route.id) === writer;
 }
 
 // Whether this install (`self`) should ask `peer` for its records on `route`, judged by this install's own state:

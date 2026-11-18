@@ -270,7 +270,7 @@ async function stubEngine(t, send, log) {
   const store = createStore(dataDir, { log: silentLog });
   await store.load();
   const identity = await loadIdentity(dataDir);
-  const transport = { capabilities: { directory: true, push: false }, start: async () => {}, setInterest() {}, setAnnounce() {}, stats: () => ({ listening: null, connections: [], presence: {} }), send, sync: async () => {}, stop: async () => {} };
+  const transport = { capabilities: { directory: true, push: false, pull: false }, start: async () => {}, setInterest() {}, setAnnounce() {}, stats: () => ({ listening: null, connections: [], presence: {} }), send, sync: async () => {}, stop: async () => {} };
   const engine = createEngine({ store, identity, log, schedule: fakeClock().schedule, makeTransport: () => transport });
   t.after(() => engine.stop());
   await engine.boot();

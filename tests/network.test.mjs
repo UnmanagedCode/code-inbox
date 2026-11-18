@@ -291,10 +291,9 @@ test('a port forward yields the real peer, with the writer bound end to end', as
   assert.ok(forward.conns[0].fromTarget.some((f) => f.t === 'prove'));
 });
 
-// Invariant (interim, until the owner relays shared-inbox records): members exchange records only over a session
-// between them. On a common hub they reach each other (co-members are contacts); connected only to the owner's
-// listener, each exchanges with the owner but never with the other.
-test('members of a shared inbox reach each other through a common hub, and not without a shared route', async (t) => {
+// Invariant: members of a shared inbox reach each other on a common hub (co-members are contacts), and connected only
+// to the owner's listener, through the owner, which relays without the members ever having a session.
+test('members of a shared inbox reach each other through a common hub, and through the owner alone', async (t) => {
   async function team(nodes) {
     const [owner, m1, m2] = nodes;
     for (const m of [m1, m2]) await m.engine.importCard(owner.card());
@@ -320,8 +319,8 @@ test('members of a shared inbox reach each other through a common hub, and not w
   for (const name of ['m1', 'm2']) direct.push(await netNode(name, { listen: null, connections: [owner.addr()] }));
   closeAll(t, ...direct);
   const id2 = await team(direct);
-  assert.deepEqual(direct[0].engine.messages(id2).map((m) => m.body), ['from m1']);
-  assert.deepEqual(direct[2].engine.messages(id2), []);
+  for (const n of direct) assert.deepEqual(n.engine.messages(id2).map((m) => m.body), ['from m1'], n.name);
+  assert.deepEqual(direct[2].sessionsWith(direct[1].fp), [], 'no session between the members');
 });
 
 // Invariant: network settings are checked on save (NETWORK_INVALID over REST) and at boot, where a connection host

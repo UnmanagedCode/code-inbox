@@ -20,7 +20,7 @@ import { createNetwork } from './src/transport/network.js';
 export function transportFactory({ identity, store, pollMs, tcpSyncMs, now, schedule, log }) {
   return (config, view) => {
     const network = {
-      identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: tcpSyncMs, log,
+      identity: proofSigner(identity), view, cursors: { load: store.loadPullCursors, save: store.savePullCursors }, syncMs: tcpSyncMs, log,
       ...(now ? { now } : {}), ...(schedule ? { schedule } : {}),
     };
     if (config.kind === 'network') return createNetwork({ listen: config.listen, connections: config.connections, ...network });

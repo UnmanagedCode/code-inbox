@@ -122,7 +122,7 @@ A configured connection (`src/transport/connection.js`) whose far end says `hell
 - **The hub reads everything it relays** and sees who talks to whom ([Hub security](#hub-security)).
 - **Peers must share a hub** (or a direct route): a contact present on no hub this install is connected to is reached only over a connection.
 - **Two connections to one hub** register the same identities: the later wins and the other shows `HUB_DUPLICATE`.
-- **Both ends must be online at once** (through the hub); until then the sender keeps the record in its outbox.
+- **Both ends must be online at once** (through the hub); until then the sender keeps the record in its outbox. The exception is a shared inbox's members, whose records the owner relays ([transport.md → Owner relay](transport.md#owner-relay)).
 
 ## Hub security
 

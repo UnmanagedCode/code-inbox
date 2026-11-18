@@ -2,7 +2,8 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import crypto from 'node:crypto';
 import {
-  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, membersAt, messagesOf, nameRefusal,
+  addPending, addRejected, admissionDue, buildIndex, addRecord, classify, inboxVerdicts, currentMembers, directory, inboxesOf, invalidMessages, isValidMessage, mayRelay, membersAt, messagesOf, nameRefusal,
+  sharedOwner,
 } from '../src/state.js';
 import { createDirectory } from '../src/directory.js';
 
@@ -314,4 +315,32 @@ test('records that depend on an unseen record are pending', () => {
 test('a join request to anyone but the owner is rejected: NOT_OWNER', () => {
   const index = buildIndex([create()]);
   assert.deepEqual(classify(index, rec({ type: 'join-request', signer: B, to: C, inbox: INBOX })), { verdict: 'reject', reason: 'NOT_OWNER' });
+});
+
+// ---- the owner relay ----
+
+// Invariant (rule 1, D4): a record signed by someone other than its writer is admitted only when it is a msg on a
+// shared inbox's route and the writer is that inbox's owner by this index; nobody else relays, and nothing else.
+test('mayRelay admits only a msg on a shared inbox from that inbox\'s owner', () => {
+  const OTHER = 'b'.repeat(32);
+  const PERSONAL = 'a'.repeat(32);
+  const index = buildIndex([
+    create(), member(1, 'add', B), member(2, 'add', C),
+    rec({ type: 'inbox-create', signer: M, inbox: OTHER, nonce: 'd'.repeat(32), name: 'other' }),
+    rec({ type: 'invite', signer: A, to: B, kind: 'personal', inbox: PERSONAL, nonce: 'e'.repeat(32) }),
+  ]);
+  const shared = { kind: 'inbox', id: INBOX };
+  const fromB = { type: 'msg', signer: B, inbox: INBOX, body: 'hi', epoch: 2, prev: null };
+  assert.equal(sharedOwner(index, INBOX), A);
+  assert.equal(sharedOwner(index, PERSONAL), null, 'a personal inbox has no owner');
+  assert.equal(sharedOwner(index, 'f'.repeat(32)), null, 'an unknown inbox has no owner');
+  assert.equal(mayRelay(index, A, shared, fromB), true, 'the owner relays a member\'s msg');
+  assert.equal(mayRelay(index, C, shared, fromB), false, 'a co-member does not');
+  assert.equal(mayRelay(index, M, shared, fromB), false, 'the owner of another shared inbox does not');
+  assert.equal(mayRelay(index, A, shared, { type: 'member', signer: B, inbox: INBOX, seq: 3, op: 'add', member: M }), false, 'only msgs');
+  assert.equal(mayRelay(index, A, { kind: 'mailbox', fp: A }, { type: 'invite-response', signer: B, to: A }), false, 'not a mailbox');
+  assert.equal(mayRelay(index, A, { kind: 'directory' }, { type: 'inbox-create', signer: B }), false, 'not the directory');
+  assert.equal(mayRelay(index, A, { kind: 'inbox', id: PERSONAL }, { type: 'msg', signer: B, inbox: PERSONAL, body: 'hi' }), false, 'not a personal inbox');
+  const unknown = 'f'.repeat(32);
+  assert.equal(mayRelay(index, A, { kind: 'inbox', id: unknown }, { ...fromB, inbox: unknown }), false, 'not an inbox unknown here');
 });
