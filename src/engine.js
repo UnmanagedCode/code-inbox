@@ -240,28 +240,40 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     await relayOut(after.relays.filter(live));
   }
 
-  // The records a closing removes, by id → {type, inbox}: every record of its inbox (accepted, pending, refused). The
-  // install that signed the closing keeps the closing itself (others fetch it from here), and only removes what it
-  // accepted before it; a leaver also keeps the inbox's create (its directory row) and its own leaves.
+  // What a closing removes here: `records`, by id → {type, accepted}: every record of its inbox (accepted, pending,
+  // refused); `outbox`: the outbox entries of its inbox that go (those of removed records, and any whose record is
+  // not in the log); `cursor`: whether a read cursor of the inbox is held. The install that signed the closing keeps
+  // the closing itself (others fetch it from here) and only removes what it accepted before it; a leaver also keeps
+  // the inbox's create (its directory row) and its own leaves.
   function purgeTargets(closing) {
     const { inbox } = closing.payload;
     const own = closing.payload.signer === self;
     const keeps = (r) => own && (r.id === closing.id || r.seq > closing.seq || (closing.payload.type === 'inbox-leave'
       && (r.payload.type === 'inbox-create' || (r.payload.type === 'inbox-leave' && r.payload.signer === self))));
-    const out = new Map();
-    for (const r of index.byId.values()) if (r.payload.inbox === inbox && !keeps(r)) out.set(r.id, { type: r.payload.type, inbox, accepted: true });
-    for (const r of index.pending.values()) if (r.payload.inbox === inbox) out.set(r.id, { type: r.payload.type, inbox });
-    for (const [id, info] of index.rejected) if (info.inbox === inbox) out.set(id, { type: info.type, inbox });
-    return out;
+    const records = new Map();
+    for (const r of index.byId.values()) if (r.payload.inbox === inbox && !keeps(r)) records.set(r.id, { type: r.payload.type, accepted: true });
+    for (const r of index.pending.values()) if (r.payload.inbox === inbox) records.set(r.id, { type: r.payload.type, accepted: false });
+    for (const [id, info] of index.rejected) if (info.inbox === inbox) records.set(id, { type: info.type, accepted: false });
+    const outboxIds = new Set();
+    for (const e of outbox) {
+      const d = decodeRecord(e.bytes);
+      if (!d.ok || d.payload.inbox !== inbox) continue;
+      if (records.has(d.id) || (!index.byId.has(d.id) && d.id !== closing.id)) outboxIds.add(d.id);
+    }
+    return { records, outbox: outboxIds, cursor: Object.hasOwn(cursors, inbox) };
   }
 
   // Removes a closed inbox's records from this install (docs/protocol.md → Closing an inbox): the log, pending,
   // refused ids, the served log, the outbox, the read cursor, and the route of interest (so the transport forgets
   // where it was on it). The ids of removed records that do not travel on the inbox route go on the purge list, so a
   // copy offered again is dropped; inbox-route records stay off it, so a rejoin can fetch them again.
+  // Crash order: every durable step comes before the one that takes the closing out of accepted.ndjson (the last
+  // write of store.dropRecords), so a crash at any point leaves either the closing in the log, for boot to purge
+  // again (finishPurges), or nothing left to purge.
   async function purgeInbox(closing) {
-    const removed = purgeTargets(closing);
-    if (!removed.size) return;
+    const targets = purgeTargets(closing);
+    const removed = targets.records;
+    if (!removed.size && !targets.outbox.size && !targets.cursor) return;
     const p = closing.payload;
     const sharedDelete = p.type === 'inbox-delete' && p.kind === 'shared';
     const entries = [];
@@ -276,21 +288,22 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
       for (const e of fresh) notePurged(e);
     }
     const ids = new Set(removed.keys());
-    await store.dropRecords(ids);
-    const hadPending = [...index.pending.keys()].some((id) => ids.has(id));
+    if ([...index.pending.keys()].some((id) => ids.has(id))) await store.savePending([...index.pending.values()].filter((r) => !ids.has(r.id)));
+    if (targets.outbox.size) {
+      outbox = outbox.filter((e) => !targets.outbox.has(decodeRecord(e.bytes).id));
+      await saveOutbox();
+    }
+    if (targets.cursor) {
+      const { [p.inbox]: _gone, ...rest } = cursors;
+      cursors = rest;
+      await store.saveCursors(cursors);
+    }
+    // Last: refused ids, then the log, the closing included on a receiver.
+    if (ids.size) await store.dropRecords(ids);
     index = withoutRecords(index, ids);
     for (const [key, list] of serveLog) {
       const kept = list.filter((e) => !ids.has(e.id));
       if (kept.length) serveLog.set(key, kept); else serveLog.delete(key);
-    }
-    if (hadPending) await store.savePending([...index.pending.values()]);
-    const before = outbox.length;
-    outbox = outbox.filter((e) => !ids.has(decodeRecord(e.bytes).id));
-    if (outbox.length !== before) await saveOutbox();
-    if (Object.hasOwn(cursors, p.inbox)) {
-      const { [p.inbox]: _gone, ...rest } = cursors;
-      cursors = rest;
-      await store.saveCursors(cursors);
     }
     await persistNewPins();
     await syncIdentities();
@@ -319,17 +332,21 @@ export function createEngine({ store, identity, makeTransport, now = Date.now, s
     if (changed) await store.savePending([...index.pending.values()]);
   }
 
-  // At boot: every closing whose purge a crash interrupted. Another install's delete still in the log, and an own
-  // closing with a record of its inbox accepted before it that the purge would remove. A completed purge leaves
-  // nothing to do, and a rejoin's later history (higher seqs) is never touched.
+  // At boot: every closing whose purge a crash interrupted. Another install's delete still in the log is always
+  // purged (a receiver's purge removes it last). An own closing is, when the purge would remove a record accepted
+  // before it, or when it is the inbox's last record and pending, refused, outbox or cursor leftovers of the inbox
+  // remain; once a later record of the inbox exists (a rejoin), those belong to it and are never touched.
   async function finishPurges() {
     const closings = [...index.deletes.values(), ...index.leaves.values()].flat()
       .filter((r) => r.payload.type === 'inbox-delete' || r.payload.signer === self)
       .sort((a, b) => a.seq - b.seq);
     for (const closing of closings) {
       if (!index.byId.has(closing.id)) continue;
-      const interrupted = closing.payload.signer !== self || [...purgeTargets(closing).values()].some((x) => x.accepted);
-      if (interrupted) await purgeInbox(closing);
+      if (closing.payload.signer !== self) { await purgeInbox(closing); continue; }
+      const t = purgeTargets(closing);
+      const later = [...index.byId.values()].some((r) => r.payload.inbox === closing.payload.inbox && r.seq > closing.seq);
+      const leftovers = t.records.size > 0 || t.outbox.size > 0 || t.cursor;
+      if ([...t.records.values()].some((x) => x.accepted) || (!later && leftovers)) await purgeInbox(closing);
     }
   }
 

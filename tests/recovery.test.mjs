@@ -2,6 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
+import { createEngine } from '../src/engine.js';
 import { loadIdentity } from '../src/identity.js';
 import { decodeRecord, encodeRecord } from '../src/records.js';
 import { FILES, createStore } from '../src/store.js';
@@ -140,8 +141,13 @@ test('boot finishes an interrupted leave purge and leaves the history of a later
   await back.engine.sendMessage(inbox, 'two');
   await syncAll([a, back]);
   assert.deepEqual(back.engine.messages(inbox).map((m) => m.body), ['one', 'two']);
-  const before = await holdings(b.dataDir, inbox);
   await back.close();
+  // State of the rejoin, not leftovers of the leave: a pending record and a refused id it holds now.
+  const waiting = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'waiting', epoch: 99, prev: null });
+  await store.savePending([{ route: { kind: 'inbox', id: inbox }, bytes: waiting.bytes }]);
+  await store.appendRejected({ id: 'e'.repeat(32), reason: 'NOT_MEMBER', type: 'msg', inbox, signer: 'f'.repeat(64) });
+  const before = await holdings(b.dataDir, inbox);
+  assert.ok(before.includes('pending msg') && before.includes('rejected msg'));
   back = await makeInstall(null, { dataDir: b.dataDir });
   assert.deepEqual(back.engine.messages(inbox).map((m) => m.body), ['one', 'two'], 'the rejoin survives a boot');
   assert.deepEqual(await holdings(b.dataDir, inbox), before);
@@ -165,4 +171,111 @@ test('boot writes the removal owed for a leave accepted before a crash', async (
   assert.ok(!again.engine.listInboxes().find((x) => x.id === inbox).members.some((m) => m.fp === b.fp));
   await again.close();
   await b.close();
+});
+
+// A store over `dataDir` that "crashes" right after the write `after` completes: every later write throws, as if the
+// process had died there. Reads still work. `crashed()` says whether the write `after` was reached.
+function crashingStore(dataDir, after) {
+  const store = createStore(dataDir, { log: silentLog });
+  const out = { ...store, crashed: () => dead };
+  let dead = false;
+  for (const [k, fn] of Object.entries(store)) {
+    if (typeof fn !== 'function' || k.startsWith('load')) continue;
+    out[k] = async (...args) => {
+      if (dead) throw new Error(`crashed before ${k}`);
+      const r = await fn(...args);
+      if (k === after) dead = true;
+      return r;
+    };
+  }
+  return out;
+}
+
+// bob's data dir, as a member of alice's inbox, holding every kind of local state of it: accepted records, a pending
+// record, a refused id, an owed outbox entry and a read cursor. bob is stopped and has no transport.
+async function seededMember() {
+  const { a, b, inbox } = await sharedPair('hello');
+  await a.engine.sendMessage(inbox, 'read by bob');
+  await syncAll([a, b]);
+  await b.engine.readMessages(inbox, {});
+  await b.close();
+  const bob = await loadIdentity(b.dataDir);
+  const owed = (await recordsOf(b.dataDir)).find((d) => d.payload.type === 'msg' && d.payload.signer === bob.fp);
+  const waiting = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'waiting', epoch: 99, prev: null });
+  const store = createStore(b.dataDir, { log: silentLog });
+  await store.load();
+  await store.savePending([{ route: { kind: 'inbox', id: inbox }, bytes: waiting.bytes }]);
+  await store.saveOutbox([{ route: { kind: 'inbox', id: inbox }, to: [a.fp], bytes: owed.bytes }]);
+  await store.appendRejected({ id: 'e'.repeat(32), reason: 'NOT_MEMBER', type: 'msg', inbox, signer: 'f'.repeat(64) });
+  unshare(b.dataDir);
+  const held = await holdings(b.dataDir, inbox);
+  for (const h of ['cursors', 'outbox msg', 'pending msg', 'rejected msg']) assert.ok(held.includes(h), `seeded: ${h}`);
+  return { a, b, bob, inbox };
+}
+
+// Invariant (recoverable crash points): a receiver's purge writes the closing's removal from accepted.ndjson last, so
+// a crash after any earlier durable step leaves the closing in the log for boot to purge again, and a crash after the
+// last step leaves nothing to do. Whatever step a crash follows, the next boot leaves nothing of the inbox.
+for (const step of ['appendPurged', 'savePending', 'saveOutbox', 'saveCursors', 'dropRecords']) {
+  test(`a delete purge that crashes after ${step} leaves nothing of the inbox after the next boot`, async () => {
+    const { a, b, inbox } = await seededMember();
+    await a.engine.deleteInbox(inbox);
+    const del = (await recordsOf(a.dataDir)).find((d) => d.payload.type === 'inbox-delete');
+    const store = crashingStore(b.dataDir, step);
+    const engine = createEngine({ store, identity: await loadIdentity(b.dataDir), log: silentLog, makeTransport: () => { throw new Error('no transport'); } });
+    await engine.boot();
+    await engine.ingest({ route: del.route, writer: a.fp, bytes: del.bytes }).catch((err) => assert.match(err.message, /crashed before/));
+    assert.ok(store.crashed(), `the purge reached ${step}`);
+    await engine.stop();
+    const again = await makeInstall(null, { dataDir: b.dataDir });
+    assert.deepEqual(await holdings(b.dataDir, inbox), []);
+    assert.equal(again.engine.state().diagnostics.pending, 0);
+    const { purged } = await createStore(b.dataDir, { log: silentLog }).load();
+    assert.ok(purged.some((e) => e.id === del.id && e.dead));
+    await again.close();
+    await a.close();
+  });
+}
+
+// Invariant: boot cleans an own closing's leftovers of every kind, not only accepted records: a pending record, a
+// refused id or an outbox entry of the inbox left beside a leave whose accepted records are already gone.
+test('boot cleans pending, refused and outbox leftovers beside an own leave', async () => {
+  const { a, b, inbox } = await sharedPair('one');
+  await b.engine.leaveInbox(inbox);
+  await b.close();
+  const bob = await loadIdentity(b.dataDir);
+  const orphan = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'never logged', epoch: 1, prev: null });
+  const waiting = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'waiting', epoch: 99, prev: null });
+  const store = createStore(b.dataDir, { log: silentLog });
+  await store.load();
+  await store.savePending([{ route: { kind: 'inbox', id: inbox }, bytes: waiting.bytes }]);
+  await store.saveOutbox([{ route: { kind: 'inbox', id: inbox }, to: [a.fp], bytes: orphan.bytes }]);
+  await store.appendRejected({ id: 'e'.repeat(32), reason: 'NOT_MEMBER', type: 'msg', inbox, signer: 'f'.repeat(64) });
+  unshare(b.dataDir);
+  const again = await makeInstall(null, { dataDir: b.dataDir });
+  assert.deepEqual(await holdings(b.dataDir, inbox), ['accepted inbox-create', 'accepted inbox-leave']);
+  assert.equal(again.engine.state().diagnostics.pending, 0);
+  await again.close();
+  await a.close();
+});
+
+// Invariant: the same for an own revoke: a pending record or an outbox entry of the revoked inbox is cleaned at boot.
+test('boot cleans pending and outbox leftovers beside an own revoke', async () => {
+  const { installs: [a, b] } = await makeNetwork(['alice', 'bob']);
+  const inbox = await connectPersonal(a, b);
+  await b.engine.deleteInbox(inbox);
+  await b.close();
+  const bob = await loadIdentity(b.dataDir);
+  const orphan = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'never logged' });
+  const waiting = encodeRecord(bob, { type: 'msg', signer: bob.fp, ts: Date.now(), inbox, body: 'waiting' });
+  const store = createStore(b.dataDir, { log: silentLog });
+  await store.load();
+  await store.savePending([{ route: { kind: 'inbox', id: inbox }, bytes: waiting.bytes }]);
+  await store.saveOutbox([{ route: { kind: 'inbox', id: inbox }, to: [a.fp], bytes: orphan.bytes }]);
+  unshare(b.dataDir);
+  const again = await makeInstall(null, { dataDir: b.dataDir });
+  assert.deepEqual(await holdings(b.dataDir, inbox), ['accepted inbox-delete']);
+  assert.equal(again.engine.state().diagnostics.pending, 0);
+  await again.close();
+  await a.close();
 });

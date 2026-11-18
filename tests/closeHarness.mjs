@@ -10,7 +10,8 @@ import { freePort, settle as netSettle, waitFor } from './tcpHelpers.mjs';
 
 // Multi-install worlds for the inbox-closing tests (tests/close.test.mjs): one test body runs on the file share and on
 // the network. A world's nodes are whole installs, each with `name`, `fp`, `dataDir`, `engine`, `mcp`, `rest(method,
-// path, body)`, `restart()` (from its data dir and stored settings) and `close()`; `up` says whether it runs.
+// path, body)`, `restart()` (from its data dir and stored settings) and `close()`; `up` says whether it runs. Network
+// nodes also have `serve(reader, route, since)`.
 //   'file-share': every install on one share; settle = scan rounds.
 //   'network':    a star: node 0 listens on a fixed port (so it restarts on the same one), every other node connects
 //                 only to it and imports its card; settle = maintain rounds.
@@ -50,6 +51,8 @@ async function networkNode(t, name, opts) {
     let port = null;
     return {
       fp: n.fp, dataDir: n.dataDir, engine: n.engine, mcp, card: n.card,
+      // What this install serves `reader` on `route` past `since` (the engine view a transport pulls through).
+      serve: (reader, route, since = 0) => n.view.serve(reader, route, since, Number.MAX_SAFE_INTEGER),
       async rest(method, p, body) {
         if (port === null) port = await listen(server);
         return request(port, { method, path: p, headers: PAGE_HEADERS, body: body === undefined ? undefined : JSON.stringify(body) });

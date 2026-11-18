@@ -122,15 +122,16 @@ export function createStore(dataDir, { log = console } = {}) {
         }
       });
     },
-    // Removes the records `ids` (a Set) from accepted.ndjson and rejected.ndjson. seq.json is written first, so the
-    // next seq stays above every seq ever assigned even when the newest line goes.
+    // Removes the records `ids` (a Set) from rejected.ndjson, then from accepted.ndjson: the log is written last, so
+    // a closing that removes itself leaves the log only once everything else is done. seq.json is written first, so
+    // the next seq stays above every seq ever assigned even when the newest line goes.
     dropRecords(ids) {
       return locked(async () => {
         await writeJson(file('seq'), { lastSeq });
-        const accepted = await readLines(file('accepted'), log);
-        await writeFileAtomic(file('accepted'), accepted.filter((e) => !ids.has(e.id)).map((e) => `${JSON.stringify(e)}\n`).join(''));
         const rejected = await readLines(file('rejected'), log);
         await writeFileAtomic(file('rejected'), rejected.filter((e) => !ids.has(e.id)).map((e) => `${JSON.stringify(e)}\n`).join(''));
+        const accepted = await readLines(file('accepted'), log);
+        await writeFileAtomic(file('accepted'), accepted.filter((e) => !ids.has(e.id)).map((e) => `${JSON.stringify(e)}\n`).join(''));
       });
     },
     // Appends purge-list entries {id, inbox, dead}, durably.

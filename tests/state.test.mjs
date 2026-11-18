@@ -392,6 +392,20 @@ test('leaveDue: due while a member; not after a removal; not after a re-add newe
   assert.equal(leaveDue(index, fresh), true, 'a leave citing the re-admission epoch');
 });
 
+// Invariant (leaveDue compares member seq with the leave's epoch, never acceptance order): a re-admission the owner
+// accepted before a stale leave arrived (a lower acceptance seq than the leave's) still wins, because its member seq
+// is above the epoch the leave cites; a leave citing the re-admission epoch is due.
+test('leaveDue: a re-admission accepted before the stale leave still wins by its member seq', () => {
+  const index = buildIndex([create(), member(1, 'add', B), member(2, 'remove', B, { keepHead: null }), member(3, 'add', B)]);
+  const stale = leave(B, 1);
+  addRecord(index, stale);
+  assert.ok(stale.seq > Math.max(...index.members.get(INBOX).map((m) => m.seq)), 'the leave is accepted after every member record');
+  assert.equal(leaveDue(index, stale), false);
+  const current = leave(B, 3);
+  addRecord(index, current);
+  assert.equal(leaveDue(index, current), true);
+});
+
 // Invariant: a record is dropped on arrival exactly when it was purged here (by id), belongs to a dead shared inbox
 // (a purged create or the owner's own kept delete), answers a purged invite or join request, or revokes a personal
 // invite already purged here (the other party's simultaneous revoke); nothing else is.

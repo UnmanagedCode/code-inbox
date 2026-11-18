@@ -119,6 +119,55 @@ test('a leave after the owner\'s removal writes no second removal', async () => 
   await m.close();
 });
 
+// Invariant (the purge reaches refused ids): a record of the inbox this install refused is gone after the purge,
+// from rejected.ndjson and from the index.
+test('a refused record of the inbox is purged from rejected.ndjson and the index', async () => {
+  const { installs } = await makeNetwork(['owner', 'member', 'stranger']);
+  const [owner, m, stranger] = installs;
+  const { id: inbox } = await owner.engine.createSharedInbox('team');
+  await syncAll(installs);
+  await m.engine.requestJoin(inbox);
+  await syncAll(installs);
+  await owner.engine.respondJoin(owner.engine.state().joinRequests.incoming[0].id, true);
+  await syncAll(installs);
+  const outsider = await loadIdentity(stranger.dataDir);
+  const refused = encodeRecord(outsider, { type: 'msg', signer: outsider.fp, ts: Date.now(), inbox, body: 'not a member', epoch: 1, prev: null });
+  await m.engine.ingest({ route: { kind: 'inbox', id: inbox }, writer: outsider.fp, bytes: refused.bytes });
+  assert.deepEqual(m.engine.verdicts(inbox).rejected, [refused.id], 'refused NOT_MEMBER');
+  assert.ok((await holdings(m.dataDir, inbox)).includes('rejected msg'));
+  await owner.engine.deleteInbox(inbox);
+  await syncAll(installs);
+  assert.deepEqual(m.engine.verdicts(inbox).rejected, [], 'gone from the index');
+  assert.deepEqual(await holdings(m.dataDir, inbox), [], 'gone from rejected.ndjson');
+  for (const x of installs) await x.close();
+});
+
+// Invariant (the served log follows the purge): an install stops serving a closed inbox's records on every route: a
+// leaver no longer serves its messages on the inbox route, and the owner no longer serves the deleted inbox's create
+// on the directory route or its invite on the invitee's mailbox.
+test('network: a purging install stops serving the inbox\'s records', async (t) => {
+  const w = await world(t, 'network', ['owner', 'm1', 'invitee']);
+  const [owner, m1, invitee] = w.nodes;
+  const id = await sharedInbox(w, owner, [m1]);
+  await m1.engine.sendMessage(id, 'served');
+  await owner.engine.inviteMember(id, invitee.fp);
+  await w.settle();
+  const types = (recs) => recs.map((r) => decodeRecord(r.bytes).payload).filter((p) => p.inbox === id).map((p) => p.type).sort();
+  const inboxRoute = { kind: 'inbox', id };
+  const directory = { kind: 'directory' };
+  const mailbox = { kind: 'mailbox', fp: invitee.fp };
+  assert.deepEqual(types(m1.serve(owner.fp, inboxRoute).recs), ['msg']);
+  assert.deepEqual(types(owner.serve(invitee.fp, directory).recs), ['inbox-create']);
+  assert.deepEqual(types(owner.serve(invitee.fp, mailbox).recs), ['invite']);
+  await m1.engine.leaveInbox(id);
+  await w.settle(3);
+  assert.deepEqual(types(m1.serve(owner.fp, inboxRoute).recs ?? []), [], 'the leaver serves none of its messages');
+  await owner.engine.deleteInbox(id);
+  await w.settle();
+  assert.deepEqual(types(owner.serve(invitee.fp, directory).recs), ['inbox-delete'], 'the directory serves only the kept delete');
+  assert.deepEqual(types(owner.serve(invitee.fp, mailbox).recs), [], 'the invite is no longer served');
+});
+
 // ---- multi-install flows, on every transport ----
 
 for (const kind of KINDS) {
