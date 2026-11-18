@@ -163,8 +163,9 @@ test('a proof bound to another target or role is refused', async (t) => {
   const dHello = await acc.nextOf('hello');
   assert.equal((await acc.nextOf('prove')).target, null);
   acc.send({ t: 'prove', ids: acceptProofs([target], 'dial', myNonce, dHello.nonce, [dialer.fp]) });
-  assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
   await waitFor(() => dialer.endpoint.stats().connections[0].error?.code === 'CONNECTION_REFUSED', 'the refusal on the connection');
+  await waitFor(() => acc.frames.some((f) => f.t === 'bye'), 'the bye');
+  assert.equal(acc.frames.find((f) => f.t === 'bye').reason, 'PROOF');
   assert.deepEqual(dialer.endpoint.stats().sessions, []);
 });
 
@@ -211,10 +212,13 @@ function streamReader(lying, link, s) {
     }
     return out;
   };
-  r.nextOf = async (type) => {
+  // The next frame of `type`; fails after `ms` rather than hang when it never comes.
+  r.nextOf = async (type, ms = 3000) => {
+    const end = Date.now() + ms;
     for (;;) {
       const all = frames();
       while (r.read < all.length) { const f = all[r.read++]; if (f.t === type) return f; }
+      if (Date.now() > end) throw new Error(`timed out waiting for a ${type} on stream ${s}`);
       await new Promise((res) => setTimeout(res, 2));
     }
   };
@@ -235,8 +239,10 @@ test('an untargeted dialer refuses an acceptor that proves one of its own identi
   assert.equal((await acc.nextOf('prove')).target, null);
   // A correct accept proof (role, both nonces, bound to the dialer's fps), signed by the dialer's own key.
   acc.send({ t: 'prove', ids: acceptProofs([self], 'accept', myNonce, dHello.nonce, [dialer.fp]) });
-  assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
+  // Bounded: without the refusal the dialer would answer `ok` and no `bye` would ever come.
   await waitFor(() => dialer.endpoint.stats().connections[0].error?.code === 'CONNECTION_REFUSED', 'the refusal on the connection');
+  await waitFor(() => acc.frames.some((f) => f.t === 'bye'), 'the bye');
+  assert.equal(acc.frames.find((f) => f.t === 'bye').reason, 'PROOF');
   assert.deepEqual(dialer.endpoint.stats().sessions, []);
 });
 
