@@ -1,4 +1,4 @@
-import { FP_RE, RECORD_MAX_BYTES } from '../records.js';
+import { ANNOUNCE_MAX_BYTES, FP_RE, RECORD_MAX_BYTES } from '../records.js';
 import { isRoute } from './index.js';
 
 // The TCP wire format (docs/protocol.md → TCP wire format): a 4-byte unsigned big-endian length, then that many
@@ -10,7 +10,10 @@ export const TCP_FRAME_MAX = 1024 * 1024; // every frame after
 export const TCP_BATCH_BYTES = 512 * 1024; // record bytes a server packs into one `recs`
 export const TCP_MAX_IDENTITIES = 16; // ids in one `prove`; identities on one endpoint
 export const TCP_PULL_ROUTES_MAX = 512; // routes in one `pull`
-export const TCP_WHOIS_MAX = 64; // fps in one `whois`
+export const HELLO_VERSION = 2;
+// Who sends a `hello`: every install says `endpoint` (listener, dialer, hub client, inside hub streams); a hub says
+// `hub`. An outbound connection learns from the far end's hello which protocol it reached.
+export const HELLO_KINDS = ['endpoint', 'hub'];
 export const BYE_REASONS = ['PROOF', 'PROTOCOL', 'DUPLICATE', 'LIMIT', 'STOP'];
 
 // `code` is the `bye` reason the session closes with: LIMIT (a size limit) or PROTOCOL (anything else).
@@ -37,6 +40,8 @@ export function createDecoder({ maxFrame }) {
   return {
     setMax(n) { max = n; },
     pending: () => buf.length,
+    // The bytes after the last frame taken: what a reader that stops here hands to the next one.
+    rest: () => buf,
     push(chunk) { buf = buf.length ? Buffer.concat([buf, chunk]) : Buffer.from(chunk); },
     next() {
       if (buf.length < 4) return null;
@@ -89,10 +94,18 @@ const route = (v) => (isRoute(v) ? v : bad('an invalid route'));
 const fromTo = (f) => { if (!isFp(f.from) || !isFp(f.to)) bad('from/to must be fingerprints'); };
 const reqId = (f) => { if (!isUint(f.id)) bad('id must be a non-negative integer'); };
 
-// t → [keys, check(frame) → parsed frame]. `prove` differs by who sends it: the dialer names its target.
+// A `hello` from a sender of one of `kinds`.
+const helloOf = (kinds) => [['t', 'v', 'nonce', 'kind'], (f) => {
+  if (f.v !== HELLO_VERSION || typeof f.nonce !== 'string' || !NONCE_RE.test(f.nonce)) bad(`hello needs v ${HELLO_VERSION} and a 64-hex nonce`);
+  return kinds.includes(f.kind) ? f : bad(`a hello of kind ${JSON.stringify(f.kind)?.slice(0, 20)} is not expected here`);
+}];
+
+// t → [keys, check(frame) → parsed frame]. `prove` differs by who sends it: the dialer names its target, or null
+// when it dials an address without knowing who is there.
 const SCHEMAS = {
-  hello: [['t', 'v', 'nonce'], (f) => (f.v === 1 && typeof f.nonce === 'string' && NONCE_RE.test(f.nonce) ? f : bad('hello needs v 1 and a 64-hex nonce'))],
-  'prove-dial': [['t', 'target', 'ids'], (f) => (isFp(f.target) ? { t: f.t, target: f.target, ids: ids(f.ids) } : bad('target must be a fingerprint'))],
+  // An endpoint session talks only to another endpoint: a hub's hello is refused like any other bad frame.
+  hello: helloOf(['endpoint']),
+  'prove-dial': [['t', 'target', 'ids'], (f) => (f.target === null || isFp(f.target) ? { t: f.t, target: f.target, ids: ids(f.ids) } : bad('target must be a fingerprint or null'))],
   'prove-accept': [['t', 'ids'], (f) => ({ t: f.t, ids: ids(f.ids) })],
   ok: [['t'], (f) => f],
   rec: [['t', 'from', 'to', 'route', 'rec'], (f) => { fromTo(f); return { ...f, route: route(f.route), rec: recordBytes(f.rec) }; }],
@@ -119,12 +132,6 @@ const SCHEMAS = {
     });
     return { ...f, routes };
   }],
-  whois: [['t', 'id', 'from', 'to', 'fps'], (f) => {
-    fromTo(f); reqId(f);
-    if (!list(f.fps, 1, TCP_WHOIS_MAX, 'fps').every(isFp)) bad('fps must be fingerprints');
-    return f;
-  }],
-  cards: [['t', 'id', 'from', 'to', 'recs'], (f) => { fromTo(f); reqId(f); return { ...f, recs: list(f.recs, 0, TCP_WHOIS_MAX, 'recs').map(recordBytes) }; }],
   ping: [['t'], (f) => f],
   pong: [['t'], (f) => f],
   bye: [['t', 'reason'], (f) => (BYE_REASONS.includes(f.reason) ? f : bad('unknown bye reason'))],
@@ -137,7 +144,7 @@ export const PHASES = {
   'prove-dial': ['prove', 'bye'],
   'prove-accept': ['prove', 'bye'],
   ok: ['ok', 'bye'],
-  ready: ['rec', 'pull', 'recs', 'whois', 'cards', 'ping', 'pong', 'bye'],
+  ready: ['rec', 'pull', 'recs', 'ping', 'pong', 'bye'],
 };
 
 // Validates a decoded frame against its exact schema for `phase`. Resolves the frame with record, key and sig
@@ -146,28 +153,38 @@ export const PHASES = {
 export function parseFrame(obj, phase) {
   if (!isObj(obj) || typeof obj.t !== 'string') bad('a frame is not an object with a string t');
   if (!PHASES[phase]?.includes(obj.t)) bad(`a ${obj.t.slice(0, 20)} frame is not allowed in phase ${phase}`);
-  const [keys, check] = SCHEMAS[obj.t === 'prove' ? phase : obj.t];
+  return checked(obj, SCHEMAS[obj.t === 'prove' ? phase : obj.t]);
+}
+
+function checked(obj, [keys, check]) {
   if (!exact(obj, keys)) bad(`a ${obj.t} frame must have exactly ${keys.join(', ')}`);
   return check(obj);
+}
+
+// The first frame an outbound connection reads (greeting.js): a v2 `hello` of any known kind, nothing else. Its
+// `kind` says whether the far end is an endpoint or a hub. Throws FrameError PROTOCOL otherwise.
+export function parseGreeting(obj) {
+  if (!isObj(obj) || obj.t !== 'hello') bad('the first frame is not a hello');
+  return checked(obj, helloOf(HELLO_KINDS));
 }
 
 // ---- the hub link (docs/protocol.md → Hub link wire format) ----
 
 export const HUB_CHUNK_BYTES = 64 * 1024; // raw tunneled bytes a client puts in one `data` frame
 export const HUB_DATA_MAX = Math.ceil((HUB_CHUNK_BYTES * 4) / 3); // base64url chars of one chunk
-export const HUB_WATCH_MAX = 1024; // fps in one `watch` or `present`
-export const HUB_FRAME_MAX = 128 * 1024; // every hub-link frame after `ok`: one `data` or a full `watch`
+export const HUB_FRAME_MAX = 128 * 1024; // every hub-link frame after `ok`: one `data` at most
 export const HUB_CLOSE_REASONS = ['ABSENT', 'GONE', 'CLOSED', 'LIMIT'];
 
 const isStreamId = (v) => Number.isSafeInteger(v) && v > 0;
 const streamId = (f, parity) => {
   if (!isStreamId(f.s) || (parity !== undefined && f.s % 2 !== parity)) bad(`s must be ${parity === 1 ? 'an odd' : parity === 0 ? 'an even' : 'a'} positive integer`);
 };
-const fpList = (v) => { if (!list(v, 0, HUB_WATCH_MAX, 'fps').every(isFp)) bad('fps must be fingerprints'); return v; };
+const announceBytes = (v) => bytesOf(v, 1, ANNOUNCE_MAX_BYTES, 'an announce');
+const fpOf = (f) => { if (!isFp(f.fp)) bad('fp must be a fingerprint'); };
 const closeOf = (reasons) => [['t', 's', 'reason'], (f) => { streamId(f); return reasons.includes(f.reason) ? f : bad('unknown close reason'); }];
 
 const HUB_SCHEMAS = {
-  hello: SCHEMAS.hello,
+  hello: helloOf(['endpoint']),
   register: [['t', 'ids'], (f) => ({ t: f.t, ids: ids(f.ids) })],
   ok: SCHEMAS.ok,
   open: [['t', 's', 'to'], (f) => { streamId(f, 1); return isFp(f.to) ? f : bad('to must be a fingerprint'); }],
@@ -177,26 +194,29 @@ const HUB_SCHEMAS = {
     if (typeof f.b !== 'string' || f.b.length < 1 || f.b.length > HUB_DATA_MAX || !B64URL_RE.test(f.b)) bad(`b must be 1–${HUB_DATA_MAX} base64url characters`);
     return f;
   }],
-  watch: [['t', 'id', 'fps'], (f) => { if (!isUint(f.id)) bad('id must be a non-negative integer'); fpList(f.fps); return f; }],
-  present: [['t', 'id', 'fps'], (f) => { if (!isUint(f.id)) bad('id must be a non-negative integer'); fpList(f.fps); return f; }],
-  presence: [['t', 'fp', 'online'], (f) => (isFp(f.fp) && typeof f.online === 'boolean' ? f : bad('presence needs a fingerprint and a boolean online'))],
+  // A client's own signed announce (the hub checks it is signed by an fp this link registered).
+  announce: [['t', 'rec'], (f) => ({ t: f.t, rec: announceBytes(f.rec) })],
+  // The roster: `fp` is registered on another link, with that link's announce for it (null while none was given) …
+  peer: [['t', 'fp', 'rec'], (f) => { fpOf(f); return { t: f.t, fp: f.fp, rec: f.rec === null ? null : announceBytes(f.rec) }; }],
+  // … or no longer registered anywhere.
+  gone: [['t', 'fp'], (f) => { fpOf(f); return f; }],
   ping: SCHEMAS.ping,
   pong: SCHEMAS.pong,
   bye: SCHEMAS.bye,
 };
 
 // role → phase → the frame types that side accepts. The hub waits for `register` after `hello`, the client for
-// `ok`; a frame meant for the other direction is refused like an unknown one.
+// `ok`; a frame meant for the other direction is refused like an unknown one. A client has no hello phase: its
+// greeting (greeting.js) read the hub's hello before the link was built.
 export const HUB_PHASES = {
   hub: {
     hello: ['hello', 'bye'],
     register: ['register', 'bye'],
-    ready: ['open', 'data', 'close', 'watch', 'ping', 'pong', 'bye'],
+    ready: ['open', 'data', 'close', 'announce', 'ping', 'pong', 'bye'],
   },
   client: {
-    hello: ['hello', 'bye'],
     ok: ['ok', 'bye'],
-    ready: ['incoming', 'data', 'close', 'present', 'presence', 'ping', 'pong', 'bye'],
+    ready: ['incoming', 'data', 'close', 'peer', 'gone', 'ping', 'pong', 'bye'],
   },
 };
 
@@ -204,11 +224,9 @@ export const HUB_PHASES = {
 const CLOSE_BY = { hub: closeOf(['CLOSED', 'LIMIT']), client: closeOf(HUB_CLOSE_REASONS) };
 
 // Validates a decoded hub-link frame received by `role` ('hub' | 'client') in `phase`, against its exact schema.
-// Resolves the frame (`register` ids decoded to bytes); throws FrameError PROTOCOL otherwise.
+// Resolves the frame (`register` ids and announce `rec` decoded to bytes); throws FrameError PROTOCOL otherwise.
 export function parseHubFrame(obj, role, phase) {
   if (!isObj(obj) || typeof obj.t !== 'string') bad('a frame is not an object with a string t');
   if (!HUB_PHASES[role]?.[phase]?.includes(obj.t)) bad(`a ${obj.t.slice(0, 20)} frame is not allowed for the ${role} in phase ${phase}`);
-  const [keys, check] = obj.t === 'close' ? CLOSE_BY[role] : HUB_SCHEMAS[obj.t];
-  if (!exact(obj, keys)) bad(`a ${obj.t} frame must have exactly ${keys.join(', ')}`);
-  return check(obj);
+  return checked(obj, obj.t === 'close' ? CLOSE_BY[role] : HUB_SCHEMAS[obj.t]);
 }

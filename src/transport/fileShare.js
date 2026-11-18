@@ -272,11 +272,12 @@ export function createFileShare({ shareDir, dataDir, selfFp, pollMs = SHARE_POLL
   return {
     capabilities: { directory: true, push: false },
     root,
-    addresses: () => [],
     async start(s) {
       sink = s;
       loop();
     },
+    // The engine writes the announce file itself (a directory-route send), so the share needs nothing here.
+    setAnnounce() {},
     setInterest(routes) { interest = [...routes]; },
     // The share stores everything, so every recipient counts as delivered.
     // Refused SHARE_UNAVAILABLE (retryable, nothing created) while the share's root does not exist: a share whose

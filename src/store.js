@@ -2,7 +2,7 @@ import fs from 'node:fs/promises';
 import path from 'node:path';
 import { ensurePrivateDir, readJson, writeFileAtomic, writeJson } from './fsAtomic.js';
 import { withLock } from './mutex.js';
-import { FP_RE } from './records.js';
+import { FP_RE, decodeRecord } from './records.js';
 import { isRoute } from './transport/index.js';
 
 // The install's local state under the data dir, written only by this backend (docs/architecture.md → Data dir).
@@ -17,10 +17,11 @@ export const FILES = {
   cursors: 'cursors.json',
   notify: 'notify.json',
   peerCursors: 'peer-cursors.json',
-  contacts: 'contacts.json',
+  identities: 'identities.json',
 };
 
-export const DEFAULT_SETTINGS = { name: null, transport: null, notifyTarget: null };
+// `announced`: the name this install last announced (its announce is re-signed from it at every boot), or null.
+export const DEFAULT_SETTINGS = { name: null, announced: null, transport: null, notifyTarget: null };
 
 // One-shot settings migration: {shareDir} becomes transport {kind:'file-share', dir} (null: none), and the
 // shareDir key is dropped. Resolves the settings as stored; writes only when something changed.
@@ -82,7 +83,7 @@ export function createStore(dataDir, { log = console } = {}) {
         outbox: validOutbox(await readJson(file('outbox'), []), log),
         cursors: await readJson(file('cursors'), {}),
         notify: await readJson(file('notify'), { watermark: 0 }),
-        contacts: await readJson(file('contacts'), []),
+        identities: validIdentities(await readJson(file('identities'), {}), log),
       };
     },
     loadNotify: () => readJson(file('notify'), { watermark: 0 }),
@@ -119,7 +120,8 @@ export function createStore(dataDir, { log = console } = {}) {
     savePins: (p) => locked(() => writeJson(file('pins'), p)),
     saveCursors: (c) => locked(() => writeJson(file('cursors'), c)),
     saveNotify: (n) => locked(() => writeJson(file('notify'), n)),
-    saveContacts: (list) => locked(() => writeJson(file('contacts'), list)),
+    // {fp: {announce: base64url announce record bytes, imported: boolean}}: the identities this install keeps.
+    saveIdentities: (obj) => locked(() => writeJson(file('identities'), obj)),
     // {peerFp: {routeKey: seq}}: the TCP transport's pull cursors.
     loadPeerCursors: () => readJson(file('peerCursors'), {}),
     savePeerCursors: (c) => locked(() => writeJson(file('peerCursors'), c)),
@@ -133,6 +135,21 @@ function validOutbox(list, log) {
   const ok = (e) => e && typeof e === 'object' && isRoute(e.route) && Array.isArray(e.to) && e.to.every((fp) => typeof fp === 'string' && FP_RE.test(fp)) && typeof e.bytes === 'string';
   return list.filter((e, i) => ok(e) || (log.warn(`code-inbox: outbox.json entry ${i} is invalid: dropped`), false))
     .map((e) => ({ route: e.route, to: e.to, bytes: Buffer.from(e.bytes, 'base64') }));
+}
+
+// The identities.json entries that hold an announce signed by their own fp and an `imported` flag. Any other entry
+// is dropped and logged: a name must never come from bytes its fp did not sign.
+function validIdentities(obj, log) {
+  if (!obj || typeof obj !== 'object' || Array.isArray(obj)) { log.warn('code-inbox: identities.json is not an object: ignored'); return {}; }
+  const out = {};
+  for (const [fp, e] of Object.entries(obj)) {
+    const bytes = typeof e?.announce === 'string' && /^[A-Za-z0-9_-]+$/.test(e.announce) ? Buffer.from(e.announce, 'base64url') : null;
+    const d = bytes ? decodeRecord(bytes) : null;
+    const ok = FP_RE.test(fp) && typeof e.imported === 'boolean' && d?.ok && d.payload.type === 'announce' && d.payload.signer === fp;
+    if (ok) out[fp] = { announce: e.announce, imported: e.imported };
+    else log.warn(`code-inbox: identities.json entry ${fp.slice(0, 16)} does not hold an announce signed by it: dropped`);
+  }
+  return out;
 }
 
 function writeFileLines(file, list) {

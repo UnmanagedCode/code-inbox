@@ -2,7 +2,7 @@ import test from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { encodeCard, encodeRecord } from '../src/records.js';
+import { decodeCard, decodeRecord, encodeCard, encodeRecord } from '../src/records.js';
 import { SHARE_ROOT } from '../src/transport/fileShare.js';
 import { loadIdentity } from '../src/identity.js';
 import { connectPersonal, makeInstall, makeNetwork, mcpCall, syncAll, tmpDir } from './helpers.mjs';
@@ -320,8 +320,8 @@ test('importCard accepts only another identity\'s announce', async (t) => {
   const a = await makeInstall(null);
   const b = await makeInstall(null);
   t.after(async () => { for (const x of [a, b]) await x.close(); });
-  await a.engine.setTcp({ port: 0 });
-  await b.engine.setTcp({ port: 0 });
+  await a.engine.setNetwork({ listen: { port: 0 } });
+  await b.engine.setNetwork({ listen: { port: 0 } });
   await b.engine.setName('bob');
   await b.engine.announce();
   const bobId = await loadIdentity(b.dataDir);
@@ -334,22 +334,20 @@ test('importCard accepts only another identity\'s announce', async (t) => {
   assert.deepEqual(a.engine.state().directory.map((d) => d.name), ['bob']);
 });
 
-// Invariant: the card on the page is stale exactly while the announced addresses differ from where the install listens.
-test('cardStale turns true when the address changes and false after announcing', async (t) => {
+// Invariant (D8): a card says who an install is, never where: its announce holds only a name, and changing the network
+// settings leaves it as it was.
+test('a card carries identity only and is unchanged by network settings changes', async (t) => {
   const a = await makeInstall(null);
   t.after(() => a.close());
-  await a.engine.setTcp({ port: 0 });
+  await a.engine.setNetwork({ listen: { port: 0 } });
   await a.engine.setName('alice');
   assert.equal(a.engine.state().transport.card, null);
   await a.engine.announce();
-  const first = a.engine.state().transport;
-  assert.equal(first.cardStale, false);
-  await a.engine.setTcp({ port: 0 }); // a new ephemeral port
-  assert.notDeepEqual(a.engine.state().transport.addresses, first.addresses);
-  assert.equal(a.engine.state().transport.cardStale, true);
-  await a.engine.announce();
-  assert.equal(a.engine.state().transport.cardStale, false);
-  assert.notEqual(a.engine.state().transport.card, first.card);
+  const { card } = a.engine.state().transport;
+  assert.deepEqual(Object.keys(decodeRecord(decodeCard(card)).payload).sort(), ['name', 'signer', 'ts', 'type']);
+  await a.engine.setNetwork({ listen: { port: 0 }, connections: ['127.0.0.1:9'] });
+  await a.engine.setNetwork({ listen: null });
+  assert.equal(a.engine.state().transport.card, card);
 });
 
 // Invariant: a stored transport config is validated at boot like a saved one; an invalid one boots unconfigured with
@@ -357,14 +355,15 @@ test('cardStale turns true when the address changes and false after announcing',
 test('an invalid stored transport boots unconfigured with its error', async (t) => {
   const inData = (dataDir) => path.join(dataDir, 'share');
   const cases = [
-    [{ kind: 'tcp', host: '::0', port: 0, advertise: null }, 'TCP_INVALID'],
-    [{ kind: 'tcp', host: '127.0.0.1', port: 70000, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    [{ kind: 'network', listen: { host: 'not a host', port: 0 }, connections: [] }, 'NETWORK_INVALID'],
+    [{ kind: 'network', listen: { host: '127.0.0.1', port: 70000 }, connections: [] }, 'NETWORK_INVALID'],
+    [{ kind: 'network', listen: null, connections: ['[::0]:5'] }, 'NETWORK_INVALID'],
     [{ kind: 'file-share', dir: 'relative/share' }, 'SHARE_INVALID'],
     [{ kind: 'file-share', dir: inData }, 'SHARE_INVALID'],
     [{ kind: 'file-share', dir: (dataDir) => path.dirname(dataDir) }, 'SHARE_INVALID'],
     [{ kind: 'carrier-pigeon' }, 'TRANSPORT_INVALID'],
     // A name that resolves to every interface.
-    [{ kind: 'tcp', host: '0x0.0.0.0', port: 0, advertise: '127.0.0.1' }, 'TCP_INVALID'],
+    [{ kind: 'network', listen: null, connections: ['0x0.0.0.0:5'] }, 'NETWORK_INVALID'],
     // Links into, and above, the data dir: caught on the real path once the stored path exists.
     [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(dataDir, l); return l; } }, 'SHARE_INVALID'],
     [{ kind: 'file-share', dir: (dataDir) => { const l = path.join(tmpDir('code-inbox-link-'), 'share'); fs.symlinkSync(path.dirname(dataDir), l); return l; } }, 'SHARE_INVALID'],

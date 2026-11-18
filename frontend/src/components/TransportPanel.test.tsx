@@ -1,10 +1,12 @@
 import { afterEach, describe, expect, it, vi } from 'vitest';
 import { fireEvent, render, screen, waitFor } from '@testing-library/react';
-import { TransportPanel, isLoopback, isWildcard } from './TransportPanel';
-import type { State, TransportView } from '../types';
+import { TransportPanel, isLoopback } from './TransportPanel';
+import type { ConnectionView, State, TransportView } from '../types';
 
-const NONE: TransportView = { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, url: null, hub: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null };
+const NONE: TransportView = { kind: null, configured: false, dir: null, listen: null, listening: null, connections: [], card: null, error: null, outboxError: null };
 const stateWith = (transport: Partial<TransportView> = {}, outbox = 0) => ({ transport: { ...NONE, ...transport }, diagnostics: { outbox } }) as unknown as State;
+const row = (address: string, c: Partial<ConnectionView> = {}): ConnectionView => ({ address, kind: null, state: 'connecting', peers: [], error: null, ...c });
+const network = (t: Partial<TransportView> = {}) => stateWith({ kind: 'network', configured: true, listen: { host: '127.0.0.1', port: 47821 }, ...t });
 
 function stubFetch() {
   const calls: { url: string; body: unknown }[] = [];
@@ -21,34 +23,69 @@ const type = (name: string, value: string) => fireEvent.change(field(name), { ta
 afterEach(() => vi.restoreAllMocks());
 
 describe('TransportPanel', () => {
-  // Invariant: the TCP form posts exactly what the human entered to the relative api/tcp.
-  it('choosing TCP posts api/tcp with the entered host, port and advertise', async () => {
+  // Invariant: the network form posts the whole config to the relative api/network: the listener as entered (empty
+  // fields left to the backend's defaults) and the saved connections.
+  it('Save listener posts api/network with the entered listener and the saved connections', async () => {
     const calls = stubFetch();
     const refresh = vi.fn();
-    render(<TransportPanel state={stateWith()} refresh={refresh} />);
-    fireEvent.click(screen.getByRole('radio', { name: 'TCP (direct)' }));
+    const { unmount } = render(<TransportPanel state={stateWith()} refresh={refresh} />);
+    fireEvent.click(screen.getByRole('radio', { name: 'Network' }));
     type('Listen host', '0.0.0.0');
     type('Port', '5000');
-    type('Advertised host (required)', 'peer.example');
-    fireEvent.click(screen.getByRole('button', { name: 'Save TCP' }));
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
-    expect(calls).toEqual([{ url: 'api/tcp', body: { host: '0.0.0.0', port: 5000, advertise: 'peer.example' } }]);
+    fireEvent.click(screen.getByRole('button', { name: 'Save listener' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    unmount();
+    render(<TransportPanel state={network({ listen: null, connections: [row('hub.example:47822')] })} refresh={refresh} />);
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Accept direct connections' }));
+    fireEvent.click(screen.getByRole('button', { name: 'Save listener' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    expect(calls).toEqual([
+      { url: 'api/network', body: { listen: { host: '0.0.0.0', port: 5000 }, connections: [] } },
+      { url: 'api/network', body: { listen: {}, connections: ['hub.example:47822'] } },
+    ]);
   });
 
-  // Invariant: empty fields are left to the backend's defaults.
-  it('an empty TCP form posts no fields', async () => {
+  // Invariant: Add and Remove post the saved listener with the edited connection list.
+  it('Add and Remove post the saved listener with the edited list', async () => {
     const calls = stubFetch();
     const refresh = vi.fn();
-    render(<TransportPanel state={stateWith()} refresh={refresh} />);
-    fireEvent.click(screen.getByRole('radio', { name: 'TCP (direct)' }));
-    fireEvent.click(screen.getByRole('button', { name: 'Save TCP' }));
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
-    expect(calls).toEqual([{ url: 'api/tcp', body: {} }]);
+    render(<TransportPanel state={network({ connections: [row('a.example:1'), row('b.example:2')] })} refresh={refresh} />);
+    type('Connect to', ' c.example:3 ');
+    fireEvent.click(screen.getByRole('button', { name: 'Add' }));
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(1));
+    fireEvent.click(screen.getAllByRole('button', { name: 'Remove' })[0]);
+    await waitFor(() => expect(refresh).toHaveBeenCalledTimes(2));
+    const listen = { host: '127.0.0.1', port: 47821 };
+    expect(calls).toEqual([
+      { url: 'api/network', body: { listen, connections: ['a.example:1', 'b.example:2', 'c.example:3'] } },
+      { url: 'api/network', body: { listen, connections: ['b.example:2'] } },
+    ]);
+  });
+
+  // Invariant: each connection row says what answered there, its state, who it reached and why it is down.
+  it('connection rows expose kind, state, peers and error by accessible name', () => {
+    render(<TransportPanel state={network({
+      connections: [
+        row('peer.example:1', { kind: 'peer', state: 'up', peers: [{ fp: 'a'.repeat(64), name: 'bob' }] }),
+        row('hub.example:2', { kind: 'hub', state: 'stopped', error: { code: 'HUB_DUPLICATE', message: 'replaced' } }),
+        row('dead.example:3', { state: 'waiting', error: { code: 'ECONNREFUSED', message: 'refused' } }),
+      ],
+    })} refresh={() => {}} />);
+    const peer = screen.getByRole('status', { name: 'Connection peer.example:1' }).textContent ?? '';
+    expect(peer).toContain('peer');
+    expect(peer).toContain('connected');
+    expect(peer).toContain('bob');
+    const hub = screen.getByRole('status', { name: 'Connection hub.example:2' }).textContent ?? '';
+    expect(hub).toContain('hub');
+    expect(hub).toContain('HUB_DUPLICATE');
+    const dead = screen.getByRole('status', { name: 'Connection dead.example:3' }).textContent ?? '';
+    expect(dead).toContain('detecting');
+    expect(dead).toContain('ECONNREFUSED');
   });
 
   // Invariant: the human is warned exactly when the listen host leaves loopback.
-  it('a non-loopback host shows the exposure warning', () => {
-    render(<TransportPanel state={stateWith({ kind: 'tcp', configured: true, host: '127.0.0.1', port: 47821, advertise: '127.0.0.1' })} refresh={() => {}} />);
+  it('a non-loopback listen host shows the exposure warning', () => {
+    render(<TransportPanel state={network()} refresh={() => {}} />);
     expect(screen.queryByRole('note', { name: 'Exposure warning' })).toBeNull();
     type('Listen host', '192.168.1.20');
     expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
@@ -57,25 +94,15 @@ describe('TransportPanel', () => {
     // A hostname that only looks like loopback is exposed like any other.
     type('Listen host', '127.example.com');
     expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
-    type('Listen host', '127.0.0.256');
-    expect(screen.getByRole('note', { name: 'Exposure warning' })).toBeTruthy();
+    // No listener, no open port.
+    fireEvent.click(screen.getByRole('checkbox', { name: 'Accept direct connections' }));
+    expect(screen.queryByRole('note', { name: 'Exposure warning' })).toBeNull();
   });
 
-  // Invariant: loopback means an actual loopback literal or localhost; wildcard means an all-zero literal.
+  // Invariant: loopback means an actual loopback literal or localhost.
   it('classifies hosts by address, not by prefix', () => {
     for (const h of ['', 'localhost', '127.0.0.1', '127.255.0.9', '::1']) expect(isLoopback(h), h).toBe(true);
     for (const h of ['127.example.com', '127.0.0.256', '1270.0.0.1', '10.0.0.1', '0.0.0.0', '::']) expect(isLoopback(h), h).toBe(false);
-    for (const h of ['0.0.0.0', '::', '::0', '0:0:0:0:0:0:0:0', '0000::', '::ffff:0.0.0.0', '::ffff:0:0', '0:0:0:0:0:ffff:0.0.0.0', '::0.0.0.0']) expect(isWildcard(h), h).toBe(true);
-    for (const h of ['::1', '0.0.0.1', 'example.com', '127.0.0.1', '::ffff:1.2.3.4', '::ffff:0.0.0.1', '1::', ':::', '::ffff:0.0.0.256', '0:0:0:0:0:0:0:0:0']) expect(isWildcard(h), h).toBe(false);
-  });
-
-  // Invariant: the advertised host is labelled required for every wildcard the backend refuses without one.
-  it('labels the advertised host required for an IPv4-mapped wildcard', () => {
-    render(<TransportPanel state={stateWith({ kind: 'tcp', configured: true, host: '127.0.0.1', port: 47821, advertise: '127.0.0.1' })} refresh={() => {}} />);
-    type('Listen host', '::ffff:0.0.0.0');
-    expect(screen.getByRole('textbox', { name: 'Advertised host (required)' })).toBeTruthy();
-    type('Listen host', '192.168.1.20');
-    expect(screen.getByRole('textbox', { name: 'Advertised host' })).toBeTruthy();
   });
 
   // Invariant: the human can see that writes are waiting, and the code of the last failure that holds them.
@@ -90,38 +117,15 @@ describe('TransportPanel', () => {
 
   // Invariant: a transport that failed to start says why, by code.
   it('shows the transport error code', () => {
-    render(<TransportPanel state={stateWith({ kind: 'tcp', host: '127.0.0.1', port: 1, advertise: '127.0.0.1', error: { code: 'TCP_LISTEN_FAILED', message: 'cannot listen' } })} refresh={() => {}} />);
-    expect(screen.getByRole('alert').textContent).toContain('TCP_LISTEN_FAILED');
+    render(<TransportPanel state={network({ configured: false, error: { code: 'LISTEN_FAILED', message: 'cannot listen' } })} refresh={() => {}} />);
+    expect(screen.getByRole('alert').textContent).toContain('LISTEN_FAILED');
   });
 
-  // Invariant: the hub form posts exactly the address the human entered to the relative api/hub.
-  it('choosing Hub posts api/hub with the entered address', async () => {
-    const calls = stubFetch();
-    const refresh = vi.fn();
-    render(<TransportPanel state={stateWith()} refresh={refresh} />);
-    fireEvent.click(screen.getByRole('radio', { name: 'Hub' }));
-    type('Hub address', ' hub://hub.example:47822 ');
-    fireEvent.click(screen.getByRole('button', { name: 'Save hub' }));
-    await waitFor(() => expect(refresh).toHaveBeenCalled());
-    expect(calls).toEqual([{ url: 'api/hub', body: { url: 'hub://hub.example:47822' } }]);
-  });
-
-  // Invariant: the human sees whether the hub link is up, and the code of what keeps it down.
-  it('shows the hub connection state and its error', () => {
-    const hub = { kind: 'hub' as const, configured: true, url: 'hub://hub.example:47822' };
-    const { rerender } = render(<TransportPanel state={stateWith({ ...hub, hub: { connected: true, error: null } })} refresh={() => {}} />);
-    expect(screen.getByRole('status', { name: 'Hub connection' }).textContent).not.toContain('not');
-    rerender(<TransportPanel state={stateWith({ ...hub, hub: { connected: false, error: { code: 'HUB_DUPLICATE', message: 'another endpoint registered this identity' } } })} refresh={() => {}} />);
-    const status = screen.getByRole('status', { name: 'Hub connection' });
-    expect(status.textContent).toContain('not connected');
-    expect(status.textContent).toContain('HUB_DUPLICATE');
-  });
-
-  // Invariant: choosing the hub tells the human what the hub can see.
-  it('shows the hub plaintext note', () => {
+  // Invariant: choosing network mode tells the human what a connection and a hub can see.
+  it('shows the network notes', () => {
     render(<TransportPanel state={stateWith()} refresh={() => {}} />);
-    expect(screen.queryByRole('note', { name: 'Hub plaintext note' })).toBeNull();
-    fireEvent.click(screen.getByRole('radio', { name: 'Hub' }));
-    expect(screen.getByRole('note', { name: 'Hub plaintext note' })).toBeTruthy();
+    expect(screen.queryByRole('note', { name: 'Network notes' })).toBeNull();
+    fireEvent.click(screen.getByRole('radio', { name: 'Network' }));
+    expect(screen.getByRole('note', { name: 'Network notes' })).toBeTruthy();
   });
 });

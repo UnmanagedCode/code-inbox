@@ -1,5 +1,5 @@
-import { FrameError, TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, createDecoder, encodeFrame, parseFrame } from './frames.js';
-import { boundFps, makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
+import { FrameError, HELLO_VERSION, TCP_FRAME_MAX, TCP_HELLO_FRAME_MAX, createDecoder, encodeFrame, parseFrame } from './frames.js';
+import { boundFps, dialBound, makeProofs, newHandshakeNonce, verifyProofs } from './handshake.js';
 
 // One TCP connection: the handshake state machine, phase limits, timeouts, request/response correlation and a
 // bounded inbound queue (docs/transport.md → TCP). Inbound frames are processed one at a time, each awaited;
@@ -24,24 +24,28 @@ export const SESSION_LIMITS = {
   writeBufferMax: TCP_WRITE_BUFFER_MAX,
 };
 
-const RESPONSE_OF = { pull: 'recs', whois: 'cards' };
+const RESPONSE_OF = { pull: 'recs' };
 
 /**
  * @param {object} o
  * @param {import('node:net').Socket} o.socket
  * @param {'dial'|'accept'} o.role
  * @param {{fp, publicRaw, signProof}[]} o.signers   every identity attached to the endpoint
- * @param {string} [o.target]                         dial: the fingerprint this connection means to reach
+ * @param {string|null} [o.target]                    dial: the fingerprint this connection means to reach, or null for
+ *                                                    whoever proves (a direct dial of an address)
+ * @param {'direct'|'hub'} o.via                      how the byte pipe was obtained: ranks duplicates (endpoint.js)
+ * @param {{myNonce, peerNonce, rest: Buffer}} [o.greeted]   dial: the hello exchange greeting.js already ran on a
+ *                                                    paused socket; the session proves at once, then resumes it
  * @param {(fp: string) => boolean} o.isAttached
  * @param {(session) => void} o.onReady
- * @param {(session, frame) => Promise<void>} o.onFrame   rec / pull / whois, `from` proven and `to` attached
+ * @param {(session, frame) => Promise<void>} o.onFrame   rec / pull, `from` proven and `to` attached
  * @param {() => void} o.onDropped                    a frame addressed to an unattached identity
  * @param {(session) => void} o.onClose               once, when the session ends (ready or not)
  */
-export function createSession({ socket, role, signers, target = null, isAttached, limits, schedule, onReady, onFrame, onDropped, onClose, log }) {
+export function createSession({ socket, role, signers, target = null, via, greeted = null, isAttached, limits, schedule, onReady, onFrame, onDropped, onClose, log }) {
   const localFps = signers.map((s) => s.fp);
   const decoder = createDecoder({ maxFrame: TCP_HELLO_FRAME_MAX });
-  const myNonce = newHandshakeNonce();
+  const myNonce = greeted ? greeted.myNonce : newHandshakeNonce();
   let peerNonce = null;
   let phase = 'hello';
   const queue = [];
@@ -49,18 +53,25 @@ export function createSession({ socket, role, signers, target = null, isAttached
   let paused = false;
   const pending = new Map(); // request id → {t, from, to, resolve, reject, cancel}
   let nextId = 1;
-  const timers = { handshake: schedule(() => destroy(), limits.handshakeMs), frame: null, idle: null, ping: null };
+  const timers = { handshake: schedule(() => { ending('deadline', 'TIMEOUT'); destroy(); }, limits.handshakeMs), frame: null, idle: null, ping: null };
   let settle;
+  let settleClosed;
 
   const session = {
     role,
     target,
+    via,
     localFps,
     remote: [],
     ready: false,
     closed: false,
+    // Why the session ended, once it has: {by: 'self'|'peer'|'socket'|'deadline', reason} (reason: a bye reason,
+    // TIMEOUT or a socket error code). A connection reads it to show why its attempt failed.
+    end: null,
     // Resolves true once ready, false if the session ends first.
     established: new Promise((r) => { settle = r; }),
+    // Resolves once the session has ended.
+    whenClosed: new Promise((r) => { settleClosed = r; }),
     write: (frame) => session.ready && send(frame),
     request,
     close,
@@ -76,8 +87,12 @@ export function createSession({ socket, role, signers, target = null, isAttached
 
   function cancel(name) { if (timers[name]) { timers[name](); timers[name] = null; } }
 
+  // The first cause recorded wins.
+  function ending(by, reason) { if (!session.closed && !session.end) session.end = { by, reason }; }
+
   function teardown() {
     if (session.closed) return;
+    ending('socket', 'CLOSED');
     session.closed = true;
     for (const name of Object.keys(timers)) cancel(name);
     queue.length = 0;
@@ -85,11 +100,13 @@ export function createSession({ socket, role, signers, target = null, isAttached
     pending.clear();
     settle(false);
     onClose(session);
+    settleClosed();
   }
 
   // A deliberate close: `bye {reason}`, then the socket is destroyed once that is flushed.
   function close(reason) {
     if (session.closed) return;
+    ending('self', reason);
     if (!socket.destroyed) socket.write(encodeFrame({ t: 'bye', reason }));
     teardown();
     socket.destroySoon();
@@ -129,25 +146,30 @@ export function createSession({ socket, role, signers, target = null, isAttached
 
   // Handshake frames are handled synchronously, so the phase (and the decoder's max) changes before the next
   // frame of the same chunk is decoded.
+  // The dialer's proof, once it knows the acceptor's nonce.
+  function prove() {
+    send({ t: 'prove', target, ids: makeProofs(signers, 'dial', myNonce, peerNonce, dialBound(target)) });
+    phase = 'prove-accept';
+  }
+
   function handshake(f) {
-    if (f.t === 'bye') { destroy(); return; }
+    if (f.t === 'bye') { ending('peer', f.reason); destroy(); return; }
     const own = (fps) => fps.some((fp) => localFps.includes(fp));
     if (phase === 'hello') {
       peerNonce = f.nonce;
-      if (role === 'dial') {
-        send({ t: 'prove', target, ids: makeProofs(signers, 'dial', myNonce, peerNonce, target) });
-        phase = 'prove-accept';
-      } else phase = 'prove-dial';
+      if (role === 'dial') prove(); else phase = 'prove-dial';
     } else if (phase === 'prove-dial') {
       // The acceptor signs nothing until the dialer's proof verifies.
-      const fps = isAttached(f.target) ? verifyProofs(f.ids, 'dial', peerNonce, myNonce, f.target) : null;
+      // An untargeted dial (target null, bound '') is for whoever is here; a targeted one must name an fp served here.
+      const fps = f.target === null || isAttached(f.target) ? verifyProofs(f.ids, 'dial', peerNonce, myNonce, dialBound(f.target)) : null;
       if (!fps || own(fps)) { close('PROOF'); return; }
       session.remote = fps;
       send({ t: 'prove', ids: makeProofs(signers, 'accept', myNonce, peerNonce, boundFps(fps)) });
       phase = 'ok';
     } else if (phase === 'prove-accept') {
       const fps = verifyProofs(f.ids, 'accept', peerNonce, myNonce, boundFps(localFps));
-      if (!fps || own(fps) || !fps.includes(target)) { close('PROOF'); return; }
+      // A targeted dialer insists on its target; an untargeted one takes whoever proves, never its own identities.
+      if (!fps || own(fps) || (target !== null && !fps.includes(target))) { close('PROOF'); return; }
       session.remote = fps;
       send({ t: 'ok' });
       becomeReady();
@@ -159,8 +181,8 @@ export function createSession({ socket, role, signers, target = null, isAttached
   async function handle(f) {
     if (f.t === 'ping') { send({ t: 'pong' }); return; }
     if (f.t === 'pong') return;
-    if (f.t === 'bye') { destroy(); return; }
-    if (f.t === 'recs' || f.t === 'cards') {
+    if (f.t === 'bye') { ending('peer', f.reason); destroy(); return; }
+    if (f.t === 'recs') {
       const p = pending.get(f.id);
       if (!p) return; // answered after its timeout
       if (p.t !== f.t || p.from !== f.from || p.to !== f.to) throw new FrameError('PROTOCOL', `a ${f.t} does not answer request ${f.id}`);
@@ -190,7 +212,7 @@ export function createSession({ socket, role, signers, target = null, isAttached
     processing = false;
   }
 
-  socket.on('data', (chunk) => {
+  function onData(chunk) {
     if (session.closed) return;
     if (session.ready) armIdle();
     decoder.push(chunk);
@@ -212,11 +234,24 @@ export function createSession({ socket, role, signers, target = null, isAttached
       return;
     }
     void drain();
-  });
+  }
+
   // Frames are small request/response pairs: Nagle plus delayed ACKs would add tens of ms to each.
   socket.setNoDelay(true);
-  socket.on('error', () => destroy());
+  socket.on('data', onData);
+  socket.on('error', (err) => { ending('socket', err?.code ?? 'ERROR'); destroy(); });
   socket.on('close', () => teardown());
-  send({ t: 'hello', v: 1, nonce: myNonce });
+  if (greeted) {
+    // The hello exchange is done: prove now, then read what followed the far hello and let the paused socket flow.
+    // Deferred, so the caller holds the session before any handshake callback runs. Attaching a `data` listener
+    // does not resume a socket paused explicitly: resume() does.
+    peerNonce = greeted.peerNonce;
+    prove();
+    queueMicrotask(() => {
+      if (socket.destroyed) { destroy(); return; }
+      if (greeted.rest.length) onData(greeted.rest);
+      socket.resume();
+    });
+  } else send({ t: 'hello', v: HELLO_VERSION, nonce: myNonce, kind: 'endpoint' });
   return session;
 }

@@ -46,9 +46,9 @@ test('settings with shareDir migrate to transport once and the migration is idem
   const dataDir = tmpDir();
   fs.writeFileSync(file(dataDir), JSON.stringify({ name: 'alice', shareDir: '/srv/share', notifyTarget: null }));
   const loaded = await createStore(dataDir).load();
-  assert.deepEqual(loaded.settings, { name: 'alice', transport: { kind: 'file-share', dir: '/srv/share' }, notifyTarget: null });
+  assert.deepEqual(loaded.settings, { name: 'alice', announced: null, transport: { kind: 'file-share', dir: '/srv/share' }, notifyTarget: null });
   const onDisk = fs.readFileSync(file(dataDir), 'utf8');
-  assert.deepEqual(JSON.parse(onDisk), loaded.settings);
+  assert.deepEqual({ announced: null, ...JSON.parse(onDisk) }, loaded.settings);
   const mtime = fs.statSync(file(dataDir)).mtimeMs;
   assert.deepEqual((await createStore(dataDir).load()).settings, loaded.settings);
   assert.equal(fs.readFileSync(file(dataDir), 'utf8'), onDisk);
@@ -56,7 +56,7 @@ test('settings with shareDir migrate to transport once and the migration is idem
 
   const none = tmpDir();
   fs.writeFileSync(file(none), JSON.stringify({ name: null, shareDir: null, notifyTarget: null }));
-  assert.deepEqual((await createStore(none).load()).settings, { name: null, transport: null, notifyTarget: null });
+  assert.deepEqual((await createStore(none).load()).settings, { name: null, announced: null, transport: null, notifyTarget: null });
   assert.equal('shareDir' in JSON.parse(fs.readFileSync(file(none), 'utf8')), false);
 });
 
@@ -78,4 +78,32 @@ test('outbox entries with an invalid route or recipient are dropped on load', as
   const loaded = await createStore(dataDir, { log }).load();
   assert.deepEqual(loaded.outbox.map((e) => e.route), [{ kind: 'mailbox', fp }]);
   assert.equal(log.lines.filter((l) => l.includes('outbox.json')).length, 4);
+});
+
+// Invariant (A1 D14): identities.json keeps, per fp, an announce that fp signed and whether a human imported its card;
+// an entry whose bytes do not decode as that fp's announce is dropped on load and logged, the rest kept.
+test('identities.json entries that do not verify are dropped on load', async () => {
+  const { loadIdentity } = await import('../src/identity.js');
+  const { encodeRecord } = await import('../src/records.js');
+  const [alice, bob] = [await loadIdentity(tmpDir()), await loadIdentity(tmpDir())];
+  const ann = (id, extra = {}) => encodeRecord(id, { type: 'announce', signer: id.fp, ts: 1, name: 'n', ...extra }).bytes.toString('base64url');
+  const msg = encodeRecord(alice, { type: 'join-request', signer: alice.fp, ts: 1, to: bob.fp, inbox: 'a'.repeat(32) });
+  const dataDir = tmpDir();
+  const store = createStore(dataDir);
+  await store.load();
+  const good = { announce: ann(alice), imported: true };
+  await store.saveIdentities({ [alice.fp]: good });
+  assert.deepEqual((await createStore(dataDir).load()).identities, { [alice.fp]: good });
+  fs.writeFileSync(path.join(dataDir, FILES.identities), JSON.stringify({
+    [alice.fp]: good,
+    [bob.fp]: { announce: ann(alice), imported: true }, // signed by someone else
+    ['c'.repeat(64)]: { announce: 'not base64url!', imported: false },
+    [`${bob.fp}x`]: { announce: ann(bob), imported: false }, // not a fingerprint
+    ['d'.repeat(64)]: { announce: msg.bytes.toString('base64url'), imported: false }, // not an announce
+    ['e'.repeat(64)]: { announce: ann(alice), imported: 'yes' },
+  }));
+  const log = captureLog();
+  assert.deepEqual((await createStore(dataDir, { log }).load()).identities, { [alice.fp]: good });
+  assert.equal(log.lines.filter((l) => l.includes('identities.json')).length, 5);
+  assert.equal(FILES.contacts, undefined);
 });

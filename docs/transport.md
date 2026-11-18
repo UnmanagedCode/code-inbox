@@ -1,187 +1,195 @@
 # Transports
 
-The engine talks to the network only through the `Transport` interface (`src/transport/index.js`). A transport moves opaque record bytes along routes; it is never trusted. Every record it hands over goes through `decodeRecord`, route binding and `state.classify` like any other.
+The engine talks to the network only through the `Transport` interface (`src/transport/index.js`). A transport moves opaque record bytes along routes; it is never trusted with authenticity: the engine verifies, binds and authorizes every record it hands over.
 
 ## Interface
 
 ```js
 /** Route    = {kind:'directory'} | {kind:'mailbox', fp} | {kind:'inbox', id}
  *  Incoming = {route, writer, bytes}   // writer: the fingerprint the transport attributes the record to
- *  Sink     = { record(i: Incoming): Promise<{retry: boolean}>, peerOnline(fp): void }
+ *  Sink     = { record(i: Incoming): Promise<{retry: boolean}>, announce(bytes): void, peerOnline(fp): void }
  *  Transport {
  *    capabilities: { directory: boolean, push: boolean }
- *    addresses(): string[]                 // goes into announce.addr (rendezvous)
  *    start(sink): Promise<void>
  *    setInterest(routes: Route[]): void    // the routes this install wants delivered
+ *    setAnnounce(bytes | null): void       // this install's current signed announce
  *    send(bytes, {route, to: fp[]}): Promise<{delivered: fp[], pending: fp[]}>
  *    sync(): Promise<void>                 // pull now / ask online peers to catch up
  *    stop(): Promise<void>
+ *    stats?(): object                      // network mode only: diagnostics, read by the engine for display
  *  } */
 ```
 
-- The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (directory records: every known identity).
+- The engine never looks at paths or sockets. It always passes `to`: the parties or members other than itself, the invitee, or the owner (an `inbox-create`: the contacts).
 - Recipients in `pending` (or all of them, if `send` throws) go to the outbox; a retryable throw keeps the write itself owed even with no recipient. The outbox is re-sent after every transport start, on the `OUTBOX_RETRY_MS` timer while it holds anything, on `engine.sync()`, and per peer on `peerOnline(fp)` ([architecture.md → Outbox](architecture.md#ingest-pipeline)).
 - `record` answers `{retry: true}` only for bytes that may still be arriving (`BAD_JSON`); the transport offers them again later.
-- `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share, the frame's proven `from` over TCP, and through a hub the frame's `from` proven end to end by the remote endpoint in the handshake tunneled through the hub stream (never the hub's word).
-- `assertTransport` checks the shape of every transport the engine is given.
-- Outside the interface, the network transports (TCP, hub) also expose `stats()`: a diagnostic the tests read, and the engine reads for display only (`state().transport.hub`).
+- `writer` is what route binding compares with `payload.signer`: the writer subdir on the file share; in network mode the frame's `from`, an identity the remote endpoint proved on that session, directly or in the handshake tunneled through a hub stream (never the hub's word).
+- `announce(bytes)` takes a **hub-relayed announce**: no proven session carried it, so the engine accepts it as an announce only, with writer = its own signer, into its memory directory only (the same narrow exception as a card import).
+- `setAnnounce(bytes)` is called before `start` and on every **Announce**. A network transport presents it on every session and to every hub; the file share ignores it (the engine writes the announce file).
+- `assertTransport` checks the shape of every transport the engine is given (`TRANSPORT_METHODS`).
 - `tests/transportContract.test.mjs` runs one contract against every implementation.
 
 ### The factory and the engine view
 
 The engine builds its transport with `makeTransport(config, view)` (`server.js` → `transportFactory`):
 
-- `config` is `settings.transport`: `{kind:'file-share', dir}`, `{kind:'tcp', host, port, advertise}` or `{kind:'hub', url}`.
-- `view` is a read-only engine object. Its functions are synchronous, read in-memory state and never take the engine lock. The file share ignores it; over TCP and through a hub the peer is the store, so the transport needs it to serve pulls and to choose whom to dial.
+- `config` is `settings.transport`: `{kind:'file-share', dir}` or `{kind:'network', listen: {host, port} | null, connections: ["host:port", …]}`.
+- `view` is a read-only engine object. Its functions are synchronous, read in-memory state and never take the engine lock. The file share ignores it; in network mode the peer is the store, so the transport needs it to serve pulls and to choose whom to dial.
 
 | `view.` | Returns | Source |
 |---|---|---|
-| `addrsOf(fp)` | `string[]`: the `addr` of `fp`'s current announce (shown or not), else `[]` | `directory()` |
-| `announceFor(requester, fp)` | the bytes of `fp`'s current announce if `requester` and `fp` share an inbox here, else `null` | `sharesInbox` (`src/state.js`), then `directory()` identity `id` → the engine's announce bytes |
 | `mayPull(peer, route)` | whether to name `route` in a pull from `peer`: the directory, this install's own mailbox, or an inbox `peer` is a party or current member of here | `mayPull` (`src/state.js`) |
-| `contacts()` | the dial set: card-imported identities (`contacts.json`), counterparties of records this install signed (`to`, `member`), parties and members of every inbox it belongs to | `contactsOf` (`src/state.js`) |
-| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied'}` (no `head`: a denial reveals nothing of what is held) | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq |
+| `contacts()` | the dial set: card-imported identities (`identities.json` entries with `imported: true`), counterparties of records this install signed (`to`, `member`), parties and members of every inbox it belongs to | `contactsOf` (`src/state.js`) |
+| `serve(reader, route, since, budgetBytes)` | `{status:'ok', recs:[{seq, bytes}], more, head}` or `{status:'denied'}` (no `head`: a denial reveals nothing of what is held) | the engine's log of records **signed by this install**, per route, by acceptance seq; gated by `mayRead` (`src/state.js`). `head` = the highest acceptance seq. The log never holds an announce, so the `directory` route serves `inbox-create` records only |
 
 - `mayRead(index, reader, route)`: the directory to any proven identity; a mailbox to its owner; a personal inbox to its inviter and invitee; a shared inbox to its current members; nothing else.
-- `sharesInbox(index, a, b)`: `a` and `b` are the two parties of a personal inbox, or both current members of a shared inbox, as this install knows them.
 
 ### Selecting a transport
 
-A stored transport is checked at boot. A TCP config is checked as when it was saved (`resolveTcpConfig`, DNS included). A hub url is checked as when it was saved (`resolveHubConfig`), except that a host that does not resolve, or not within `TCP_LOOKUP_MS`, still starts: the client keeps reconnecting, like a share whose mount is not up yet; a malformed url, or a host resolving to a wildcard, is refused `HUB_INVALID`. Saving a hub (`setHub`) requires the host to resolve, outside the engine lock. A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, its scans pick the directory up once it appears, and writes made meanwhile wait in the outbox until a retry finds its root. A stored share whose root exists but is a link (`code-inbox` or `v1`) is refused `SHARE_UNSAFE`. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath) and creates the share's root (`ensureShareRoot`).
+One transport at a time, set on the page (`POST api/share` or `POST api/network`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'network', listen, connections}`.
 
-**The root marker.** A write needs `<share>/code-inbox/v1` (`SHARE_ROOT`) to exist already, and only saving the share creates it. So a mount point that is missing, or an empty directory, takes no write, without comparing devices (a local share dir legitimately shares its parent's device). What the marker proves is only that the root exists, not that the mount is up. A share whose root already exists is unaffected. Not detected: an unmounted mount point that itself holds a `code-inbox/v1` tree on the local disk, whether copied there, written before this rule, or **created by saving the share while its mount was down** (the save cannot tell either; the page says to save with the share mounted). A share saved but never written to by an older version has no root: saving it again creates one. An invalid stored config starts nothing and shows its refusal (`TCP_INVALID`, `HUB_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID` for an unknown kind) in `state().transport.error`; so does a TCP listener that cannot bind (`TCP_LISTEN_FAILED`). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
+- **Network settings** are checked by `resolveNetworkConfig` (`src/transport/network.js`): `validateNetworkConfig` (pure), then DNS for every non-literal host, outside the engine lock (a slow resolver blocks no other action), each lookup bounded by `TCP_LOOKUP_MS`. A listen host must resolve, on a save and at boot. A connection host that resolves to every interface is refused; one that does not resolve (or not in time) is refused on a save only: at boot it may be unreachable for now, and the connection keeps retrying. Refusal: `NETWORK_INVALID`. Saving (`setNetwork`) stores the whole config and rebuilds the transport; there is no hot add or remove of a connection.
+- A share dir is checked by `checkStoredShareDir`: its path rules (`checkShareDirPath`: absolute, neither inside the data dir nor containing it, as resolved paths), plus the same rule on real paths when the dir resolves (a link into or above the data dir is refused); it is not required to exist or be writable, so a share whose mount is not up yet still starts, its scans pick the directory up once it appears, and writes made meanwhile wait in the outbox until a retry finds its root. A stored share whose root exists but is a link (`code-inbox` or `v1`) is refused `SHARE_UNSAFE`. Saving a share (`setShare`) runs the full `validateShareDir` (also: an existing, writable directory; overlap compared by realpath) and creates the share's root (`ensureShareRoot`).
 
-One transport at a time, set on the page (`POST api/share`, `POST api/tcp` or `POST api/hub`). Settings hold `transport: null | {kind:'file-share', dir} | {kind:'tcp', host, port, advertise} | {kind:'hub', url}`.
+**The root marker.** A write needs `<share>/code-inbox/v1` (`SHARE_ROOT`) to exist already, and only saving the share creates it. So a mount point that is missing, or an empty directory, takes no write, without comparing devices (a local share dir legitimately shares its parent's device). What the marker proves is only that the root exists, not that the mount is up. A share whose root already exists is unaffected. Not detected: an unmounted mount point that itself holds a `code-inbox/v1` tree on the local disk, whether copied there, written before this rule, or **created by saving the share while its mount was down** (the save cannot tell either; the page says to save with the share mounted). A share saved but never written to by an older version has no root: saving it again creates one.
 
-- The file share reports every recipient delivered (the share stores everything), so a composite with TCP or a hub would drop a network-only peer's outbox entry.
-- Route binding requires writer = signer on the share and writer = the proven `from` over TCP and through a hub, so an install could not relay between groups anyway.
-- TCP and the hub are not composed either: that would need per-recipient routing, and nothing requires it.
-- Consequence: installs on different transports (or on different hubs) cannot reach each other. A group picks one medium.
+- **At boot** an invalid stored config starts nothing and shows its refusal in `state().transport.error`: `NETWORK_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, or `TRANSPORT_INVALID` for any other kind. A listener that cannot bind is `LISTEN_FAILED` (on a save: refused 409, and no transport is configured after it). Whenever a transport starts (at boot, or when a human saves one), admissions owed since (`admissionDue`) are written.
+- **One mode, never both.** The file share reports every recipient delivered (the share stores everything), so a composite with network mode would drop a network-only peer's outbox entry. Inside network mode, direct and hub routes compose: the pool is keyed by fingerprint.
 
 ## File share (v1, `src/transport/fileShare.js`)
 
 | Concern | Answer |
 |---|---|
 | `capabilities` | `{directory: true, push: false}` |
-| `addresses()` | `[]` |
+| `setAnnounce` | Nothing: the engine writes the announce file itself (a directory-route send) |
 | `send` | Atomic write under the route's dir in this install's own fingerprint subdir; every `to` is `delivered`. Before each write (`checkWritable`): the share's root `<dir>/SHARE_ROOT` must already exist, else the retryable `SHARE_UNAVAILABLE` and nothing is created; neither the share dir nor its root may resolve into or above the data dir (real paths, re-checked on every write), else `SHARE_UNSAFE`. The route and writer subdirs under the root are created as needed, after a check that their path stays inside the root (`SHARE_UNSAFE` otherwise) |
-| Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once |
+| Reading | Scans the routes of interest every `SHARE_POLL_MS`; `sync()` scans once. Announce files go to the engine's memory directory, never its log |
 | `peerOnline` | Never fires |
 
 Layout and filename rules: [protocol.md → Routes and the share layout](protocol.md#routes-and-the-share-layout).
 
-## Direct TCP (`src/transport/tcp.js`)
+## Network endpoint (`src/transport/network.js`, `endpoint.js`)
 
-Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md#tcp-wire-format). Everything below except the listener, dial policy and whois hints is the endpoint core (`src/transport/endpoint.js`), which the hub client shares ([hub.md](hub.md)).
+Network mode is the endpoint core (`endpoint.js`) with **links**: an optional listener (`listener.js`) and one link per configured connection (`connection.js`). A connection is an address and nothing else: no name, fingerprint or pin. Whoever answers there is detected from its first `hello`: an endpoint (a peer's listener, directly or through a port forward or SSH tunnel) or a hub ([hub.md](hub.md)). Wire format, handshake and limits: [protocol.md → Endpoint wire format](protocol.md#endpoint-wire-format).
 
 | Concern | Answer |
 |---|---|
 | `capabilities` | `{directory: false, push: true}` |
-| `addresses()` | `[tcp://<advertise>:<bound port>]` once listening, else `[]` |
-| `send` | A `rec` frame to each recipient with a ready session whose write buffer is under `TCP_WRITE_BUFFER_MAX`: `delivered`. Everyone else is `pending`; pending recipients in the dial set are dialed in the background |
+| `send` | A `rec` frame to each recipient with a ready session whose write buffer is under `TCP_WRITE_BUFFER_MAX`: `delivered`. Everyone else is `pending`; a pending recipient in the dial set (contacts, plus a `mailbox` route's fp) is dialed through the hubs in the background |
+| `setAnnounce` | Stored per binding; pushed at once on every ready session, and to every hub-mode connection |
 | Push | Inbound `rec` frames call `sink.record` when the route is in the addressed identity's interest; otherwise they are dropped and counted |
 | `sync()` | Runs `maintain` and awaits it |
-| `peerOnline` | Fires for every remote fingerprint when a session becomes ready |
-| No directory | Identities find each other through contact cards (a signed announce pasted on the page) and the announces pulled at every handshake |
+| `peerOnline` | Fires for every remote fingerprint when a session becomes ready, on any route |
+| `stats()` | `{presence, listening, connections: [status…], sessionCount, handshaking, sessions: [{role, via, address, remote}], handshakeFailures, dropped}` |
 
-### Endpoint and bindings
+### Core and links
 
-- **Core and link.** `createEndpoint({makeLink, limits, now, schedule, syncMs, log})` (`endpoint.js`) holds the bindings, sessions, the pool and duplicate rule, `peerOnline`, frame serving (`rec`, `pull`, gated `whois`), pulls and cursors, the maintain loop and the Transport object. `makeLink(core)` supplies how a session's byte pipe is obtained:
-
-  | Link hook | TCP link (`tcp.js`) | Hub link (`hubClient.js`) |
-  |---|---|---|
-  | `addresses()` | `[tcp://advertise:boundPort]` once listening | `[url]` always |
-  | `open()` (every binding start; a rejection fails `start`) | listen | connect unless up or connecting with the same identities; resolves at once |
-  | `identitiesChanged()` (a detach leaving bindings) | nothing | reconnect and re-register |
-  | `shutdown()` (last detach, `close()`; synchronous) | close the listener | `bye STOP` on the link, cancel the reconnect timer |
-  | `discover(b, missing)` (maintain step 1) | whois for contacts with no address | await a connect in progress, refresh the watch, await `present` |
-  | `dial(b, fp)` | per-address dials of `fp`'s `tcp://` addresses | one stream to `fp` |
-  | `stats()` | `{listening}` | `{hub: {url, connected, error}}` |
-
-  The core hands the link `lim`, `now`, `schedule`, `log`, `signers()`, `fps()`, `isLocal(fp)`, `contacts()` (every binding's dial set), `hasSession(fp)`, `readySessions()`, `canDial()`, `accept(socket)` (destroys it beyond the caps), `dial(socket, target)` and `syncAll()`.
-- `createTcpEndpoint({host, port, advertise, limits, now, schedule, syncMs, createServer, log})` → `{attach(binding), stats(), close()}`. One listener and one pool of sessions serve every identity attached to it. `createTcp(opts)` = one endpoint with one binding: what `server.js` uses.
+- `createEndpoint({makeLinks, limits, now, schedule, syncMs, log})` holds the bindings, sessions, the pool and duplicate rule, `peerOnline`, frame serving (`rec`, `pull`), the announce push, pulls and cursors, the maintain loop and the Transport object. `makeLinks(core)` → the listener (first, at most one), then one connection link per configured address, in configured order.
+- `createNetworkEndpoint({listen, connections, connect, createServer, limits, now, schedule, syncMs, log})` → `{attach(binding), stats(), close()}`; `connect` (net.connect) and `createServer` (net.createServer) are injectable (tests). `createNetwork(opts)` = one endpoint with one binding: what `server.js` builds for `{kind:'network'}`.
 - `binding = {identity: proofSigner(identity), view, cursors: {load(), save(obj)}}`. The transport only ever holds `signProof` (handshake proofs), never a general `sign`.
-- The listener starts on the first `start()`. Starting or stopping a binding on a live endpoint closes its sessions: they re-handshake with the new identity set when next needed.
-- `stop()` closes the listener **synchronously, before anything is awaited**, then every socket, and never awaits a pending sink call. Re-saving TCP settings on the same port therefore rebinds at once, under the engine lock.
-- `stats()` → `{listening, connections, handshaking, sessions: [{role, remote: [fp]}], handshakeFailures, dropped}`. The Transport object exposes it too (tests and the multi-identity checks use it).
-- `validateTcpConfig({host, port, advertise})`: host an IP literal or hostname (default `127.0.0.1`); port an integer 0–65535 (default `TCP_DEFAULT_PORT`; 0 = ephemeral); `advertise` defaults to host and is required (and must not be a wildcard) when host is a wildcard. Wildcards are decided on the parsed address (`isWildcardHost`): `0.0.0.0` and every spelling of `::` (`::0`, `0:0:0:0:0:0:0:0`, `::ffff:0.0.0.0`, …). Otherwise `TCP_INVALID`. Pure.
-- `resolveTcpConfig(input)`: `validateTcpConfig`, then a host or advertised host that is not an IP literal is looked up (`dns.lookup`, every address) and refused `TCP_INVALID` if any address is a wildcard: `0`, `00.0.0.0` and `0x0.0.0.0` pass as hostnames but resolve to `0.0.0.0`. A listen host that does not resolve is refused `TCP_INVALID`; an advertised host that does not resolve here is allowed (peers may resolve it where this install cannot). A lookup that does not answer within `TCP_LOOKUP_MS` is refused `TCP_INVALID`, for either name. `setTcp` resolves before it takes the engine lock, so a slow resolver blocks no other action; the boot check uses it too.
+
+  | Link hook | Listener (`listener.js`) | Connection (`connection.js`) |
+  |---|---|---|
+  | `open()` (every binding start; a rejection fails `start`) | listen | start connecting, unless a hub link is already up or registering with exactly these identities; resolves at once |
+  | `identitiesChanged()` (a detach leaving bindings) | — | peer: the session re-handshakes; hub: leave and re-register (clears a `HUB_DUPLICATE` stop) |
+  | `shutdown()` (synchronous) | close the server | cancel the timer; close the greeting socket, the peer session or the hub link (`bye STOP`) |
+  | `connect()` (maintain step 1) | — | reconnect if due (below) and await an attempt in progress; never waits for a backoff timer |
+  | `dial(fp)` | — | hub mode: one stream dial to `fp` |
+  | `announceChanged()` | — | hub mode: send the announces again |
+  | `present()` | `[]` | hub mode: the fps the hub's roster reports |
+  | `status()` | `{listening}` | `{address, kind: 'peer'\|'hub'\|null, state, remote: [fp], error}` |
+
+  The core hands links `lim`, `now`, `schedule`, `log`, `signers()`, `fps()`, `isLocal(fp)`, `contacts()` (every binding's dial set), `hasSession(fp)`, `hasDirectSession(fp)`, `readySessions()`, `canDial()`, `dialHubs(fp)`, `announces()`, `offerAnnounce(bytes)`, `countDropped()`, `accept(socket, {via, link})` (destroys it beyond the caps), `dial(socket, target | null, {via, link, greeted})` and `syncAll()`.
+- One endpoint and one pool of sessions serve every identity attached to it. Starting or stopping a binding on a live endpoint closes its sessions: they re-handshake with the new identity set when next needed. A binding's cursors load before its links open.
+- `stop()` closes the listener and every connection's timer, socket, session or link **synchronously, before anything is awaited**, and never awaits a pending sink call. Re-saving network settings on the same port therefore rebinds at once, under the engine lock.
+
+### The listener
+
+- Binds `listen.host` (default `127.0.0.1`; a wildcard is allowed: nothing is advertised) on `listen.port` (default `TCP_DEFAULT_PORT`; `0` = ephemeral). A bind failure fails the start: `LISTEN_FAILED`.
+- Every accepted socket is an `accept` session with `via: 'direct'`. A listener that fails after it is up is closed (its port freed) and forgotten; its sessions stay.
+- `listen: null` opens no port.
+
+### Connections
+
+Each attempt:
+
+1. **Precheck:** a connection whose kind is not known to be a hub needs a free session slot (`canDial()`); a hub link takes none.
+2. `connect({host, port})`, then **the greeting** (`greeting.js`): send this install's `hello` (kind `endpoint`) and read the far end's. Anything but a v2 `hello` of a known kind fails the attempt `CONNECTION_PROTOCOL`; nothing within `TCP_HANDSHAKE_MS`, `CONNECTION_TIMEOUT`.
+3. **Peer mode** (the far end said `endpoint`): an untargeted `dial` session (`target: null`, `via: 'direct'`) on the greeted socket. It accepts whoever proves there, except this install's own identities (a connection to its own listener fails `CONNECTION_REFUSED`). Up once the session is ready.
+4. **Hub mode** (the far end said `hub`): a hub-link client (`hubConn.js`) registers every identity; up on `ok` ([hub.md → The hub mode of a connection](hub.md#the-hub-mode-of-a-connection)).
+
+| After | Then |
+|---|---|
+| A failed attempt: a socket error, a greeting failure or timeout, a handshake failure, `bye PROOF`, `HUB_REFUSED` | `failures += 1`; reconnect timer after `min(redialMinMs · 2^(failures−1), redialMaxMs)` (`TCP_REDIAL_MIN_MS`, `TCP_REDIAL_MAX_MS`); `state: 'waiting'`, `error` set |
+| An attempt that reached ready (peer) or `ok` (hub) | `failures = 0`, `error = null`, `state: 'up'` |
+| An up connection ends | reconnect after `redialMinMs`, except in the next two rows |
+| Peer mode: the session closed as the duplicate loser, or at its close every fp it reached has a direct session | `state: 'idle'`: no timer; maintain step 1 reconnects it once one of those fps lacks a **direct** session |
+| Hub mode: `bye DUPLICATE` on the current link | `state: 'stopped'`, `HUB_DUPLICATE`; no reconnect until a binding attaches or detaches (a settings save rebuilds the endpoint) |
+| `shutdown()` | nothing is armed |
+
+- Timers use the injected `schedule` and `now`. A connection's reconnects never depend on contacts: whoever is at the address becomes reachable, strangers and hubs included.
+- **Errors** on a connection's row (never a REST refusal: connecting is asynchronous): a socket code (`ECONNREFUSED`, `ENOTFOUND`, …), `CONNECTION_TIMEOUT`, `CONNECTION_PROTOCOL` (not a v2 hello, a `bye` before it, or the handshake broke the protocol), `CONNECTION_REFUSED` (a `PROOF` refusal either way), `CONNECTION_LIMIT` (no session slot when the greeting ended), `CONNECTION_CLOSED` (the far end closed during the handshake), `HUB_REFUSED`, `HUB_DUPLICATE`.
+- Two connections that reach the same hub register the same identities: the later registration wins and the other shows `HUB_DUPLICATE`.
 
 ### Pooling and duplicates
 
-- The pool maps each remote fingerprint to one ready session. Two endpoints share one session for all of their identities.
-- **Duplicate rule:** when a session becomes ready for a fingerprint that already has one, the session kept is the one whose dialer's smallest proven fingerprint sorts lowest; on a tie, the older. Only the losing session's dialer closes it (`bye DUPLICATE`), so both sides agree without a further message.
-- When a pooled session closes, another ready session proving that fingerprint takes its place.
+- The pool maps each remote fingerprint to one ready session. Two endpoints share one session for all of their identities. Each session records `via` locally: `direct` (accepted on the listener, or a connection's peer dial) or `hub` (a hub stream, either way).
+- **Duplicate rule** (`keeps`): when a session becomes ready for a fingerprint that already has one, the session kept is the **direct** one if the two differ in route; otherwise the one whose dialer's smallest proven fingerprint sorts lowest; on a tie, the older. Only the losing session's dialer closes it (`bye DUPLICATE`).
+- Both ends agree without a further message: a port forward or an SSH tunnel is a TCP socket at both ends, and a hub stream is a hub stream at both ends, so both ends classify a session the same way.
+- When a pooled session closes, the best remaining ready session proving that fingerprint (by the same rule) takes its place.
+- With a hub session up and the direct route back, the direct session wins and the hub session's dialer closes it: a contact moves back to direct.
 
 ### Dial policy
 
-- The transport dials only `view.contacts()` and the `fp` of a `mailbox` route it is sending on. It never dials a stranger whose announce arrived on an inbound session; that stranger still gets records over its live session, and through the outbox when it reconnects.
-- Addresses: the `tcp://` entries of `view.addrsOf(fp)`, plus whois hints (below). Other schemes are ignored.
-- Dials are deduplicated per address. A failed dial (refused, or a handshake that does not complete) backs that address off from `TCP_REDIAL_MIN_MS`, doubling up to `TCP_REDIAL_MAX_MS`; a successful handshake resets it. Backoff is clock-based: nothing redials until a send or `maintain` asks.
-- Caps: `TCP_MAX_CONNECTIONS` total, `TCP_MAX_HANDSHAKING` handshaking. An inbound socket beyond either is destroyed at accept; no dial starts beyond the total.
+- **Maintain** runs at `start`, every `syncMs` (`TCP_SYNC_MS`) and on `sync()`; per binding, maintain runs and pulls queue behind each other and never overlap:
+  1. bring due connections up and await them (`connect()` on every link);
+  2. dial each contact still without a session through the first hub-mode connection, in configured order, whose roster shows it present and that is not backing off for it (`dialHubs(fp)`);
+  3. pull from every remote fingerprint on every session the routes of interest it could serve.
+- A roster `peer` notice for a contact without a session triggers `dialHubs(fp)` at once.
+- **Strangers** (a non-contact that dialed in, was met on a connection, or is on a hub's roster) are served (`mayRead`), pulled from (`mayPull`) and receive what is addressed to them, and are listed in the directory with where they are present. Maintain never dials one, and a roster notice never does. A human's invite makes it a counterparty, and so a contact: the invite itself goes out on a live session, or through the first hub that has it (a `mailbox` route's fp is dialable).
+- A hub stream dial is per (hub, fp): a failure (an `ABSENT` or `LIMIT` close, or a failed handshake) backs that fp off on that hub from `redialMinMs`, doubling to `redialMaxMs`; a roster `peer` notice resets it.
+- Caps: `TCP_MAX_CONNECTIONS` sessions in all, `TCP_MAX_HANDSHAKING` handshaking, whatever the route; `CONNECTIONS_MAX` configured connections. An inbound socket or stream beyond a cap is destroyed at accept; no dial starts beyond the total.
 
-### Maintain, pulls and cursors
+### Announces, pulls and cursors
 
-`maintain` runs at `start`, every `syncMs` (`TCP_SYNC_MS`) and on `sync()`. Per binding, maintain runs and pulls queue behind each other and never overlap.
-
-1. **Whois:** for every contact without a session and without any address, ask every connected session for its announce.
-2. **Dial** contacts without a session (backoff permitting), awaiting each handshake.
-3. **Pull** from every remote fingerprint on every session the routes of interest it could serve.
-
-- **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A pull names no route key the peer has no part in. The directory itself is public, though: it still carries this install's `inbox-create` records, so their shared inbox ids and names reach any peer that pulls it (personal inbox ids are never in the directory).
-- **On session ready:** `peerOnline(fp)` for every remote fingerprint and local binding, then a (scoped) pull of that binding's interest from it. The directory is always pulled, so this is the announce exchange at the handshake.
+- **On session ready:** each side pushes each binding's announce to each remote fp (`rec` on the `directory` route; `from` is proven, so the writer is bound), then `peerOnline(fp)` for every remote fingerprint and local binding, then a (scoped) pull of that binding's interest from it. **Announce** pushes the new announce on every ready session.
+- **Scoped pulls:** a pull names only the routes `view.mayPull(peer, route)` allows, judged by this install's own state: the directory, this install's mailbox, and an inbox only when the peer is a party of that personal inbox or a current member of that shared inbox. A pull names no route key the peer has no part in. The directory carries this install's `inbox-create` records (shared inbox ids and names) to any peer that pulls it (personal inbox ids are never in the directory).
 - **New routes:** `setInterest` schedules (never awaits; it runs under the engine lock) a pull of each newly added route from every session.
 - **A pull** asks for records signed by the remote identity on each route with seq > the cursor, loops while a route answers `more`, and stops if an answer makes no progress.
 - **Cursors** are per (peer fp, route key), persisted in `peer-cursors.json`. A cursor moves only once its batch has been offered to the sink, and only on pull answers, never on pushes, so a push gap cannot skip records. A `denied` route keeps its cursor: pulling an inbox before being admitted does not skip its history. A server answering `head` < cursor (its data was reset) resets the cursor to 0.
 - **Delivered** means written to a ready session under the write-buffer cap; `send` never waits for the flush because it runs under the engine lock. A frame lost on a dying socket is recovered by the pull on reconnect and by the periodic pull.
 
-### Route binding over TCP
+### Route binding
 
-- **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine still checks `payload.signer === writer` and `routeFor(payload) === route`. A peer therefore pushes and serves only records it signed itself; a relayed third-party record is refused `ROUTE_MISMATCH`, like a file in the wrong share subdir.
-- **Contact-card import** is the one path where the writer is not a transport identity: `engine.importCard` accepts only an `announce` and ingests it with route `directory` and writer = its signer. Every other check still runs.
-- **Whois answers only for a shared inbox.** A peer asking about `fp` gets `fp`'s announce only if the two share an inbox on this install (`view.announceFor`): the member-discovery case. Anything else is answered with nothing, so whois is no oracle for this install's contacts or third parties' addresses.
-- **Whois hints are never ingested.** A `cards` reply is used only for the `tcp://` addresses of announces that decode, are `announce`s, and are signed by a fingerprint that was asked for. The engine receives that identity's announce from the identity itself, by the pull after the handshake. A forged or mismatched hint is dropped; a hint pointing at the wrong place fails the handshake proof.
+- **The writer is the proven `from`.** `Incoming.writer` is the frame's `from`, which must be an identity the remote proved on that session (any other `from` closes the session). The engine still checks `payload.signer === writer` and `routeFor(payload) === route`. A peer therefore pushes and serves only records it signed itself; a relayed third-party record is refused `ROUTE_MISMATCH`.
+- **Two self-certifying exceptions, announces only, into memory only:** a contact-card import (`engine.importCard`) and a hub-relayed announce (`sink.announce`). The writer is the announce's own signer; anything but an announce is refused.
+- **Least disclosure:** no frame asks about, or answers with, any identity other than the session's two proven parties. A session serves only records its proven `from` may read (`mayRead`); pulls name only routes the peer could serve (`mayPull`); a denial carries no head.
 
 ### Known limitations
 
-- **A member's records come only from that member.** A shared-inbox message reaches a member that was offline when it was sent only once that member and the message's author are online at the same time; another member or the owner cannot pass it on. A removed member is no longer pulled from, so a member who joins after a removal never receives the removed member's earlier messages.
+- **A member's records come only from that member.** Two members of a shared inbox exchange records only over a session between them: a common hub (co-members are contacts, so each dials the other there) or a connection from one to the other's listener. Members with neither still exchange with the owner when connected to the owner, but never with each other. A removed member is no longer pulled from, so a member who joins after a removal never receives the removed member's earlier messages.
 - **Both ends must be online at once** (or the sender keeps the record in its outbox until the recipient reconnects).
 - **Plaintext, loopback by default** (below).
 
-### TCP security
+### Network security
 
-1. **Open port, default binding.**
-   - The listener binds `127.0.0.1` unless a human saves a non-loopback host; the page warns when the host is not loopback. A wildcard host needs an explicit advertised host.
-   - `POST api/tcp` sits behind the mutating-request guard (`Sec-Fetch-Site`/`Origin`, JSON only). Like every REST route, any local process can call it.
-2. **Plaintext, by design.** An on-path observer reads every record (bodies, names, membership, proven fingerprints), sees which identities share an endpoint and when installs pull. The advertised host is in the signed, public announce. With no session keys there is **no per-frame authentication after the handshake**: an on-path attacker can drop or inject frames. An injected frame cannot forge a record (every record still passes `decodeRecord`, route binding and `classify`); an injected `pull` only makes the server send records into a stream the attacker already reads. Drops are recovered by the outbox and by pulls.
-3. **Framing limits.**
-   - The frame size limit depends on the phase (`TCP_HELLO_FRAME_MAX` before ready, `TCP_FRAME_MAX` after) and is enforced from the 4-byte header, before the body is buffered.
-   - Every frame has an exact schema; anything else closes the session.
-   - Deadlines: the whole handshake within `TCP_HANDSHAKE_MS`; a started post-ready frame within `TCP_FRAME_MS`; nothing received for `TCP_IDLE_MS` closes. Together they bound slowloris and partial frames.
-   - The inbound queue pauses the socket at `TCP_INBOUND_QUEUE` frames; more than `TCP_WRITE_BUFFER_MAX` unflushed bytes destroys it.
-   - Connection caps (`TCP_MAX_CONNECTIONS`, `TCP_MAX_HANDSHAKING`) bound memory. There is no per-IP fairness: availability against a hostile flooder is out of scope.
-4. **Handshake replay and binding.**
-   - Each side contributes a fresh 32-byte random nonce per connection and both are signed, so a proof recorded on one connection fails on any other. No clock is involved.
-   - A role label stops a dial proof being presented as an accept proof, and the reverse.
-   - The dialer's proof names the **target fingerprint**; the acceptor's names the **dialer's fingerprints**. If M gets A to dial M and replays A's proof to B, the proof names M as its target and M is not attached at B, so B refuses. M cannot reuse B's accept proof either: it is bound to M's own fingerprints. The dialer also refuses an acceptor that does not prove the target it dialed.
-   - `PROOF_DOMAIN` differs from the record domain: no handshake signature is ever a record signature.
-   - The transport holds only `signProof`. A remote proving one of this endpoint's own fingerprints is refused.
-5. **What an unauthenticated connection can make the process do:** take one connection slot and one handshake slot; generate one 32-byte nonce and write one `hello` (about 100 bytes); buffer at most `TCP_HELLO_FRAME_MAX`; parse at most three small JSON frames; run up to `TCP_MAX_IDENTITIES` Ed25519 verifies. It cannot cause any signing, any sink or engine call, any disk write, any dial, or a log line (failures are counted in `stats().handshakeFailures`). It learns nothing about the identities served, because the acceptor proves second.
-6. **Authority after the proof.**
-   - The writer is the proven `from`: pushes and pulls carry only the sender's own records.
-   - A `pull` is gated by `mayRead`: inbox records go only to its parties or current members, a mailbox only to its owner. This is least privilege, not confidentiality (see 2).
-   - Pushes on routes outside the addressed identity's interest are dropped, as the share reads only routes of interest.
-   - `whois` is answered only about identities the requester shares an inbox with here; replies never reach the engine. Card import accepts only announces.
-   - Pulls name only routes the peer could serve by this install's state (scoped pulls): a pull names no route key the peer has no part in, and a denied answer carries no `head`, so it reveals nothing of how many records are held. The public directory still carries this install's `inbox-create` records (shared inbox ids and names), served to any proven peer.
-7. **Dial-hint residue.** A dial address comes from an announce: one a contact signed (pulled from it or imported from its card), or one fetched by `whois` and signed by the contact asked about. Such an address can name any host and port. So **an identity in the dial set (an inbox owner or member, a card a human imported, a counterparty) can steer this process into a TCP connect to an address of its choosing.** What leaves the process on such a connection:
-   - at once, `hello`: the protocol version and a fresh random nonce;
-   - as soon as anything answers with a well-formed `hello`, the dialer's `prove`: the target fingerprint, the raw public key of **every identity attached to the endpoint**, and per key a signature over `PROOF_DOMAIN` ‖ `["dial", dialer nonce, answerer nonce, target]`. The listener at the steered address learns which identities share this endpoint.
-   - nothing else: no record, route, or other frame is sent before the answerer proves the target identity in its own `prove`.
-
-   The signatures cannot be reused: each is bound to this connection's two nonces (any other acceptor contributes a different nonce), to the `dial` role (never valid as an accept proof), to the target fingerprint (refused by any endpoint where that identity is not attached), and to `PROOF_DOMAIN` (never a record signature). What bounds the residue:
-   - only identities in the dial set can do it; a stranger's announce never causes a dial (dial policy);
-   - each address is dialed at most once per backoff period, so a failing target is retried at most at the backoff schedule;
-   - the steering identity already knows the target fingerprint; with one identity per install (production), the public key it learns is the install's own, published in its announce anyway.
+1. **Trust assumption (owner ruling).** Peers, hubs, connection targets and strangers on a hub are trusted parties. No defence is designed against their abuse: no rate limits, no presence anti-spoofing, no announce-forgery handling beyond the signature check.
+2. **Kept:**
+   - every record and announce is signature-verified (`decodeRecord` on every path; hubs and clients both decode announces);
+   - the writer is the proven `from`, end to end on every route; the two self-certifying exceptions (card import, hub-relayed announces) take announces only, into memory only;
+   - `mayRead` and `mayPull`, and head-less denials;
+   - the handshake proofs (below), with direct dials untargeted;
+   - every cap: sessions, handshakes, hub links, streams and buffers, per-stream back-pressure, frame sizes and deadlines;
+   - the loopback listener default; `POST api/network` behind the mutating-request guard;
+   - `stop()` synchronous under the lock.
+3. **Handshake.** Each side contributes a fresh 32-byte nonce per connection and both are signed, so a proof recorded on one connection fails on any other; a role label (`dial`, `accept`, `hub`) stops one kind of proof being presented as another; `PROOF_DOMAIN` differs from the record domain. The dialer proves first and the acceptor signs nothing before that proof verifies. The acceptor's proof is bound to the dialer's proven fingerprints. A targeted dial (a hub stream: `target` = the fp it means to reach) is bound to its target, and the dialer refuses an acceptor that does not prove it: a misrouting hub gets no session. A direct dial is untargeted (`target: null`, bound `''`): a connection names no fingerprint.
+4. **Still exposed:**
+   - **Plaintext:** anyone on the path reads every record (bodies, names, membership, proven fingerprints) and timing, and can drop or inject frames; an injected frame cannot forge a record, and drops are recovered by the outbox and pulls.
+   - **A listener reveals its fingerprints:** a direct dial is untargeted, so anyone who reaches a listener and proves any key gets the listener's accept proof: which fingerprints sit behind that address. That stranger is then a proven non-contact: it reads the public directory (`inbox-create` names and ids) and may push its announce and mailbox records to this install, as any reachable party can.
+   - **A connection target can relay a session live** (a port forward does exactly that honestly): an on-path relay sees, drops or injects frames, and an injected `pull` reads whatever the far peer serves this install. It can never forge a record or a `from`.
+   - **Hubs:** [hub.md → Hub security](hub.md#hub-security). Every client on a hub sees every other client's fingerprint, name and online times; a hub never receives a contact list.
+   - **Invites:** anyone who can reach this install (on a common hub, or over a connection) can invite it. Invites are human-gated (Accept or Decline); there is no rate or volume limit.
+5. **In scope:** peer-supplied names (`NAME_RE`) and fingerprints render only as React text; presence addresses are the user's own saved strings. The REST guard covers `POST api/network` and every invite route. Realistic input: the caps above, the hub roster's coalescing, `ANNOUNCE_MAX_BYTES`.
 
 ### File-share write safety
 
@@ -189,7 +197,3 @@ Wire format, handshake and limits: [protocol.md → TCP wire format](protocol.md
 - The route and writer subdirs are created one component at a time (`mkdirsInside`), each checked before anything is created under it: a component that is a symlink, or resolves outside the root, is refused `SHARE_UNSAFE`. A link a peer plants anywhere in the share (`code-inbox`, `v1`, `inboxes`, `inboxes/<id>`, a writer subdir) creates and writes nothing outside it. The same `rootState` rule refuses a root that is a link when the share is saved (before the root is created), at boot (a stored share whose root is a link starts nothing: `SHARE_UNSAFE` in `state().transport.error`), and on every write.
 - Right before the record is written, the writer subdir's real path is checked once more against the root's.
 - **Remaining race:** a check and the next `mkdir` or write are separate system calls, so a component swapped for a link in between can still get one empty directory created, or one record file written, through the link. Only someone who already controls the share's contents can do it, and the write is a no-overwrite (exclusive tmp + rename to a fresh random name) of this install's own signed record, which is published anyway.
-
-## Hub client (`src/transport/hubClient.js`)
-
-Every install dials out to one hub; sessions run as streams through it, with the endpoint handshake unchanged inside each, so the writer is still the `from` the remote endpoint proved. The hub routes by fingerprint, stores nothing and is never trusted for authenticity. Behaviour, the hub server, and its security: [hub.md](hub.md). Wire format: [protocol.md → Hub link wire format](protocol.md#hub-link-wire-format).

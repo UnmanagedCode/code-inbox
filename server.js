@@ -12,26 +12,24 @@ import { createApp } from './src/routes.js';
 import { createStore } from './src/store.js';
 import { createFileShare } from './src/transport/fileShare.js';
 import { proofSigner } from './src/transport/handshake.js';
-import { createHubClient } from './src/transport/hubClient.js';
-import { createTcp } from './src/transport/tcp.js';
+import { createNetwork } from './src/transport/network.js';
 
 // The engine's transport factory: (settings.transport, engine view) → a Transport. `pollMs` overrides the file
-// share's poll; `tcpSyncMs` the maintain interval of the TCP endpoint and the hub client (tests).
-// `now` and `schedule` reach the TCP endpoint and the hub client (redial backoff, session timers) when given (tests).
+// share's poll; `tcpSyncMs` the maintain interval of the network endpoint (tests). `now` and `schedule` reach the
+// network endpoint (reconnect backoff, session timers) when given (tests).
 export function transportFactory({ identity, store, pollMs, tcpSyncMs, now, schedule, log }) {
   return (config, view) => {
     const network = {
       identity: proofSigner(identity), view, cursors: { load: store.loadPeerCursors, save: store.savePeerCursors }, syncMs: tcpSyncMs, log,
       ...(now ? { now } : {}), ...(schedule ? { schedule } : {}),
     };
-    if (config.kind === 'tcp') return createTcp({ host: config.host, port: config.port, advertise: config.advertise, ...network });
-    if (config.kind === 'hub') return createHubClient({ url: config.url, ...network });
+    if (config.kind === 'network') return createNetwork({ listen: config.listen, connections: config.connections, ...network });
     return createFileShare({ shareDir: config.dir, dataDir: store.dataDir, selfFp: identity.fp, pollMs, log });
   };
 }
 
 // Builds one install; the caller listens. `pollMs`, `tcpSyncMs`, `schedule` (the notifier's timers, the engine's
-// outbox retry, the TCP endpoint's and hub client's timers) and `now` (their clock) override the defaults (tests).
+// outbox retry, the network endpoint's timers) and `now` (their clock) override the defaults (tests).
 // Resolves {server, engine, notifier, mcp, identity, close}.
 export async function wire({ dataDir, distDir, env = process.env, pollMs, tcpSyncMs, now, schedule, log = console }) {
   const store = createStore(dataDir, { log });

@@ -3,9 +3,9 @@ import { fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { ContactsPanel } from './ContactsPanel';
 import type { State, TransportView } from '../types';
 
-const CARD = 'code-inbox-card:v1:abc';
+const CARD = 'code-inbox-card:v2:abc';
 const tcp = (t: Partial<TransportView> = {}) => ({
-  transport: { kind: 'tcp', configured: true, dir: null, host: '127.0.0.1', port: 47821, advertise: '127.0.0.1', addresses: [], card: CARD, cardStale: false, error: null, ...t },
+  transport: { kind: 'network', configured: true, dir: null, listen: null, listening: null, connections: [], card: CARD, error: null, outboxError: null, ...t },
 }) as unknown as State;
 
 afterEach(() => vi.restoreAllMocks());

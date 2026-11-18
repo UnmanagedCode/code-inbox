@@ -8,10 +8,14 @@ export const PROOF_DOMAIN = Buffer.from('code-inbox/tcp-proof/v1\0', 'utf8');
 
 export const newHandshakeNonce = () => crypto.randomBytes(32).toString('hex');
 
-// role: 'dial' | 'accept'. bound: the dialer's target fp (dial) or the dialer's proven fps (accept, `boundFps`).
+// role: 'dial' | 'accept'. bound: what the dialer means to reach (dial, `dialBound`) or the dialer's proven fps
+// (accept, `boundFps`).
 export const proofBytes = (role, proverNonce, verifierNonce, bound) => Buffer.concat([PROOF_DOMAIN, Buffer.from(JSON.stringify([role, proverNonce, verifierNonce, bound]), 'utf8')]);
 
 export const boundFps = (fps) => [...fps].sort().join(',');
+
+// A dial proof's bound: the target fingerprint, or '' when the dialer names none (a direct dial of an address).
+export const dialBound = (target) => target ?? '';
 
 // What the transport holds of an identity: it can sign handshake proofs and nothing else.
 export function proofSigner(identity) {

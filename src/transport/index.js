@@ -5,22 +5,27 @@ import { FP_RE, ID_RE } from '../records.js';
 //
 /** @typedef {{kind:'directory'} | {kind:'mailbox', fp:string} | {kind:'inbox', id:string}} Route */
 /** @typedef {{route: Route, writer: string, bytes: Uint8Array}} Incoming
- *  `writer` is the fingerprint the transport attributes the record to: on the file share the writer subdir, over
- *  TCP the frame's `from`, an identity the remote proved on that session. */
-/** @typedef {{record(i: Incoming): Promise<{retry: boolean}>, peerOnline(fp: string): void}} Sink
- *  `record` resolves {retry:true} when the bytes may still be incomplete and should be offered again. */
+ *  `writer` is the fingerprint the transport attributes the record to: on the file share the writer subdir, in
+ *  network mode the frame's `from`, an identity the remote proved on that session (direct or through a hub). */
+/** @typedef {{record(i: Incoming): Promise<{retry: boolean}>, announce(bytes: Uint8Array): void, peerOnline(fp: string): void}} Sink
+ *  `record` resolves {retry:true} when the bytes may still be incomplete and should be offered again. `announce`
+ *  takes a hub-relayed announce, which no proven session carried: the engine accepts it as an announce only, writer =
+ *  its own signer, into memory only. */
 /**
  * @typedef {object} Transport
  * @property {{directory: boolean, push: boolean}} capabilities
- * @property {() => string[]} addresses                  the rendezvous addresses that go into announce.addr
  * @property {(sink: Sink) => Promise<void>} start
  * @property {(routes: Route[]) => void} setInterest       the routes this install wants delivered
+ * @property {(bytes: Uint8Array|null) => void} setAnnounce   this install's current signed announce: a network
+ *                                                         transport presents it to every peer and hub
  * @property {(bytes: Uint8Array, opts: {route: Route, to: string[]}) => Promise<{delivered: string[], pending: string[]}>} send
  * @property {() => Promise<void>} sync                    pull now / ask online peers to catch up
  * @property {() => Promise<void>} stop
+ * @property {() => object} [stats]                       network mode only: listener, connections, sessions
+ *                                                         (diagnostics; the engine reads it for display only)
  */
 
-export const TRANSPORT_METHODS = ['addresses', 'start', 'setInterest', 'send', 'sync', 'stop'];
+export const TRANSPORT_METHODS = ['start', 'setInterest', 'setAnnounce', 'send', 'sync', 'stop'];
 
 // Throws unless `t` has the Transport shape: the engine calls this on every transport it is given.
 export function assertTransport(t) {

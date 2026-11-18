@@ -6,13 +6,13 @@ import { fingerprint, verifySignature } from './identity.js';
 // (docs/protocol.md → Records). Everything here is pure.
 
 export const RECORD_MAX_BYTES = 32 * 1024;
+// An announce's whole record: it is held in memory per identity and broadcast by hubs.
+export const ANNOUNCE_MAX_BYTES = 1024;
 export const BODY_MAX_BYTES = 16 * 1024;
 export const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,31}$/;
 export const FP_RE = /^[0-9a-f]{64}$/;
 // Record ids, inbox ids and nonces.
 export const ID_RE = /^[0-9a-f]{32}$/;
-export const ADDR_MAX = 8;
-export const ADDR_MAX_CHARS = 256;
 // The largest ts a JavaScript Date can represent: a later one could not be displayed.
 export const TS_MAX = 8_640_000_000_000_000;
 
@@ -47,7 +47,6 @@ const isId = str(ID_RE);
 const isBool = (v) => typeof v === 'boolean';
 const isInt = (min) => (v) => Number.isSafeInteger(v) && v >= min;
 const oneOf = (...xs) => (v) => xs.includes(v);
-const isAddrList = (v) => Array.isArray(v) && v.length <= ADDR_MAX && v.every((a) => typeof a === 'string' && a.length > 0 && a.length <= ADDR_MAX_CHARS);
 const isIdOrNull = (v) => v === null || isId(v);
 const isBody = (v) => typeof v === 'string' && v.length > 0 && Buffer.byteLength(v, 'utf8') <= BODY_MAX_BYTES;
 const isTs = (v) => isInt(0)(v) && v <= TS_MAX;
@@ -55,7 +54,8 @@ const NAME = Symbol('name');
 
 // Per type: field → check (`NAME` marks a name, refused as BAD_NAME); `optional` lists fields that may be absent.
 const SCHEMA = {
-  announce: { fields: { name: NAME, addr: isAddrList } },
+  // Who an identity is, never where: routes are the user's connections (docs/transport.md).
+  announce: { fields: { name: NAME } },
   'inbox-create': { fields: { inbox: isId, nonce: isId, name: NAME } },
   invite: { fields: { to: isFp, kind: oneOf('personal', 'shared'), inbox: isId, nonce: isId } },
   'invite-response': { fields: { to: isFp, invite: isId, inbox: isId, accept: isBool } },
@@ -127,7 +127,8 @@ export function encodeRecord(identity, payload) {
     sig: identity.sign(signedBytes(payloadBytes)).toString('base64url'),
   };
   const bytes = Buffer.from(JSON.stringify(envelope), 'utf8');
-  if (bytes.length > RECORD_MAX_BYTES) throw new CodedError('RECORD_TOO_LARGE', `the ${payload.type} record would be ${bytes.length} bytes; readers accept at most ${RECORD_MAX_BYTES}`);
+  const max = payload.type === 'announce' ? ANNOUNCE_MAX_BYTES : RECORD_MAX_BYTES;
+  if (bytes.length > max) throw new CodedError('RECORD_TOO_LARGE', `the ${payload.type} record would be ${bytes.length} bytes; readers accept at most ${max}`);
   return { bytes, id: recordId(payloadBytes), payload };
 }
 
@@ -166,13 +167,14 @@ function decodeUnsafe(bytes) {
   if (payload && typeof payload === 'object' && payload.signer !== fingerprint(key)) return bad('SIGNER_MISMATCH', 'signer is not the fingerprint of key');
   const check = checkPayload(payload);
   if (!check.ok) return check;
+  if (payload.type === 'announce' && bytes.length > ANNOUNCE_MAX_BYTES) return bad('TOO_LARGE', `an announce of ${bytes.length} bytes`);
   return { ok: true, id: recordId(payloadBytes), payload };
 }
 
 // ---- contact cards ----
 
 // A contact card is a signed announce, pasted between humans: CARD_PREFIX + base64url(record bytes).
-export const CARD_PREFIX = 'code-inbox-card:v1:';
+export const CARD_PREFIX = 'code-inbox-card:v2:';
 
 export const encodeCard = (bytes) => `${CARD_PREFIX}${Buffer.from(bytes).toString('base64url')}`;
 

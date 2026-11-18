@@ -6,7 +6,7 @@ Every wire format code-inbox owns, and the cc routes it uses. The record codec l
 
 ### Envelope
 
-The bytes of a record (a file on the share, a TCP frame's `rec`, a contact card's payload) are exactly:
+The bytes of a record (a file on the share, a session frame's `rec`, a hub roster entry's `rec`, a contact card's payload) are exactly:
 
 ```
 {"v":1,"key":"<b64url raw public key>","payload":"<b64url payload JSON>","sig":"<b64url signature>"}
@@ -22,7 +22,7 @@ The bytes of a record (a file on the share, a TCP frame's `rec`, a contact card'
 
 | Step | Refusal reason |
 |---|---|
-| 1. size ≤ `RECORD_MAX_BYTES` | `TOO_LARGE` |
+| 1. size ≤ `RECORD_MAX_BYTES` (an announce: ≤ `ANNOUNCE_MAX_BYTES`, checked once its type is known) | `TOO_LARGE` |
 | 2. the envelope parses as JSON | `BAD_JSON` (the only retryable reason: the file may still be arriving) |
 | 3. strict envelope shape (above) | `BAD_ENVELOPE` |
 | 4. Ed25519 verify | `BAD_SIGNATURE` |
@@ -38,7 +38,7 @@ The bytes of a record (a file on the share, a TCP frame's `rec`, a contact card'
 | `RECORD_MAX_BYTES` | a whole record. `encodeRecord` refuses to sign a larger one (`RECORD_TOO_LARGE`), so no install signs, or accepts from itself, a record its readers would reject |
 | `BODY_MAX_BYTES` | a message body, as UTF-8 bytes. A send whose encoded record would still exceed `RECORD_MAX_BYTES` (heavily escaped characters) is refused `BODY_TOO_LARGE` too |
 | `NAME_RE` | identity and inbox names: one short token, so a peer-chosen name cannot carry markup or prose into a prompt |
-| `ADDR_MAX`, `ADDR_MAX_CHARS` | `announce.addr` |
+| `ANNOUNCE_MAX_BYTES` | a whole announce record: held in memory per identity and broadcast by hubs. `encodeRecord` refuses a larger one, `decodeRecord` refuses one `TOO_LARGE` |
 
 Ids and nonces are 32 lowercase hex (`ID_RE`); fingerprints 64 (`FP_RE`); `ts` is an integer from 0 to `TS_MAX` (ms since the epoch, the signer's clock, never trusted for ordering). A `msg` body is non-empty.
 
@@ -55,7 +55,7 @@ Every payload has `type`, `signer`, `ts`; no other fields than listed.
 
 | Type | Fields | Route | Accepted when | Pending while |
 |---|---|---|---|---|
-| `announce` | `name`, `addr: string[]` (`[]` on the file share; `["tcp://host:port"]` over TCP; `["hub://host:port"]` through a hub) | directory | always (it certifies its own key) | — |
+| `announce` | `name` (any other field, `addr` included, is `BAD_PAYLOAD`) | directory | always (it certifies its own key). **Never logged:** it goes to the engine's memory directory ([Names](#names)) | — |
 | `inbox-create` | `inbox`, `nonce`, `name` | directory | the id recomputes | — |
 | `invite` | `to`, `kind: personal\|shared`, `inbox`, `nonce` | mailbox(`to`) | personal: the id recomputes. Shared: the id recomputes from signer + nonce and the `inbox-create` is known (`NOT_OWNER` otherwise) | shared: the `inbox-create` is unseen |
 | `invite-response` | `to`, `invite` (record id), `inbox`, `accept: boolean` | mailbox(`to` = inviter) | the invite's `to` is the signer, its signer is `to`, same inbox (`RESPONSE_MISMATCH`) | the invite is unseen |
@@ -112,8 +112,9 @@ The owner's install writes the `member add` itself when it accepts the invitee's
 
 ### Names
 
-- **Current announce** of an identity: its latest by `ts`, record id breaking ties.
-- **Pinning:** `pins.json` maps name → fingerprint. A name is pinned the first time this install shows it.
+- **The directory** is in memory only (`src/directory.js`): the latest verified announce per fingerprint, by `ts`, record id breaking ties, fed by every route (session pushes, hub rosters, share files, card imports, `identities.json` at boot, this install's own announce). Announces never enter `accepted.ndjson`, `pending.ndjson` or `rejected.ndjson`.
+- **What persists:** `identities.json` keeps the current announce of every identity this install keeps (a card a human imported, or any fp an accepted record names as `signer`, `to` or `member`), so contacts' and counterparties' names survive a restart; a stranger's does not. This install's own announce is not stored: `settings.announced` is, and the announce is re-signed from it at every boot.
+- **Pinning:** `pins.json` maps name → fingerprint. A name is pinned the first time this install shows it, **for this install and the identities it keeps only**: a stranger's name is judged in memory (against the pins and the memory directory) and never written; it pins once the stranger becomes a counterparty (first key wins).
 - **Pinned to another key** → that identity is not shown: `NAME_TAKEN`.
 - **Unpinned, two or more claimant keys** → none shown: `NAME_CONFLICT`. This closes the backdated-`ts` race.
 - **Own name:** setting or announcing a name pinned here to another key, or claimed by another key, is refused (`NAME_TAKEN`, `NAME_CONFLICT`).
@@ -128,9 +129,10 @@ A route says where a record travels: `{kind:'directory'}`, `{kind:'mailbox', fp}
 | Transport | `writer` is |
 |---|---|
 | File share | the fingerprint subdir the file sits in |
-| TCP | the frame's `from`: an identity the remote proved on that session (any other `from` closes the session) |
-| Hub | the same: the frame's `from`, proven by the remote **endpoint** in the handshake tunneled through the hub stream. The hub attests nothing |
-| Contact-card import | the announce's own signer. Only an `announce` is accepted this way (`CARD_INVALID` otherwise) |
+| Direct (a listener or a connection's peer session) | the frame's `from`: an identity the remote proved on that session (any other `from` closes the session) |
+| Hub stream | the same: the frame's `from`, proven by the remote **endpoint** in the handshake tunneled through the hub stream. The hub attests nothing |
+| Contact-card import | the announce's own signer. Only an `announce` is accepted this way (`CARD_INVALID` otherwise); into memory and `identities.json` only |
+| Hub roster (`peer.rec`) | the announce's own signer, which must be the fp the roster names. Announces only, into memory only |
 
 ### File share (`<shareDir>/code-inbox/v1/`, `SHARE_ROOT`)
 
@@ -145,9 +147,9 @@ inboxes/<inboxId>/<signerFp>/<ts13>-<rand32hex>.rec
 - Readers skip writer subdirs and record files that are symlinks, and open files without following links.
 - Readers offer only names matching `FILE_RE` (`^\d{13}-[0-9a-f]{32}\.rec$`, `src/transport/fileShare.js`) in subdirs that are a fingerprint. That skips tmp files and sync-client conflict copies.
 
-## TCP wire format
+## Endpoint wire format
 
-Owned by `src/transport/frames.js` (framing, schemas, limits), `src/transport/handshake.js` (proofs) and `src/transport/tcpSession.js` (phases, timeouts). Behaviour on top of it: [transport.md → Direct TCP](transport.md#direct-tcp-srctransporttcpjs).
+Owned by `src/transport/frames.js` (framing, schemas, limits), `src/transport/handshake.js` (proofs), `src/transport/greeting.js` (the first hello exchange of an outbound connection) and `src/transport/tcpSession.js` (phases, timeouts). The same frames run on a direct TCP connection and inside a hub stream. Behaviour on top of it: [transport.md → Network endpoint](transport.md#network-endpoint-srctransportnetworkjs-endpointjs).
 
 ### Framing
 
@@ -162,12 +164,23 @@ Owned by `src/transport/frames.js` (framing, schemas, limits), `src/transport/ha
 | `TCP_BATCH_BYTES` | `frames.js` | record bytes a server packs into one `recs` |
 | `TCP_MAX_IDENTITIES` | `frames.js` | ids in one `prove`; identities on one endpoint |
 | `TCP_PULL_ROUTES_MAX` | `frames.js` | routes in one `pull` / `recs` |
-| `TCP_WHOIS_MAX` | `frames.js` | fingerprints in one `whois`, records in one `cards` |
-| `TCP_HANDSHAKE_MS` | `tcpSession.js` | the whole handshake; then the connection is destroyed |
+| `TCP_HANDSHAKE_MS` | `tcpSession.js` | the whole handshake (and an outbound connection's greeting); then the connection is destroyed |
 | `TCP_FRAME_MS` | `tcpSession.js` | a post-ready frame, from its first byte to its last |
 | `TCP_PING_MS`, `TCP_IDLE_MS` | `tcpSession.js` | keepalive interval; nothing received for this long closes |
-| `TCP_REQUEST_MS` | `tcpSession.js` | a `pull` or `whois` without its answer fails |
+| `TCP_REQUEST_MS` | `tcpSession.js` | a `pull` without its answer fails |
 | `TCP_INBOUND_QUEUE`, `TCP_WRITE_BUFFER_MAX` | `tcpSession.js` | frames queued before the socket pauses; unflushed bytes before it is destroyed |
+
+### Hello
+
+`{t:'hello', v:2, nonce, kind}`: `nonce` is 32 random bytes as 64 lowercase hex; `kind` is in `HELLO_KINDS`: `endpoint` (every install: listener, dialer, hub client, inside hub streams) or `hub` (a hub). Who accepts what:
+
+| Receiver | Accepts |
+|---|---|
+| An endpoint session (`parseFrame`) | only `kind: 'endpoint'`: a listener refuses a hello claiming to be a hub (`bye PROTOCOL`) |
+| The hub (`parseHubFrame(…, 'hub', …)`) | only `kind: 'endpoint'` |
+| The greeting (`parseGreeting`) | either: it tells a connection what answered |
+
+**The greeting** (`greet`, an outbound connection): send `hello` (kind `endpoint`) at once; read the first frame, which must be a v2 `hello` of a known kind (anything else: `CONNECTION_PROTOCOL`, after `bye PROTOCOL` unless the far end sent a `bye`; nothing within `TCP_HANDSHAKE_MS`: `CONNECTION_TIMEOUT`). It then pauses the socket and hands over `{kind, myNonce, peerNonce, rest}`: an `endpoint` far end gets an untargeted `dial` session, a `hub` far end a hub-link client; either starts as if the far hello had just arrived (the dialer sends `prove`, the client `register`), pushes `rest` (bytes after the hello) and resumes the socket.
 
 ### Handshake
 
@@ -175,19 +188,20 @@ Owned by `src/transport/frames.js` (framing, schemas, limits), `src/transport/ha
 
 ```
 proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON.stringify([role, proverNonce, verifierNonce, bound]))
-  role  = "dial" | "accept"
-  bound = dial:   the target fingerprint the dialer means to reach
+  role  = "dial" | "accept" | "hub"
+  bound = dial:   dialBound(target): the target fingerprint, or "" for an untargeted dial
           accept: the dialer's proven fingerprints, sorted, joined with ","
+          hub:    ""
 ```
 
 | Step | Dialer (D) | Acceptor (A) |
 |---|---|---|
-| 1 | on connect: `{t:'hello', v:1, nonce:nD}` (32 random bytes, 64 hex) | on accept: `{t:'hello', v:1, nonce:nA}` |
-| 2 | on A's hello: `{t:'prove', target, ids:[{key, sig}]}`, one per local identity, `sig` over `proofBytes('dial', nD, nA, target)` | — |
-| 3 | — | checks `target` is attached here, 1..`TCP_MAX_IDENTITIES` ids, each `key` 32 bytes whose `sig` verifies, no repeated key, none of A's own fingerprints. Failure: `bye PROOF`, close; **A has signed nothing**. Success: `{t:'prove', ids:[…]}` over `proofBytes('accept', nA, nD, sortedDialerFps)` |
-| 4 | checks A's ids the same way (role `accept`, bound = D's own sorted fingerprints) and that `target` is among them. Failure: `bye PROOF`. Success: `{t:'ok'}` → **ready** | on `ok` → **ready** |
+| 1 | `hello` (kind `endpoint`) with nonce nD; on a connection, the greeting sends it | on accept: `hello` (kind `endpoint`) with nonce nA |
+| 2 | on A's hello: `{t:'prove', target, ids:[{key, sig}]}`, one per local identity, `sig` over `proofBytes('dial', nD, nA, dialBound(target))`. `target` is a fingerprint (a hub stream) or `null` (a connection: it names no one) | — |
+| 3 | — | checks `target` is `null` or attached here, 1..`TCP_MAX_IDENTITIES` ids, each `key` 32 bytes whose `sig` verifies against that bound, no repeated key, none of A's own fingerprints. Failure: `bye PROOF`, close; **A has signed nothing**. Success: `{t:'prove', ids:[…]}` over `proofBytes('accept', nA, nD, sortedDialerFps)` |
+| 4 | checks A's ids the same way (role `accept`, bound = D's own sorted fingerprints), none of D's own, and, for a targeted dial, that `target` is among them. Failure: `bye PROOF`. Success: `{t:'ok'}` → **ready** | on `ok` → **ready** |
 
-`key` is the raw Ed25519 public key and `sig` the signature, both base64url; a proven fingerprint is sha256 of `key`, as for records.
+`key` is the raw Ed25519 public key and `sig` the signature, both base64url; a proven fingerprint is sha256 of `key`, as for records. An untargeted proof is never a targeted one, nor the reverse: the bound differs.
 
 ### Session frames (after ready)
 
@@ -195,54 +209,52 @@ proofBytes(role, proverNonce, verifierNonce, bound) = PROOF_DOMAIN ‖ utf8(JSON
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise |
-| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since`. Names only routes `to` could serve by the asker's own state ([transport.md → Scoped pulls](transport.md#maintain-pulls-and-cursors)) |
-| `recs` | `id, from, to, routes:[{route, status:'ok', recs:[{seq, rec}], more, head} \| {route, status:'denied'}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route is exactly `{route, status:'denied'}`: no `head`, so it reveals nothing of what the server holds. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq |
-| `whois` | `id, from, to, fps` | Ask for the current announces of `fps`. Answered only for those that share an inbox with `from` on the answering install; the others are left out |
-| `cards` | `id, from, to, recs:[rec]` | Answer to `whois`: dial hints only, never ingested |
+| `rec` | `from, to, route, rec` | Push one record. Offered to `to` with writer `from` if `route` is in `to`'s interest; dropped and counted otherwise. On session ready (and on every Announce) each side pushes its announces this way, on the `directory` route |
+| `pull` | `id, from, to, routes:[{route, since}]` | Ask `to` for records **signed by `to`** on these routes with seq > `since`. Names only routes `to` could serve by the asker's own state ([transport.md → Announces, pulls and cursors](transport.md#announces-pulls-and-cursors)) |
+| `recs` | `id, from, to, routes:[{route, status:'ok', recs:[{seq, rec}], more, head} \| {route, status:'denied'}]` | Answer to `pull`: `from` is the pull's `to`, only routes it asked for, seqs ascending. A denied route is exactly `{route, status:'denied'}`: no `head`, so it reveals nothing of what the server holds. Routes the budget did not reach get `recs:[]`, `more:true`. `head` is the server's highest acceptance seq. The `directory` route serves `inbox-create` records only |
 | `ping` / `pong` | — | Keepalive every `TCP_PING_MS` |
 | `bye` | `reason`: `PROOF`, `PROTOCOL`, `DUPLICATE`, `LIMIT`, `STOP` | Sent before a deliberate close |
 
+No frame asks about, or answers with, any identity other than the session's two proven parties: any other `t` is `bye PROTOCOL`.
+
 ### Addresses
 
-`tcp://<host>:<port>` with host a DNS name, an IPv4 address, or `[IPv6]`, port 1–65535 (`parseTcpAddr` / `formatTcpAddr`, `src/transport/tcp.js`; both are `parseAddr` / `formatAddr` in `src/transport/addr.js`). A TCP install dials only these; entries of `announce.addr` in any other form are ignored.
-
-`hub://<host>:<port>`, the same syntax (`parseHubAddr` / `formatHubAddr`, `src/transport/hubClient.js`), is the hub a hub-client install uses. It is informational: a hub client dials peers by fingerprint through its own hub and never reads others' `addr`.
+One form: `host:port` (`parseHostPort` / `formatHostPort`, `src/transport/addr.js`): host a DNS name, an IPv4 address or `[IPv6]`, port 1–65535, at most `ADDRESS_MAX_CHARS`. `formatHostPort` lowercases the host, so one address has one spelling. A connection address is never a wildcard literal; the listen host may be one.
 
 ### Contact card
 
-`CARD_PREFIX` (`"code-inbox-card:v1:"`, `src/records.js`) followed by the base64url of an announce record's bytes. `decodeCard` trims the text, requires the prefix and canonical base64url of at most `RECORD_MAX_BYTES` bytes; the record then goes through `decodeRecord` and must be an `announce` signed by another identity (`CARD_INVALID` otherwise).
+`CARD_PREFIX` (`"code-inbox-card:v2:"`, `src/records.js`) followed by the base64url of an announce record's bytes. `decodeCard` trims the text, requires the prefix and canonical base64url of at most `RECORD_MAX_BYTES` bytes; the record then goes through `decodeRecord` and must be an `announce` signed by another identity (`CARD_INVALID` otherwise). A card says who someone is, never where: it gives no route.
 
 ## Hub link wire format
 
 Owned by `src/transport/frames.js` (`parseHubFrame`, `HUB_PHASES`, the `HUB_*` frame limits) and `src/transport/hubConn.js` (phases, deadlines, keepalive). Behaviour on top of it: [hub.md](hub.md).
 
-- **Framing:** as TCP ([Framing](#framing)): a 4-byte length, then one UTF-8 JSON object with a string `t`; the length is checked against the phase's limit from the header. Before `ok` the limit is `TCP_HELLO_FRAME_MAX`, after it `HUB_FRAME_MAX`.
+- **Framing:** as endpoint frames ([Framing](#framing)): a 4-byte length, then one UTF-8 JSON object with a string `t`; the length is checked against the phase's limit from the header. Before `ok` the limit is `TCP_HELLO_FRAME_MAX`, after it `HUB_FRAME_MAX`.
 - **Exact schemas per receiving role:** the hub and the client each parse with their own table (`HUB_PHASES[role][phase]`), so a frame sent in the wrong direction, out of phase, with an unknown `t`, a missing or extra key, or any field failure is `bye PROTOCOL`.
 - **Registration proof:** `sig` over `proofBytes('hub', clientNonce, hubNonce, '')` ([Handshake](#handshake)); the hub runs `verifyProofs` and answers a failure with `bye PROOF`. The hub signs nothing. A `hub` proof is never a `dial` or `accept` proof, and the reverse.
 
 | Phase | Hub accepts | Client accepts |
 |---|---|---|
-| `hello` | `hello`, `bye` | `hello`, `bye` |
+| `hello` | `hello` (kind `endpoint`), `bye` | — (the greeting read the hub's hello) |
 | `register` (hub) / `ok` (client) | `register`, `bye` | `ok`, `bye` |
-| `ready` | `open`, `data`, `close`, `watch`, `ping`, `pong`, `bye` | `incoming`, `data`, `close`, `present`, `presence`, `ping`, `pong`, `bye` |
+| `ready` | `open`, `data`, `close`, `announce`, `ping`, `pong`, `bye` | `incoming`, `data`, `close`, `peer`, `gone`, `ping`, `pong`, `bye` |
 
 | `t` | Fields | Meaning |
 |---|---|---|
-| `hello` | `v:1, nonce` | Both sides at once; the TCP schema |
+| `hello` | `v:2, nonce, kind` | Both sides at once: the hub's says `hub`, the client's `endpoint` ([Hello](#hello)) |
 | `register` | `ids:[{key, sig}]` (1..`TCP_MAX_IDENTITIES`) | Client → hub: proves every identity it serves |
 | `ok` | — | Hub → client: registered, ready |
 | `open` | `s` (odd), `to` (fp) | Client → hub: open stream `s` to the link that registered `to` |
 | `incoming` | `s` (even) | Hub → client: a stream was opened to one of this link's fps. Names nobody |
 | `data` | `s`, `b` | Either way: `b` is 1..`HUB_DATA_MAX` base64url characters (`HUB_CHUNK_BYTES` raw bytes at most), forwarded unchanged; tunneled endpoint frames reassemble from the decoded chunks |
 | `close` | `s`, `reason` | Either way. Hub → client: `ABSENT` (no such registration), `GONE` (the peer's link went), `CLOSED` (the peer closed), `LIMIT` (a cap). Client → hub: `CLOSED` or `LIMIT` only |
-| `watch` | `id` (uint), `fps` (0..`HUB_WATCH_MAX`) | Client → hub: replaces this link's watch set |
-| `present` | `id`, `fps` | Hub → client: answers `watch id` with the watched fps registered now on other links |
-| `presence` | `fp`, `online` (boolean) | Hub → client: a watched fp registered (`true`) or left (`false`) |
-| `ping` / `pong` / `bye` | as TCP | `bye` reasons as TCP: `PROOF`, `PROTOCOL`, `DUPLICATE` (a newer link registered one of these fps), `LIMIT`, `STOP` |
+| `announce` | `rec` (base64url, 1..`ANNOUNCE_MAX_BYTES` bytes) | Client → hub: this link's own announce for one of its registered fps; any number of times, latest wins. The hub checks it decodes, is an `announce` and is signed by an fp this link holds (`bye PROTOCOL` otherwise) |
+| `peer` | `fp`, `rec` (base64url, or `null` while that link gave none) | Hub → client: `fp` is registered on another link, with that link's announce for it |
+| `gone` | `fp` | Hub → client: `fp` is no longer registered |
+| `ping` / `pong` / `bye` | as endpoint sessions | `bye` reasons: `PROOF`, `PROTOCOL`, `DUPLICATE` (a newer link registered one of these fps), `LIMIT`, `STOP` |
 
 - **Stream ids** are per link: odd ids are chosen by the client for streams it opens, even ids by the hub for streams it delivers. Reopening an id still open is `bye PROTOCOL`.
-- Inside a stream run the endpoint handshake and session frames exactly as over a TCP socket ([Handshake](#handshake), [Session frames](#session-frames-after-ready)), with their own phase limits and deadlines.
+- Inside a stream run the endpoint handshake (targeted: the dialer names the fp it opened the stream to) and session frames exactly as over a TCP socket ([Handshake](#handshake), [Session frames](#session-frames-after-ready)), with their own phase limits and deadlines.
 - Deadlines and keepalive on the link: `TCP_HANDSHAKE_MS` for the registration, `TCP_FRAME_MS` for a partial frame, `TCP_IDLE_MS` of silence, `TCP_PING_MS` pings. Hub-side caps: [hub.md → Limits](hub.md#limits-srchubhubjs-srctransportframesjs).
 
 ## REST routes
@@ -256,13 +268,12 @@ All under the backend root; the page calls them relative (`api/...`). Every HTTP
 | Route | Body | Answer |
 |---|---|---|
 | `GET api/health` | — | `{ok: true}` |
-| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). `transport` = `{kind, configured, dir, host, port, advertise, url, hub, addresses, card, cardStale, error, outboxError}`: `kind` is `file-share`, `tcp`, `hub` or null; `url` is the saved hub address (else null); `hub` is `{connected, error}` of the hub link while a hub transport runs (else null; `error` is `{code, message}`: a socket error code, `HUB_REFUSED` or `HUB_DUPLICATE`, [hub.md → The link](hub.md#the-link)); `outboxError` is `{code, message}` of the latest send failure still holding writes in the outbox (`diagnostics.outbox`), else null; `card` is this install's current announce as a contact card (or null), `cardStale` is true while that announce's `addr` differs from `addresses`, `error` is `{code, message}` when the stored transport was invalid at boot (`TCP_INVALID`, `HUB_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID`) or the TCP listener could not start (`TCP_LISTEN_FAILED`) |
+| `GET api/state` | — | `{identity, transport, directory, sharedInboxes, invites, joinRequests, inboxes, diagnostics, notify}` (shapes: `frontend/src/types.ts` `State`). **`transport`** = `{kind, configured, dir, listen, listening, connections, card, error, outboxError}`: `kind` is `file-share`, `network` or null; `listen` the saved listener (`{host, port}` or null); `listening` where it is bound while up (`{host, port}`, else null); `connections` one row per configured connection, `{address, kind: 'peer'\|'hub'\|null, state: 'connecting'\|'up'\|'waiting'\|'idle'\|'stopped', peers: [{fp, name}], error: {code, message}\|null}` (the saved list with `state: 'connecting'` while no transport runs; codes: [transport.md → Connections](transport.md#connections)); `card` this install's current announce as a contact card (or null); `error` `{code, message}` when the stored transport was invalid at boot (`NETWORK_INVALID`, `SHARE_INVALID`, `SHARE_UNSAFE`, `TRANSPORT_INVALID`) or the listener could not start (`LISTEN_FAILED`); `outboxError` `{code, message}` of the latest send failure still holding writes in the outbox (`diagnostics.outbox`), else null. **`directory`** = every shown identity but this install, strangers included: `[{fp, fingerprint, name, contact: boolean, presence: [{via: 'direct'\|'hub', address: string\|null}]}]` (`presence`: its ready sessions, `address` the connection's or null for one accepted on the listener, and each hub whose roster has it; empty when not reachable now) |
 | `GET api/inboxes/:id/messages` | — | `{inbox, messages: [{id, seq, sender: {fp, name}, ts, body}]}`: every valid message, in acceptance order |
 | `GET api/sessions` | — | `{sessions: [{sessionId, label, status, live}], target, autoStart}`: cc's top-level conductors; 503 `CONDUCTOR_UNAVAILABLE` without cc |
 | `POST api/identity` | `{name}` | `{name}` |
 | `POST api/share` | `{dir}` | `{shareDir}`; makes the file share the transport. `SHARE_INVALID` 400 |
-| `POST api/tcp` | `{host?, port?, advertise?}` | `{host, port, advertise, addresses}`; makes TCP the transport (`validateTcpConfig`). `TCP_INVALID` 400, `TCP_LISTEN_FAILED` 409 (no transport is configured after it) |
-| `POST api/hub` | `{url}` | `{url, addresses}`; makes the hub client the transport (`resolveHubConfig`: `hub://host:port`, not a wildcard, the host must resolve). `HUB_INVALID` 400. Starting never fails because the hub is unreachable: the client keeps reconnecting |
+| `POST api/network` | `{listen: {host?, port?} \| null, connections: ["host:port", …]}` (either may be absent: no listener, no connections) | `{listen, connections, listening}`; saves the whole config and makes network mode the transport (`resolveNetworkConfig`). `NETWORK_INVALID` 400, `LISTEN_FAILED` 409 (no transport is configured after it). Starting never fails because a connection is unreachable: it keeps reconnecting |
 | `POST api/contacts` | `{card}` | `{fp, name, shown}`: the imported identity. `CARD_INVALID` 400 |
 | `POST api/announce` | `{}` | `{id}` |
 | `POST api/invites` | `{to}` (fingerprint) | `{id, inbox}` |

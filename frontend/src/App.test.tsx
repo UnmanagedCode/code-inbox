@@ -6,7 +6,7 @@ import type { State } from './types';
 // The `api/state` shape the backend serves: a `transport` view and no `share` key.
 const STATE: State = {
   identity: { fp: 'aaaaaaaa', fingerprint: 'aaaa-aaaa', name: 'Ann', announcedName: null, nameStatus: 'unset' },
-  transport: { kind: null, configured: false, dir: null, host: null, port: null, advertise: null, url: null, hub: null, addresses: [], card: null, cardStale: false, error: null, outboxError: null },
+  transport: { kind: null, configured: false, dir: null, listen: null, listening: null, connections: [], card: null, error: null, outboxError: null },
   directory: [],
   sharedInboxes: [],
   invites: { incoming: [], outgoing: [] },
@@ -27,6 +27,6 @@ describe('App', () => {
     vi.stubGlobal('fetch', vi.fn(async (url: string) => json(url === 'api/state' ? STATE : { sessions: [], target: null, autoStart: null })));
     render(<App />);
     expect(await screen.findByRole('heading', { level: 1, name: 'Code Inbox' })).toBeTruthy();
-    expect(screen.getByRole('radio', { name: 'TCP (direct)' })).toBeTruthy();
+    expect(screen.getByRole('radio', { name: 'Network' })).toBeTruthy();
   });
 });
