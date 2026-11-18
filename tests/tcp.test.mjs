@@ -221,6 +221,25 @@ function streamReader(lying, link, s) {
   return r;
 }
 
+// Invariant (D3, dialer side): an untargeted dialer refuses an acceptor that validly proves one of the dialer's own
+// identities. The far end here is a raw acceptor holding the dialer's key, so no acceptor-side check intervenes.
+test('an untargeted dialer refuses an acceptor that proves one of its own identities', async (t) => {
+  const self = await newIdentity();
+  const srv = await rawServer(t);
+  const dialer = await stubEndpoint(t, { identity: self, listen: null, connections: [srv.addr] });
+  await waitFor(() => srv.conns.length === 1, 'the connection');
+  const acc = srv.conns[0];
+  const myNonce = nonce();
+  acc.send(helloFrame(myNonce));
+  const dHello = await acc.nextOf('hello');
+  assert.equal((await acc.nextOf('prove')).target, null);
+  // A correct accept proof (role, both nonces, bound to the dialer's fps), signed by the dialer's own key.
+  acc.send({ t: 'prove', ids: acceptProofs([self], 'accept', myNonce, dHello.nonce, [dialer.fp]) });
+  assert.equal((await acc.nextOf('bye')).reason, 'PROOF');
+  await waitFor(() => dialer.endpoint.stats().connections[0].error?.code === 'CONNECTION_REFUSED', 'the refusal on the connection');
+  assert.deepEqual(dialer.endpoint.stats().sessions, []);
+});
+
 // Invariant (D3): a connection names no fingerprint: it reaches whoever proves at its address, but never this
 // install's own identities (a connection to its own listener is refused, shown and backed off).
 test('an untargeted dialer accepts whoever proves, never its own identities', async (t) => {

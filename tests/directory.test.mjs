@@ -59,6 +59,14 @@ test('announces are never written to the record log or the data dir, over a dire
   assert.deepEqual(dataDirHolds(carol.dataDir, { text: dave.fp }), []);
 });
 
+// The name in `node`'s persisted identity for `fp` (identities.json), or null.
+function keptName(node, fp) {
+  const file = path.join(node.dataDir, FILES.identities);
+  if (!fs.existsSync(file)) return null;
+  const e = JSON.parse(fs.readFileSync(file, 'utf8'))[fp];
+  return e ? decodeRecord(Buffer.from(e.announce, 'base64url')).payload.name : null;
+}
+
 const decodeRecordBytes = (card) => Buffer.from(card.slice('code-inbox-card:v2:'.length), 'base64url');
 
 // Invariant: identities the install keeps (counterparties, card imports) keep their names across a restart; a
@@ -93,11 +101,12 @@ test('a newer verified announce updates the persisted identity', async (t) => {
   t.after(async () => { await alice.close(); await bob.close(); });
   await waitFor(() => names(alice).join() === 'bob', 'bob shown');
   await personal(alice, bob);
+  assert.equal(keptName(alice, bob.fp), 'bob');
   await bob.engine.setName('robert');
   await bob.engine.announce();
-  await waitFor(() => names(alice).join() === 'robert', 'the new name');
-  const kept = JSON.parse(fs.readFileSync(path.join(alice.dataDir, FILES.identities), 'utf8'));
-  assert.equal(decodeRecord(Buffer.from(kept[bob.fp].announce, 'base64url')).payload.name, 'robert');
+  // The memory directory changes first; identities.json follows once the engine has written it.
+  await waitFor(() => keptName(alice, bob.fp) === 'robert', 'the persisted identity to update');
+  assert.deepEqual(names(alice), ['robert']);
 });
 
 // Invariant: an imported card persists as that contact's identity, and makes it a contact.

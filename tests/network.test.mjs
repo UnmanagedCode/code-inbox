@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import net from 'node:net';
 import { loadIdentity } from '../src/identity.js';
 import { createStore } from '../src/store.js';
-import { TCP_REDIAL_MIN_MS } from '../src/transport/endpoint.js';
+import { ENDPOINT_LIMITS, TCP_REDIAL_MIN_MS } from '../src/transport/endpoint.js';
+import { connectionLink } from '../src/transport/connection.js';
 import { proofSigner } from '../src/transport/handshake.js';
 import { TCP_DEFAULT_PORT, createNetworkEndpoint, validateNetworkConfig } from '../src/transport/network.js';
 import { encodeFrame } from '../src/transport/frames.js';
@@ -216,6 +217,60 @@ test('a peer-mode connection that lost the duplicate rule stays idle while a dir
   await waitFor(() => high.sessionsWith(low.fp).length === 0, 'the winning session to end');
   await high.engine.sync();
   await waitFor(() => high.status(toLow.addr).state === 'up' && high.sessionsWith(low.fp).length === 1, 'high\'s connection back up');
+});
+
+// Invariant (§4.4 idle rule, each half alone): a peer-mode connection whose session ended goes idle, with no
+// reconnect timer, when (a) every fp it reached has another direct session, though it did not lose the duplicate
+// rule, or (b) it lost the duplicate rule, though no other direct session is pooled; otherwise it waits to reconnect.
+// The connection link runs against a stand-in core, so each outcome turns on exactly one condition.
+test('a peer-mode connection goes idle on either idle condition alone, and otherwise reconnects', async (t) => {
+  const sockets = [];
+  const srv = net.createServer((s) => { sockets.push(s); s.on('error', () => {}); s.write(encodeFrame(helloFrame())); });
+  await new Promise((r) => srv.listen(0, '127.0.0.1', r));
+  t.after(() => { for (const s of sockets) s.destroy(); srv.close(); });
+  const address = `127.0.0.1:${srv.address().port}`;
+  const PEER = 'b'.repeat(64);
+  async function endWith(end, direct) {
+    const clock = fakeClock();
+    const state = { direct, connects: 0, finish: null };
+    const core = {
+      lim: ENDPOINT_LIMITS, now: clock.now, schedule: clock.schedule, log: silentLog,
+      fps: () => ['a'.repeat(64)], signers: () => [], canDial: () => true, readySessions: () => [],
+      hasDirectSession: () => state.direct,
+      dial: (socket) => {
+        const s = { remote: [PEER], ready: true, end: null, established: Promise.resolve(true), close() {} };
+        s.whenClosed = new Promise((r) => { state.finish = () => { s.end = end; socket.destroy(); r(); }; });
+        return s;
+      },
+    };
+    const link = connectionLink({ address, connect: (o) => { state.connects += 1; return net.connect(o); } })(core);
+    t.after(() => link.shutdown());
+    await link.open();
+    await waitFor(() => link.status().state === 'up', 'the session');
+    state.finish();
+    await waitFor(() => link.status().state !== 'up', 'the session to end');
+    return { link, clock, state };
+  }
+  const peerStop = { by: 'peer', reason: 'STOP' };
+  // (a) Not a loser, but the peer has another direct session: idle, no timer; reconnects once it has none.
+  const a = await endWith(peerStop, true);
+  assert.equal(a.link.status().state, 'idle');
+  a.clock.advance(10 * TCP_REDIAL_MIN_MS);
+  await sleep(20);
+  assert.equal(a.state.connects, 1);
+  await a.link.connect();
+  assert.equal(a.state.connects, 1, 'maintain leaves it idle while the other session lives');
+  a.state.direct = false;
+  await a.link.connect();
+  assert.equal(a.state.connects, 2);
+  // (b) The duplicate loser, with no other direct session pooled: idle.
+  const b = await endWith({ by: 'self', reason: 'DUPLICATE' }, false);
+  assert.equal(b.link.status().state, 'idle');
+  // Neither: it waits to reconnect.
+  const c = await endWith(peerStop, false);
+  assert.equal(c.link.status().state, 'waiting');
+  c.clock.advance(TCP_REDIAL_MIN_MS);
+  await waitFor(() => c.state.connects === 2, 'the reconnect');
 });
 
 // Invariant: a port forward (or an SSH tunnel) is a direct route to the real peer: the session proves the far

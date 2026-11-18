@@ -42,7 +42,8 @@ settings.json               {name, announced: string | null, transport, notifyTa
                             announced: the name last announced (the announce is re-signed from it at every boot)
                             transport: null | {kind:'file-share', dir} | {kind:'network', listen: {host, port} | null, connections: ["host:port", …]}
 pins.json                   name → fingerprint, for this install and the identities in identities.json only
-identities.json             {fp: {announce: base64url announce record, imported: boolean}}: card imports and every fp the log names
+identities.json             {fp: {announce: base64url announce record, imported: boolean}}: card imports and every fp the log names,
+                            never this install's own fp (its announce is re-signed from settings.announced)
 accepted.ndjson             append-only {seq, id, route, bytes(base64)}; fsynced per record; never an announce
 pending.ndjson              {route, bytes} of records waiting for a dependency; rewritten atomically
 rejected.ndjson             append-only {id, reason, type, inbox, signer} of records refused for good; fsynced

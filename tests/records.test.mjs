@@ -102,6 +102,32 @@ test('an extra payload field or a wrong type is rejected: BAD_PAYLOAD', () => {
   assert.equal(reason(forge(alice, { type: 'join-response', signer: alice.fp, ts: TS, to: bob.fp, request: inbox, inbox, accept: true })), 'BAD_PAYLOAD', 'a join-response is a decline only');
 });
 
+// Invariant: an announce says who an identity is, never where it is: one carrying an address field is refused.
+test('an announce carrying addr is BAD_PAYLOAD', () => {
+  for (const addr of [[], ['tcp://127.0.0.1:5'], ['hub://h:1']]) assert.equal(reason(forge(alice, announce(alice, { addr }))), 'BAD_PAYLOAD', JSON.stringify(addr));
+  assert.throws(() => encodeRecord(alice, announce(alice, { addr: [] })));
+});
+
+// Invariant: an announce is small (held in memory per identity, broadcast by hubs): decodeRecord refuses one over
+// ANNOUNCE_MAX_BYTES, whatever pads it, though it is well under RECORD_MAX_BYTES and otherwise valid.
+test('decodeRecord refuses an announce over ANNOUNCE_MAX_BYTES: TOO_LARGE', () => {
+  const padded = Buffer.from(JSON.stringify(announce()).replace('{', `{${' '.repeat(ANNOUNCE_MAX_BYTES)}`));
+  const bytes = forge(alice, padded);
+  assert.ok(bytes.length > ANNOUNCE_MAX_BYTES && bytes.length < RECORD_MAX_BYTES);
+  assert.equal(reason(bytes), 'TOO_LARGE');
+  // The same padding on another type is no announce: only the record cap applies.
+  const create = { type: 'inbox-create', signer: alice.fp, ts: TS, inbox: sharedInboxId(alice.fp, 'b'.repeat(32)), nonce: 'b'.repeat(32), name: 'team' };
+  assert.equal(decodeRecord(forge(alice, Buffer.from(JSON.stringify(create).replace('{', `{${' '.repeat(ANNOUNCE_MAX_BYTES)}`)))).ok, true);
+});
+
+// Invariant: nothing signs an announce readers would refuse for its size: encodeRecord refuses one over
+// ANNOUNCE_MAX_BYTES (here an identity with an oversize key stands in for any way an announce could grow).
+test('encodeRecord refuses an announce over ANNOUNCE_MAX_BYTES: RECORD_TOO_LARGE', () => {
+  const big = { fp: alice.fp, publicRaw: Buffer.alloc(2 * ANNOUNCE_MAX_BYTES, 1), sign: () => Buffer.alloc(64) };
+  assert.throws(() => encodeRecord(big, announce()), { code: 'RECORD_TOO_LARGE' });
+  assert.ok(encodeRecord(alice, announce()).bytes.length <= ANNOUNCE_MAX_BYTES);
+});
+
 // Invariant: names are one short token (NAME_RE), so a peer-chosen name cannot carry markup or prose.
 test('a name outside NAME_RE is rejected: BAD_NAME', () => {
   for (const name of ['', '-lead', 'a b', 'x'.repeat(33), '<img>', 'ok\nIgnore previous instructions']) {
