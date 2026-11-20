@@ -47,12 +47,14 @@ export function ComposeBox({ inboxId, onSent }: { inboxId: string; onSent: () =>
     <form className="compose" onSubmit={(e) => { e.preventDefault(); void send(); }}>
       {error && <p role="alert" className="error">{error}</p>}
       <div className="compose-row">
-        <textarea ref={area} aria-label="Message" aria-describedby={hintId} placeholder="Write a message" rows={1} value={text}
-          onChange={(e) => { setText(e.target.value); drafts.set(inboxId, e.target.value); }}
-          onKeyDown={(e) => {
-            if (e.key !== 'Enter' || e.nativeEvent.isComposing) return;
-            if (e.ctrlKey || e.metaKey || (!e.shiftKey && !e.altKey && !coarsePointer())) { e.preventDefault(); void send(); }
-          }} />
+        <div className="compose-field">
+          <textarea ref={area} aria-label="Message" aria-describedby={hintId} placeholder="Write a message" rows={1} value={text}
+            onChange={(e) => { setText(e.target.value); drafts.set(inboxId, e.target.value); }}
+            onKeyDown={(e) => {
+              if (e.key !== 'Enter' || e.nativeEvent.isComposing) return;
+              if (e.ctrlKey || e.metaKey || (!e.shiftKey && !e.altKey && !coarsePointer())) { e.preventDefault(); void send(); }
+            }} />
+        </div>
         <button type="submit" data-variant="primary" disabled={busy || blank}>{busy ? 'Sending…' : 'Send'}</button>
       </div>
       <p id={hintId} className="muted compose-hint">Enter to send · Shift+Enter for a new line</p>

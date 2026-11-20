@@ -30,7 +30,7 @@ export function useStickToBottom(lastKey: string | null) {
   }, []);
 
   useLayoutEffect(() => {
-    if (lastKey === prevKey.current) return;
+    if (lastKey === prevKey.current) return; // the mount run: nothing arrived yet
     prevKey.current = lastKey;
     if (atBottom.current) toLatest();
     else if (lastKey !== null) setFresh(true);
@@ -45,6 +45,8 @@ export function useStickToBottom(lastKey: string | null) {
     return () => ro.disconnect();
   }, []);
 
-  const stickNext = useCallback(() => { atBottom.current = true; }, []);
+  // Own send: scroll now (a poll may already have delivered the sent message while the reader was away, so no
+  // later lastKey change would follow) and keep following the newest entry.
+  const stickNext = toLatest;
   return { ref: ref as RefObject<HTMLDivElement | null>, onScroll, away, fresh, toLatest, stickNext };
 }

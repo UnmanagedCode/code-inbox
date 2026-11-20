@@ -59,4 +59,10 @@ describe('MessageList', () => {
     const times = [...container.querySelectorAll('time')].map((t) => Date.parse(t.getAttribute('datetime')!));
     expect(times).toEqual([T0, T0 + 5000]);
   });
+
+  // Invariant: a gap of exactly GROUP_GAP_MS still groups (the boundary is inclusive).
+  it('groups at exactly GROUP_GAP_MS', () => {
+    render(<MessageList messages={[from('b', 'bob', T0, 'one', 1), from('b', 'bob', T0 + GROUP_GAP_MS, 'two', 2)]} selfFp={SELF} now={T0} />);
+    expect(screen.getAllByText(/^bob \[/)).toHaveLength(1);
+  });
 });

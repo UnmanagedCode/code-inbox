@@ -93,7 +93,7 @@ export function InboxView({ inbox, state, refresh, back }: { inbox: Inbox; state
         {error && <p role="alert" className="error">{error}</p>}
       </header>
       <div className="messages-wrap">
-        <div ref={ref} className="messages-scroll" role="region" aria-label="Message history" tabIndex={0} onScroll={onScroll}>
+        <div ref={ref} className="messages-scroll" role="region" aria-label="Message history" tabIndex={0} data-away={away || undefined} onScroll={onScroll}>
           {messages === null ? <p className="muted">Loading messages…</p> : <MessageList messages={messages} selfFp={state.identity.fp} />}
         </div>
         {away && <button type="button" data-variant="primary" className="jump" onClick={toLatest}>{fresh ? 'New messages ↓' : 'Jump to latest ↓'}</button>}

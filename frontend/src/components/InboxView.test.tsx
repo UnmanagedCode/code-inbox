@@ -239,4 +239,49 @@ describe('InboxView scrolling', () => {
     expect(screen.getByText(/bob \[/)).toBeTruthy();
     await screen.findByText('No messages yet.');
   });
+
+  // Invariant: the own send jumps to the latest even when a poll delivered the sent message before the POST
+  // resolved (no later newest-message change would come to scroll).
+  it('own send jumps to the latest when a poll lands first', async () => {
+    const box = { messages: Array.from({ length: 10 }, (_, i) => peerMsg(i + 1)) };
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+      if (init.method === 'POST') {
+        box.messages = [...box.messages, { id: 'own', seq: 11, ts: 1_700_100_000_000, body: 'mine', sender: { fp: SELF, name: 'alice' } }];
+        await gate;
+        return new Response(JSON.stringify({ id: 'own' }), { status: 200 });
+      }
+      return new Response(JSON.stringify({ inbox: INBOX.id, messages: box.messages }), { status: 200 });
+    }));
+    const { region, reload } = await openScrolling(box);
+    scrollUp(region);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'mine' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await reload();
+    expect(region.querySelectorAll('li')).toHaveLength(11);
+    expect(region.scrollTop).toBe(0);
+    await act(async () => { release(); await new Promise((r) => setTimeout(r, 0)); });
+    await waitFor(() => expect(atLatest(region)).toBe(true));
+  });
+
+  // Invariant: "New messages" is cleared by the jump button and by the reader reaching the bottom, so a later
+  // scroll up with no traffic offers "Jump to latest" again.
+  it('the fresh flag resets on jump and on reaching the bottom', async () => {
+    const { region, reload, box } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    scrollUp(region);
+    box.messages = [...box.messages, peerMsg(11)];
+    await reload();
+    fireEvent.click(screen.getByRole('button', { name: 'New messages ↓' }));
+    scrollUp(region);
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+    box.messages = [...box.messages, peerMsg(12)];
+    await reload();
+    expect(screen.getByRole('button', { name: 'New messages ↓' })).toBeTruthy();
+    region.scrollTop = region.scrollHeight;
+    fireEvent.scroll(region);
+    expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
+    scrollUp(region);
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+  });
 });
