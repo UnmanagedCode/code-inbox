@@ -36,11 +36,11 @@ export function App() {
   if (!state) return <main className="page">{error ? <p role="alert" className="error">{error}</p> : <p className="muted">Loading…</p>}</main>;
   const inbox = inboxId ? state.inboxes.find((b) => b.id === inboxId) : undefined;
   return (
-    <main className="page">
+    <main className={inbox ? 'page page-inbox' : 'page'}>
       <h1>Code Inbox</h1>
       {error && <p role="alert" className="error">{error}</p>}
       {inboxId ? (
-        inbox ? <InboxView inbox={inbox} state={state} refresh={refresh} back={() => open(null)} />
+        inbox ? <InboxView key={inbox.id} inbox={inbox} state={state} refresh={refresh} back={() => open(null)} />
           : <section className="panel"><p className="muted">This install is not a party or member of that inbox.</p><button type="button" onClick={() => open(null)}>← Inboxes</button></section>
       ) : (
         <>

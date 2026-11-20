@@ -1,9 +1,10 @@
-import { useCallback, useState } from 'react';
+import { useCallback, useId, useState } from 'react';
 import { api, describe } from '../api';
 import type { Inbox, Message, State } from '../types';
 import { who } from '../format';
 import { useAction } from '../useAction';
 import { usePoll } from '../usePoll';
+import { useStickToBottom } from '../useStickToBottom';
 import { ComposeBox } from './ComposeBox';
 import { ConfirmButton } from './ConfirmButton';
 import { inboxLabel } from './InboxList';
@@ -59,27 +60,45 @@ function CloseAction({ inbox, state, refresh, back }: { inbox: Inbox; state: Sta
   );
 }
 
-// One inbox: its members, its messages (reloaded while visible) and a compose box.
+// One inbox: a header (members behind a toggle), the message history (the only part that scrolls, reloaded while
+// visible) and a compose box pinned below it.
 export function InboxView({ inbox, state, refresh, back }: { inbox: Inbox; state: State; refresh: () => void; back: () => void }) {
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessages] = useState<Message[] | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [showMembers, setShowMembers] = useState(false);
+  const membersId = useId();
   const load = useCallback(() => {
     api.messages(inbox.id).then((r) => { setMessages(r.messages); setError(null); }, (e) => setError(describe(e)));
   }, [inbox.id]);
   usePoll(load, POLL_MS, [inbox.id]);
+  const { ref, onScroll, away, room, fresh, toLatest, stickNext } = useStickToBottom(messages?.at(-1)?.id ?? null);
   const isOwner = inbox.kind === 'shared' && inbox.owner?.fp === state.identity.fp;
   return (
     <section className="panel inbox" aria-label={`Inbox ${inboxLabel(inbox, state.identity.fp)}`}>
-      <div className="row">
-        <button type="button" data-variant="ghost" onClick={back}>← Inboxes</button>
-        <h2 className="grow">{inboxLabel(inbox, state.identity.fp)} <span className="muted">({inbox.kind})</span></h2>
-        <CloseAction inbox={inbox} state={state} refresh={refresh} back={back} />
+      <header className="inbox-head">
+        <div className="row">
+          <button type="button" data-variant="ghost" onClick={back}>← Inboxes</button>
+          <h2 className="grow">{inboxLabel(inbox, state.identity.fp)} <span className="muted">({inbox.kind})</span></h2>
+          <CloseAction inbox={inbox} state={state} refresh={refresh} back={back} />
+        </div>
+        <button type="button" data-variant="ghost" aria-expanded={showMembers} aria-controls={membersId} onClick={() => setShowMembers((v) => !v)}>
+          Members ({inbox.members.length})
+        </button>
+        {showMembers && (
+          <div id={membersId}>
+            <p className="muted">{inbox.members.map(who).join(', ')}</p>
+            {isOwner && <OwnerControls inbox={inbox} state={state} refresh={refresh} />}
+          </div>
+        )}
+        {error && <p role="alert" className="error">{error}</p>}
+      </header>
+      <div className="messages-wrap">
+        <div ref={ref} className="messages-scroll" role="region" aria-label="Message history" tabIndex={0} data-away={away || undefined} onScroll={onScroll}>
+          {messages === null ? <p className="muted">Loading messages…</p> : <MessageList messages={messages} selfFp={state.identity.fp} />}
+        </div>
+        {away && room && <button type="button" data-variant="primary" className="jump" onClick={toLatest}>{fresh ? 'New messages ↓' : 'Jump to latest ↓'}</button>}
       </div>
-      <p className="muted">Members: {inbox.members.map(who).join(', ')}</p>
-      {isOwner && <OwnerControls inbox={inbox} state={state} refresh={refresh} />}
-      {error && <p role="alert" className="error">{error}</p>}
-      <MessageList messages={messages} />
-      <ComposeBox inboxId={inbox.id} onSent={() => { load(); refresh(); }} />
+      <ComposeBox inboxId={inbox.id} onSent={() => { stickNext(); load(); refresh(); }} />
     </section>
   );
 }
