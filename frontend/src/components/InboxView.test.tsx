@@ -308,4 +308,35 @@ describe('InboxView scrolling', () => {
     expect(atLatest(region)).toBe(true);
     expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
   });
+
+  // Invariant: while the history has no room (collapsed to ~0 height) the jump pill is not rendered, so it cannot
+  // be focused unseen; it returns when the room does.
+  it('does not render the jump pill while the history is collapsed', async () => {
+    let resized: () => void = () => {};
+    vi.stubGlobal('ResizeObserver', class { constructor(cb: () => void) { resized = cb; } observe() {} disconnect() {} });
+    const { region } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    let height = 200;
+    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => height });
+    scrollUp(region);
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+    height = 0;
+    act(() => resized());
+    expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
+    height = 200;
+    act(() => resized());
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+  });
+
+  // Invariant: when a layout change gives space back so the reader is at the latest (content now fits) without any
+  // scroll event, the resize re-judges them as at the latest and the pill goes.
+  it('clears a stale pill when the content comes to fit', async () => {
+    let resized: () => void = () => {};
+    vi.stubGlobal('ResizeObserver', class { constructor(cb: () => void) { resized = cb; } observe() {} disconnect() {} });
+    const { region } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    scrollUp(region);
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => 600 }); // scrollHeight is 500
+    act(() => resized());
+    expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
+  });
 });

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useLayoutEffect, useRef, useState } from 'react
 import type { RefObject } from 'react';
 
 export const NEAR_BOTTOM_PX = 48; // "at the latest" tolerance: sub-pixel rounding, a partly visible last entry
+export const MIN_ROOM_PX = 24; // below this viewport height the container is collapsed: nothing to jump within
 
 // Keeps a scroll container at its newest entry: opens there, stays there while the reader is there, and holds the
 // reader's place (flagging `fresh`) when they scrolled up. `lastKey` identifies the newest entry.
@@ -12,6 +13,7 @@ export function useStickToBottom(lastKey: string | null) {
   const clientH = useRef<number | null>(null); // the viewport height the last scroll/resize was judged at
   const [away, setAway] = useState(false);
   const [fresh, setFresh] = useState(false);
+  const [room, setRoom] = useState(true); // false while the container is collapsed (a floating control would be invisible)
 
   const toLatest = useCallback(() => {
     const el = ref.current;
@@ -49,7 +51,14 @@ export function useStickToBottom(lastKey: string | null) {
     if (!el || typeof ResizeObserver === 'undefined') return;
     const ro = new ResizeObserver(() => {
       clientH.current = el.clientHeight;
-      if (atBottom.current) el.scrollTop = el.scrollHeight;
+      setRoom(el.clientHeight >= MIN_ROOM_PX);
+      if (atBottom.current) { el.scrollTop = el.scrollHeight; return; }
+      // The layout may have given space back (content now fits, or the viewport grew) without a scroll event.
+      if (el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX) {
+        atBottom.current = true;
+        setAway(false);
+        setFresh(false);
+      }
     });
     ro.observe(el);
     return () => ro.disconnect();
@@ -58,5 +67,5 @@ export function useStickToBottom(lastKey: string | null) {
   // Own send: scroll now (a poll may already have delivered the sent message while the reader was away, so no
   // later lastKey change would follow) and keep following the newest entry.
   const stickNext = toLatest;
-  return { ref: ref as RefObject<HTMLDivElement | null>, onScroll, away, fresh, toLatest, stickNext };
+  return { ref: ref as RefObject<HTMLDivElement | null>, onScroll, away, room, fresh, toLatest, stickNext };
 }

@@ -71,7 +71,7 @@ export function InboxView({ inbox, state, refresh, back }: { inbox: Inbox; state
     api.messages(inbox.id).then((r) => { setMessages(r.messages); setError(null); }, (e) => setError(describe(e)));
   }, [inbox.id]);
   usePoll(load, POLL_MS, [inbox.id]);
-  const { ref, onScroll, away, fresh, toLatest, stickNext } = useStickToBottom(messages?.at(-1)?.id ?? null);
+  const { ref, onScroll, away, room, fresh, toLatest, stickNext } = useStickToBottom(messages?.at(-1)?.id ?? null);
   const isOwner = inbox.kind === 'shared' && inbox.owner?.fp === state.identity.fp;
   return (
     <section className="panel inbox" aria-label={`Inbox ${inboxLabel(inbox, state.identity.fp)}`}>
@@ -96,7 +96,7 @@ export function InboxView({ inbox, state, refresh, back }: { inbox: Inbox; state
         <div ref={ref} className="messages-scroll" role="region" aria-label="Message history" tabIndex={0} data-away={away || undefined} onScroll={onScroll}>
           {messages === null ? <p className="muted">Loading messages…</p> : <MessageList messages={messages} selfFp={state.identity.fp} />}
         </div>
-        {away && <button type="button" data-variant="primary" className="jump" onClick={toLatest}>{fresh ? 'New messages ↓' : 'Jump to latest ↓'}</button>}
+        {away && room && <button type="button" data-variant="primary" className="jump" onClick={toLatest}>{fresh ? 'New messages ↓' : 'Jump to latest ↓'}</button>}
       </div>
       <ComposeBox inboxId={inbox.id} onSent={() => { stickNext(); load(); refresh(); }} />
     </section>
