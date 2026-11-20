@@ -144,6 +144,8 @@ Cursors, unread counts, the notifier's watermark and `read_messages {after}` use
 
 `npm test` runs `node --test "tests/**/*.test.mjs"` then vitest. Everything is in-process on temp dirs; no live cc and no real `PROJECTS_ROOT`.
 
+- UI scroll tests stub `scrollHeight` / `clientHeight` / a clamped `scrollTop` on the history region (happy-dom has no layout) and reload through a `visibilitychange` event instead of timers.
+
 | Helper (`tests/helpers.mjs`) | Gives |
 |---|---|
 | `makeInstall(shareDir, {name, env, schedule, dataDir})` | A whole install (`wire`) with its own temp data dir; the share is polled (and network mode maintained) only when a test calls `engine.sync()`. `rest(method, path, body)` calls its HTTP app as the page does |

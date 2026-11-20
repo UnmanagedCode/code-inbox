@@ -1,6 +1,7 @@
 import { describe, expect, it, vi } from 'vitest';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { InboxView } from './InboxView';
+import { NEAR_BOTTOM_PX } from '../useStickToBottom';
 import type { Inbox, Message, State } from '../types';
 
 const SELF = 'a'.repeat(64);
@@ -94,6 +95,7 @@ describe('InboxView closing', () => {
     const posts = server();
     render(<InboxView inbox={TEAM} state={ownerState} refresh={() => {}} back={() => {}} />);
     await screen.findByText('No messages yet.');
+    fireEvent.click(screen.getByRole('button', { name: /^Members/ }));
     const select = screen.getByRole('combobox');
     const options = [...select.querySelectorAll('option')].map((o) => o.value).filter(Boolean).sort();
     expect(options).toEqual([PEER, CAROL, DAVE].sort());
@@ -108,5 +110,133 @@ describe('InboxView closing', () => {
     fireEvent.click(screen.getByRole('button', { name: 'Invite' }));
     await waitFor(() => expect(posts).toEqual([`api/inboxes/${TEAM.id}/members/${PEER}/remove`, `api/inboxes/${TEAM.id}/invites`]));
     expect(screen.queryByRole('button', { name: 'Remove' })).toBeNull();
+  });
+});
+
+// happy-dom has no layout: the history region gets fake sizes (50px per message, a 200px viewport) and a clamped
+// scrollTop, as browsers clamp. Reloads go through `visibilitychange` (usePoll runs on it) instead of timers.
+const ROW = 50;
+const peerMsg = (n: number): Message => ({ id: `p${n}`, seq: n, ts: 1_700_000_000_000 + n * 600_000, body: `msg ${n}`, sender: { fp: PEER, name: 'bob' } });
+const atLatest = (el: HTMLElement) => el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
+
+function scrollServer(initial: Message[]) {
+  const box = { messages: initial };
+  vi.stubGlobal('fetch', vi.fn(async (_url: string, init: RequestInit) => {
+    if (init.method === 'POST') {
+      const { body } = JSON.parse(String(init.body));
+      box.messages = [...box.messages, { id: `own${box.messages.length}`, seq: box.messages.length + 1, ts: 1_700_100_000_000, body, sender: { fp: SELF, name: 'alice' } }];
+      return new Response(JSON.stringify({ id: 'x' }), { status: 200 });
+    }
+    return new Response(JSON.stringify({ inbox: INBOX.id, messages: box.messages }), { status: 200 });
+  }));
+  return box;
+}
+
+function fakeLayout(el: HTMLElement, rows: () => number) {
+  let top = 0;
+  Object.defineProperty(el, 'scrollHeight', { configurable: true, get: () => rows() * ROW });
+  Object.defineProperty(el, 'clientHeight', { configurable: true, get: () => 200 });
+  Object.defineProperty(el, 'scrollTop', {
+    configurable: true,
+    get: () => top,
+    set: (v: number) => { top = Math.max(0, Math.min(v, rows() * ROW - 200)); },
+  });
+}
+
+async function openScrolling(box: { messages: Message[] }) {
+  render(<InboxView key={INBOX.id} inbox={INBOX} state={STATE} refresh={() => {}} back={() => {}} />);
+  const region = screen.getByRole('region', { name: 'Message history' });
+  fakeLayout(region, () => region.querySelectorAll('li').length);
+  const reload = () => act(async () => { document.dispatchEvent(new Event('visibilitychange')); await new Promise((r) => setTimeout(r, 0)); });
+  await reload();
+  return { region, reload, box };
+}
+
+const scrollUp = (region: HTMLElement) => { region.scrollTop = 0; fireEvent.scroll(region); };
+
+describe('InboxView scrolling', () => {
+  // Invariant: the newest message is visible without scrolling after the first load.
+  it('opens at the latest', async () => {
+    const { region } = await openScrolling(scrollServer(Array.from({ length: 30 }, (_, i) => peerMsg(i + 1))));
+    await waitFor(() => expect(region.querySelectorAll('li')).toHaveLength(30));
+    expect(atLatest(region)).toBe(true);
+  });
+
+  // Invariant: Loading shows until the first answer; "No messages yet." only for a really empty inbox.
+  it('shows Loading, then the empty state', async () => {
+    scrollServer([]);
+    render(<InboxView inbox={INBOX} state={STATE} refresh={() => {}} back={() => {}} />);
+    expect(screen.getByText('Loading messages…')).toBeTruthy();
+    expect(screen.queryByText('No messages yet.')).toBeNull();
+    await screen.findByText('No messages yet.');
+    expect(screen.queryByText('Loading messages…')).toBeNull();
+  });
+
+  // Invariant: a reader at the latest stays there when a message arrives.
+  it('stays at the latest when a message arrives', async () => {
+    const { region, reload, box } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    box.messages = [...box.messages, peerMsg(11)];
+    await reload();
+    expect(region.querySelectorAll('li')).toHaveLength(11);
+    expect(atLatest(region)).toBe(true);
+    expect(screen.queryByRole('button', { name: /New messages/ })).toBeNull();
+  });
+
+  // Invariant: a scrolled-up reader keeps their place; the button says New messages when something arrived and
+  // jumps to the latest on click.
+  it('keeps a scrolled-up reader in place', async () => {
+    const { region, reload, box } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    scrollUp(region);
+    expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
+    box.messages = [...box.messages, peerMsg(11)];
+    await reload();
+    expect(region.scrollTop).toBe(0);
+    fireEvent.click(screen.getByRole('button', { name: 'New messages ↓' }));
+    expect(atLatest(region)).toBe(true);
+    expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
+  });
+
+  // Invariant: a poll that returns the same list neither moves the reader nor flags new messages.
+  it('an unchanged poll does not move or flag', async () => {
+    const { region, reload } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    scrollUp(region);
+    await reload();
+    expect(region.scrollTop).toBe(0);
+    expect(screen.queryByRole('button', { name: 'New messages ↓' })).toBeNull();
+  });
+
+  // Invariant: the human's own send jumps to the latest even when scrolled up.
+  it('own send jumps to the latest', async () => {
+    const { region } = await openScrolling(scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1))));
+    scrollUp(region);
+    fireEvent.change(screen.getByRole('textbox', { name: 'Message' }), { target: { value: 'my reply' } });
+    fireEvent.click(screen.getByRole('button', { name: 'Send' }));
+    await waitFor(() => expect(region.querySelectorAll('li')).toHaveLength(11));
+    await waitFor(() => expect(atLatest(region)).toBe(true));
+  });
+
+  // Invariant: the composer is outside the scrolling history and follows it (the structural half of "pinned").
+  it('composer sits outside the history', async () => {
+    scrollServer([]);
+    render(<InboxView inbox={INBOX} state={STATE} refresh={() => {}} back={() => {}} />);
+    const region = screen.getByRole('region', { name: 'Message history' });
+    const textbox = screen.getByRole('textbox', { name: 'Message' });
+    expect(region.contains(textbox)).toBe(false);
+    const form = textbox.closest('form')!;
+    expect(region.compareDocumentPosition(form) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    await screen.findByText('No messages yet.');
+  });
+
+  // Invariant: the member list hides behind a toggle that reports its state.
+  it('members toggle', async () => {
+    scrollServer([]);
+    render(<InboxView inbox={INBOX} state={STATE} refresh={() => {}} back={() => {}} />);
+    const toggle = screen.getByRole('button', { name: 'Members (2)' });
+    expect(toggle.getAttribute('aria-expanded')).toBe('false');
+    expect(screen.queryByText(/bob \[/)).toBeNull();
+    fireEvent.click(toggle);
+    expect(toggle.getAttribute('aria-expanded')).toBe('true');
+    expect(screen.getByText(/bob \[/)).toBeTruthy();
+    await screen.findByText('No messages yet.');
   });
 });

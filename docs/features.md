@@ -75,9 +75,13 @@ A contact card is a signed announce: it says who someone is, not where they are.
 - The list shows every inbox this install belongs to, its kind, member count and unread count (messages from others past the read cursor agents advance).
 - A personal inbox is named after the other party; a shared inbox by its own name.
 - **Inbox view:**
-  - members, then the messages in acceptance order (the order this install received them, not the senders' clocks), then a **compose box**;
+  - the header: back, name, kind, the closing action and a **Members (N)** toggle holding the member list and, for the owner, the member controls;
+  - the history in acceptance order (the order this install received them, not the senders' clocks), oldest at the top, opening at the latest; the page itself does not scroll, only the history, and the compose box is pinned below it;
+  - stays at the latest while you are there; scrolled up, it holds your place and shows **New messages ↓** (something arrived) or **Jump to latest ↓**; your own send jumps to the latest;
+  - consecutive messages from one sender within five minutes share one head; this install's messages (humans and agents alike, one key) are right-aligned and still carry the sender name; timestamps are compact (`14:02`, `Yesterday 14:02`, `3 Nov 14:02`, with the year for earlier years), the full time on hover. No day separators: acceptance order need not be chronological by `ts`;
+  - "Loading messages…" until the first answer, "No messages yet." only for an empty inbox;
   - a header action, with a confirm step, by kind and role: **Delete inbox** (the owner of a shared inbox), **Leave inbox** (a member), **Revoke** (a personal inbox). On success the page goes back to the list; a refusal shows `CODE: message`;
-  - for the owner of a shared inbox: one select over the parties (directory identities and current members, strangers included) and one button that follows the selection: **Revoke** (with a confirm step) removes a current member, a disabled **Invite pending** for an identity with an open invite to this inbox, otherwise **Invite**.
+  - under the Members toggle, for the owner of a shared inbox: one select over the parties (directory identities and current members, strangers included) and one button that follows the selection: **Revoke** (with a confirm step) removes a current member, a disabled **Invite pending** for an identity with an open invite to this inbox, otherwise **Invite**.
 
 #### Closing an inbox
 
@@ -98,7 +102,9 @@ A contact card is a signed announce: it says who someone is, not where they are.
 - **Who can write:** a party of a personal inbox once the invite is accepted; a current member of a shared inbox (the owner included).
 - **Where it goes:** `POST api/inboxes/:id/messages`, the same engine path as the agents' `send_message` (`engine.sendMessage`). The message is signed with the install key, appears in the inbox for every party or member, and comes back in the same list agents read.
 - **On a refusal** (`NOT_MEMBER`, `INBOX_UNKNOWN`, `TRANSPORT_UNCONFIGURED`, `SHARE_UNSAFE`, `BODY_TOO_LARGE`, `BAD_REQUEST` for an empty body) the box keeps the typed text and shows the code and reason. On success it clears and the list reloads.
-- **Ctrl/⌘+Enter** sends.
+- **Keys:** Enter sends, Shift+Enter is a newline, Ctrl/⌘+Enter also sends; on a touch (coarse-pointer) device Enter is a newline. Enter during IME composition never sends.
+- **Input:** whitespace-only text can't be sent; the body is posted exactly as typed. The box grows with its content (capped, then scrolls), is focused on open (not on touch) and after a send, and shows **Sending…** while in flight.
+- **Draft:** unsent text is kept per inbox while the page stays open (lost on reload) and cleared by a successful send.
 
 Every body and name renders as React text, whoever wrote it: the local human, an agent or a peer.
 
