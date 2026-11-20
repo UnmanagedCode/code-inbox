@@ -284,4 +284,28 @@ describe('InboxView scrolling', () => {
     scrollUp(region);
     expect(screen.getByRole('button', { name: 'Jump to latest ↓' })).toBeTruthy();
   });
+
+  // Invariant: a scroll event that comes with a viewport-height change (the browser clamping after the header or
+  // composer resized) is not read as the reader leaving the latest; the resize re-pin keeps them at the latest.
+  it('a layout-driven resize plus scroll keeps a reader at the latest pinned', async () => {
+    let resized: () => void = () => {};
+    vi.stubGlobal('ResizeObserver', class { constructor(cb: () => void) { resized = cb; } observe() {} disconnect() {} });
+    const box = scrollServer(Array.from({ length: 10 }, (_, i) => peerMsg(i + 1)));
+    const { region } = await openScrolling(box);
+    let height = 200;
+    Object.defineProperty(region, 'clientHeight', { configurable: true, get: () => height });
+    let top = region.scrollTop;
+    Object.defineProperty(region, 'scrollTop', {
+      configurable: true,
+      get: () => top,
+      set: (v: number) => { top = Math.max(0, Math.min(v, region.scrollHeight - height)); },
+    });
+    act(() => resized()); // the observer's initial notification: judge scrolls against the current height
+    expect(atLatest(region)).toBe(true);
+    height = 100; // e.g. the header grew
+    fireEvent.scroll(region); // the browser's scroll event for the changed layout
+    act(() => resized());
+    expect(atLatest(region)).toBe(true);
+    expect(screen.queryByRole('button', { name: /↓/ })).toBeNull();
+  });
 });

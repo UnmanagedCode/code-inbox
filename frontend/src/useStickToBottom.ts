@@ -9,6 +9,7 @@ export function useStickToBottom(lastKey: string | null) {
   const ref = useRef<HTMLDivElement | null>(null);
   const atBottom = useRef(true);
   const prevKey = useRef(lastKey);
+  const clientH = useRef<number | null>(null); // the viewport height the last scroll/resize was judged at
   const [away, setAway] = useState(false);
   const [fresh, setFresh] = useState(false);
 
@@ -23,6 +24,12 @@ export function useStickToBottom(lastKey: string | null) {
   const onScroll = useCallback(() => {
     const el = ref.current;
     if (!el) return;
+    // A scroll that arrives with a changed viewport height is the browser clamping to a layout change (the header
+    // grew, the composer grew), not the reader leaving the latest: leave the verdict to the resize re-pin.
+    const h = el.clientHeight;
+    const resized = clientH.current !== null && clientH.current !== h;
+    clientH.current = h;
+    if (resized) return;
     const near = el.scrollHeight - el.scrollTop - el.clientHeight <= NEAR_BOTTOM_PX;
     atBottom.current = near;
     setAway(!near);
@@ -40,7 +47,10 @@ export function useStickToBottom(lastKey: string | null) {
   useEffect(() => {
     const el = ref.current;
     if (!el || typeof ResizeObserver === 'undefined') return;
-    const ro = new ResizeObserver(() => { if (atBottom.current) el.scrollTop = el.scrollHeight; });
+    const ro = new ResizeObserver(() => {
+      clientH.current = el.clientHeight;
+      if (atBottom.current) el.scrollTop = el.scrollHeight;
+    });
     ro.observe(el);
     return () => ro.disconnect();
   }, []);
